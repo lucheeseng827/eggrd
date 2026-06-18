@@ -1,0 +1,24 @@
+# Load-test scenario: BASELINE (pure passthrough).
+#
+# Auth, rate limiting, and the WAF are all OFF, so this isolates EdgeGuard's intrinsic
+# reverse-proxy overhead vs. hitting the upstream directly. The white paper's "proxy tax"
+# number (added latency + max-RPS delta) is computed from baseline-vs-direct.
+#
+# The upstream is supplied via the UPSTREAM env var (see docker-compose.yml). The ops
+# endpoints are moved to a private admin listener so Prometheus can scrape metrics without
+# exposing them on the load-bearing public port (and so the split itself is under load).
+
+[server]
+port = 8080
+admin_port = 9090
+admin_addr = "0.0.0.0"        # reachable by the Prometheus container on the compose network
+trust_forwarded_for = false   # direct k6 hop is untrusted, so per-IP limits key on the real peer (no XFF spoofing)
+
+[auth]
+mode = "none"
+
+[ratelimit]
+enabled = false
+
+[waf]
+mode = "off"

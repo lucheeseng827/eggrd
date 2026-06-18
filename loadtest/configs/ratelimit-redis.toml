@@ -1,0 +1,31 @@
+# Load-test scenario: RATE LIMIT (shared-store / Redis GCRA).
+#
+# Same offered load and limit as ratelimit-local.toml, but the GCRA check-and-update runs as
+# an atomic Redis Lua script so N replicas enforce ONE global limit. This scenario is what
+# proves the distributed limiter against a *live* Redis (the in-crate suite only exercises the
+# in-process `memory` backend) — the headline ◐ item from docs/ROADMAP.md Phase 4.
+#
+# Run it with the compose `redis` service up and, ideally, EDGEGUARD replicas=2+ (see
+# loadtest/README.md "Multi-replica") to demonstrate the global cap holding across instances.
+
+[server]
+port = 8080
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = false   # direct k6 hop is untrusted, so per-IP limits key on the real peer (no XFF spoofing)
+
+[auth]
+mode = "none"
+
+[ratelimit]
+enabled = true
+rate = "5000/sec"
+burst = 500
+store = "redis"
+# Overridden by EDGEGUARD_REDIS_URL in docker-compose.yml.
+redis_url = "redis://redis:6379"
+redis_prefix = "edgeguard-lt"
+fail_open = false             # store outage -> 503, so a Redis blip is visible in results
+
+[waf]
+mode = "off"

@@ -1,0 +1,17 @@
+# Competitor baseline: Traefik static config. Pure reverse proxy to the SAME upstream via the
+# file provider (cloud-native Go twin; the second GC/memory data point next to Caddy).
+# log.level ERROR + no accessLog block == logging effectively off, matching RUST_LOG=warn.
+
+entryPoints:
+  web:
+    address: ":8080"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: false
+
+log:
+  level: ERROR
+
+# No `accessLog:` block -> per-request access logging disabled.

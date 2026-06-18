@@ -1,0 +1,27 @@
+# Load-test scenario: WAF (block mode, all built-in rulesets).
+#
+# Every request is screened by the SQLi/XSS/path-traversal RegexSets. The k6 waf script mixes
+# benign traffic (should pass, 200) with attack-shaped payloads (should be blocked, 403) and
+# checks both the throughput cost vs. baseline and the block correctness. Pair the throughput
+# delta with benches/waf.rs for the per-request "WAF tax" figure.
+
+[server]
+port = 8080
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = false   # direct k6 hop is untrusted, so per-IP limits key on the real peer (no XFF spoofing)
+
+[auth]
+mode = "none"
+
+[ratelimit]
+enabled = false
+
+[waf]
+mode = "block"
+sqli = true
+xss = true
+path_traversal = true
+inspect_path = true           # default surface: path + query (raw and percent-decoded)
+inspect_headers = false
+inspect_body = false

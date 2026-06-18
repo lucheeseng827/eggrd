@@ -1,0 +1,35 @@
+[package]
+name = "edgeguard-worker"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "EdgeGuard's response-hardening + edge-auth subset as a Rust->WASM Cloudflare Worker."
+publish = false
+
+# Detached from the parent monorepo workspace on purpose: this crate targets
+# wasm32-unknown-unknown and pulls in the Cloudflare `worker` runtime, neither of which the
+# native workspace build (or module_52's CI) should try to compile. An empty [workspace] table
+# makes this crate its own workspace root, so the outer workspace ignores it. Build it with
+# `worker-build` / `wrangler` — see README.md.
+[workspace]
+
+[lib]
+# cdylib for the wasm artifact; rlib so the pure logic can be unit-tested on the host target.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Basic-auth credential decoding. Pure Rust; compiles for both the native host (tests) and wasm.
+base64 = "0.22"
+
+# The Cloudflare Workers runtime bindings (and the bytes->JsValue glue for forwarding a body).
+# wasm-only: target-gating keeps native `cargo test` — which exercises the pure hardening/auth
+# logic below — from needing the wasm-only runtime.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = "0.8"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

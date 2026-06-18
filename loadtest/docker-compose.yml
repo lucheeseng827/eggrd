@@ -1,0 +1,84 @@
+# EdgeGuard load-test harness.
+#
+#   upstream    nginx stub (tiny static 200) — the backend EdgeGuard proxies to.
+#   edgeguard   the proxy under test, front-proxy mode, scenario chosen by $EG_SCENARIO.
+#   redis       shared store for the distributed-limiter scenario.
+#   prometheus  scrapes edgeguard:9090/__edgeguard/metrics throughout the run.
+#   grafana     (profile: observability) dashboards over Prometheus.
+#   k6          (profile: run) the load generator, invoked on demand by run.sh.
+#
+# Pick a scenario with EG_SCENARIO (one of loadtest/configs/*.toml, sans extension):
+#   EG_SCENARIO=full docker compose up -d --build edgeguard upstream redis prometheus
+# then drive load with ./run.sh. See loadtest/README.md.
+
+name: edgeguard-loadtest
+
+services:
+  upstream:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./upstream/default.conf:/etc/nginx/conf.d/default.conf:ro
+    # Not published to the host — only EdgeGuard reaches it, on the compose network.
+    expose:
+      - "80"
+
+  edgeguard:
+    build:
+      # Crate root, so the standalone build in Dockerfile.edgeguard sees Cargo.toml + src/.
+      context: ..
+      dockerfile: loadtest/Dockerfile.edgeguard
+    depends_on:
+      - upstream
+      - redis
+    environment:
+      EDGEGUARD_CONFIG: /etc/edgeguard/${EG_SCENARIO:-baseline}.toml
+      UPSTREAM: http://upstream:80
+      EDGEGUARD_API_KEYS: sk_loadtest_key
+      EDGEGUARD_REDIS_URL: redis://redis:6379
+      RUST_LOG: ${RUST_LOG:-warn}        # quiet by default so logging isn't the bottleneck
+    volumes:
+      - ./configs:/etc/edgeguard:ro
+    ports:
+      - "8080:8080"     # public proxy port (k6 hits this; also reachable from the host)
+      - "127.0.0.1:9090:9090"   # private admin/metrics listener — loopback only (Prometheus reaches it over the compose network)
+    # Scale to N replicas for the multi-replica distributed-limiter demo (see README):
+    #   EG_SCENARIO=ratelimit-redis docker compose up -d --build --scale edgeguard=3 edgeguard
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]  # in-memory, no persistence
+    expose:
+      - "6379"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"     # Prometheus UI on the host (its own :9090, mapped off the edge's 9090)
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["observability"]
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer    # read-only: anon is published on :3000, don't grant admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+
+  k6:
+    image: grafana/k6:0.53.0
+    profiles: ["run"]      # not started by `up`; invoked by run.sh via `compose run`
+    depends_on:
+      - edgeguard
+    environment:
+      BASE_URL: http://edgeguard:8080
+      API_KEY: sk_loadtest_key
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results

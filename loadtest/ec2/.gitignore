@@ -1,0 +1,4 @@
+# Ephemeral benchmark artifacts — never commit keys or per-run output.
+*.pem
+instances.env
+results/

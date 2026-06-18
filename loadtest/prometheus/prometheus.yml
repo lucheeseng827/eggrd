@@ -1,0 +1,16 @@
+# Scrape EdgeGuard's own Prometheus exposition throughout a load run, so the white paper can
+# correlate k6's client-side latency/RPS with the proxy's server-side counters (request
+# outcomes, rate-limit hits, WAF hits, latency histogram). Targets the PRIVATE admin listener
+# (:9090) — the same split a real deployment uses to keep metrics off the public port.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: edgeguard
+    metrics_path: /__edgeguard/metrics
+    static_configs:
+      - targets: ["edgeguard:9090"]
+        labels:
+          service: edgeguard

@@ -1,0 +1,25 @@
+# fly.toml — co-process mode on Fly.io.
+# `fly deploy` builds the repo Dockerfile (examples/Dockerfile.node or .python).
+# Fly ties the runtime PORT to http_service.internal_port below; EdgeGuard binds it and
+# then wraps your app on APP_PORT. (EdgeGuard's own default port is 8080, matching this.)
+app = "my-vibe-app"
+primary_region = "yyz"
+
+[build]
+  # dockerfile = "Dockerfile"   # your wrap-your-app Dockerfile
+
+[env]
+  APP_PORT = "3000"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "get"
+    path = "/__edgeguard/health"
+    interval = "15s"
+    timeout = "2s"

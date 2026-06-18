@@ -1,0 +1,28 @@
+# Load-test scenario: FULL (realistic production-shaped policy).
+#
+# API-key auth + per-IP rate limiting + WAF block mode together, the way a real deployment
+# stacks them. The end-to-end overhead here is the number an operator actually experiences;
+# the per-stage benches and the single-feature scenarios above attribute it to its parts.
+
+[server]
+port = 8080
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = false   # direct k6 hop is untrusted, so per-IP limits key on the real peer (no XFF spoofing)
+
+[auth]
+mode = "apikey"
+api_keys = ["sk_loadtest_key"]
+
+[ratelimit]
+enabled = true
+rate = "5000/sec"
+burst = 500
+store = "local"
+
+[waf]
+mode = "block"
+sqli = true
+xss = true
+path_traversal = true
+inspect_path = true

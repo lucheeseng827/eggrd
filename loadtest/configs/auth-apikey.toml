@@ -1,0 +1,23 @@
+# Load-test scenario: AUTH (static API key).
+#
+# Isolates the cost of the auth gate on the hot path vs. the baseline. The constant-time
+# key match is sub-microsecond (see benches/auth.rs), so the end-to-end delta here should be
+# small — this scenario confirms that at throughput. The key is also injected via
+# EDGEGUARD_API_KEYS in compose; the k6 script sends it as `X-API-Key`.
+
+[server]
+port = 8080
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = false   # direct k6 hop is untrusted, so per-IP limits key on the real peer (no XFF spoofing)
+
+[auth]
+mode = "apikey"
+# Overridden/echoed by EDGEGUARD_API_KEYS in docker-compose.yml; kept here for standalone runs.
+api_keys = ["sk_loadtest_key"]
+
+[ratelimit]
+enabled = false
+
+[waf]
+mode = "off"

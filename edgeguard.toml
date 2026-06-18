@@ -1,0 +1,174 @@
+# EdgeGuard configuration (TOML).
+#
+# Everything here is OPTIONAL — EdgeGuard runs with secure defaults and reads
+# PORT / APP_PORT / UPSTREAM from the environment. This file layers richer policy
+# on top. Env vars (PORT, APP_PORT, UPSTREAM) override the [server] values below.
+
+[server]
+# Public port EdgeGuard listens on. Usually injected by the platform as $PORT.
+port = 8080
+# Internal port your app listens on (EdgeGuard sets PORT=<app_port> for the child).
+app_port = 3000
+# Or point at an external upstream instead of a wrapped child (separate-service mode):
+# upstream = "http://app.internal:3000"
+# EdgeGuard fails closed: an unreachable upstream returns 502 (it never serves forged or
+# stale content). A configurable fail-open mode returns alongside the distributed limiter
+# (see docs/ROADMAP.md, Phase 4), where it actually has a backing store that can fail.
+# Trust X-Forwarded-For for the client IP. Enable ONLY behind a trusted proxy/LB
+# (e.g. a PaaS edge); otherwise a directly reachable client can spoof its IP and
+# defeat per-IP rate limiting. Default false => use the real peer address.
+# This also governs X-Forwarded-Proto sent upstream: if EdgeGuard terminates TLS ([tls]
+# below) it forwards "https"; otherwise, when this is true the edge's incoming
+# X-Forwarded-Proto is preserved, and when false a plain-HTTP hop forwards "http".
+trust_forwarded_for = false
+# Public/private split (optional). When admin_port is non-zero, EdgeGuard serves the internal
+# ops endpoints (/__edgeguard/health, /ready, /metrics) on a SECOND, plain-HTTP listener at
+# admin_addr:admin_port instead of the public port — so metrics/health aren't exposed publicly.
+# The public port then serves only the proxy + the browser-facing CSP sink. Point your platform
+# health check at admin_port when enabled, and keep it on a trusted network (it has no auth).
+admin_port = 0            # 0 = keep internal endpoints on the public port (default)
+admin_addr = "127.0.0.1"  # loopback (same-host scraper); "0.0.0.0" for a private interface
+
+[auth]
+# Gate applied to every proxied request (the internal /__edgeguard/* endpoints are exempt):
+#   "none"   — no authentication
+#   "basic"  — HTTP Basic against [auth].users
+#   "apikey" — a static API key / bearer token from [auth].api_keys
+#   "jwt"    — a verified JWT bearer token per [auth.jwt]
+mode = "basic"
+realm = "EdgeGuard"
+# username -> password. A value starting with "$argon2" is verified as a PHC hash; anything
+# else is treated as a LITERAL plaintext password (dev only). The placeholder below is an
+# intentionally invalid "$argon2" string, so the shipped config can NEVER authenticate anyone
+# — REPLACE it before exposing anything. Generate a real hash with the built-in helper:
+#   echo -n 'your-password' | edgeguard --hash
+# (or any argon2 PHC tool, e.g. `echo -n 'pw' | argon2 "$(openssl rand -base64 16)" -id -e`)
+users = { admin = "$argon2id$REPLACE_ME$run-edgeguard---hash-to-generate-a-real-value" }
+
+# --- API-key gate (mode = "apikey") ---
+# Keys are compared in constant time and may be presented as `Authorization: Bearer <key>`
+# or in the `api_key_header`. Prefer the EDGEGUARD_API_KEYS env var (comma-separated) over
+# committing keys to this file.
+# api_keys = ["sk_live_xxx", "sk_live_yyy"]
+# api_key_header = "X-API-Key"
+
+# --- JWT gate (mode = "jwt") ---
+[auth.jwt]
+# Expected algorithm; the token's own `alg` must match (no alg-substitution/`alg=none`).
+algorithm = "HS256"   # HS256/384/512, RS256/384/512, PS*, ES256/384, EdDSA
+# HS*: shared secret. Prefer EDGEGUARD_JWT_SECRET over this file.
+secret = ""
+# RS*/ES*/PS*: a static PEM public key, OR a JWKS endpoint (keys cached + selected by `kid`).
+public_key_pem = ""
+jwks_url = ""
+jwks_cache_secs = 300
+# Optional claim checks (empty = not enforced) and clock-skew leeway.
+issuer = ""
+audience = ""
+leeway_secs = 60
+
+[ratelimit]
+enabled = true
+rate = "60/min"   # default per-client-IP limit; supports N/sec, N/min, N/hour
+burst = 20
+# Where limiter state lives. "local" (default) is the fast in-process governor limiter, but it
+# counts PER REPLICA — N instances behind a load balancer allow N× the limit. For multi-replica
+# deployments use "redis" to share one global GCRA limit across instances. "memory" uses the
+# same shared-store code path with an in-process map (single-replica / testing). Same rate/burst
+# /routes/per_key settings apply regardless of store.
+store = "local"   # "local" | "redis" | "memory"
+# Redis connection for store = "redis" (redis:// or, for TLS, rediss://). Prefer the
+# EDGEGUARD_REDIS_URL env var over committing it here.
+redis_url = "redis://127.0.0.1:6379"
+redis_prefix = "edgeguard"   # key namespace, so multiple deployments can share one Redis
+# On a store error: false (default) fails CLOSED (503, so an outage can't silently disable rate
+# limiting); true fails OPEN (allow the request — availability over strict limiting).
+fail_open = false
+# Per-route overrides (longest matching path prefix wins; still keyed per client IP).
+# A matching route's limit REPLACES the global one for that path.
+# [[ratelimit.routes]]
+# path = "/api/"
+# rate = "10/sec"
+# burst = 20
+# [[ratelimit.routes]]
+# path = "/api/admin/"
+# rate = "1/sec"
+# burst = 5
+
+# Extra limit keyed by the authenticated principal (API-key id / JWT `sub`) rather than IP,
+# so one credential can't fan out across many IPs. Only applies to authenticated requests.
+[ratelimit.per_key]
+enabled = false
+rate = "1000/hour"
+burst = 100
+
+[validation]
+max_body = "2MiB"
+# Cap on the upstream response body EdgeGuard buffers ("0" = unbounded). Set a limit
+# (e.g. "16MiB") to stop a huge upstream response from OOM-ing the proxy; raise it if
+# you proxy large downloads.
+max_response_body = "0"
+# Max time to wait for the upstream response and to read its body, e.g. "30s", "500ms",
+# "2m". "0" disables it. A stalled upstream returns 504 instead of pinning the request.
+upstream_timeout = "30s"
+# Cap on total request header bytes (sum of name + value), e.g. "32KiB". "0" disables it.
+# Requests over the limit get 431. A policy limit on top of hyper's transport-level cap.
+max_header_bytes = "0"
+# Empty list = allow all methods.
+allow_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+
+[headers]
+hsts = true
+csp = "default-src 'self'"
+# Send the CSP as Content-Security-Policy-Report-Only (collect violations without enforcing).
+csp_report_only = false
+# If set, a `report-uri <value>` directive is appended to the CSP. Point it at EdgeGuard's own
+# sink to have reports logged + counted, or at any external collector.
+# csp_report_uri = "/__edgeguard/csp-report"
+referrer_policy = "no-referrer"
+permissions_policy = "geolocation=(), microphone=(), camera=()"
+frame_options = "DENY"
+force_secure_cookies = true
+strip = ["Server", "X-Powered-By"]
+
+# --- WAF-lite input inspection (optional; OFF by default) ---
+# Screens requests for common attack signatures before forwarding. These are heuristics, so it
+# ships off and report-first: run "report" to log + count matches (edgeguard_waf_hits_total)
+# without blocking, watch for false positives, then switch to "block" (returns 403). It runs
+# after auth and the size/method checks; the internal /__edgeguard/* endpoints are never seen.
+[waf]
+mode = "off"            # "off" | "report" | "block"
+sqli = true             # built-in SQL-injection heuristics
+xss = true              # built-in cross-site-scripting heuristics
+path_traversal = true   # built-in path-traversal heuristics
+inspect_path = true     # inspect the URL path + query (matched raw AND percent-decoded)
+inspect_headers = false # inspect header values (noisy: cookies/tokens) — opt in
+inspect_body = false    # inspect the (size-capped) request body — opt in
+# Operator-defined deny patterns, matched in addition to the built-ins. `pattern` is an RE2
+# regex (linear-time, ReDoS-safe — no backreferences/lookaround). `target` is one of "path"
+# (default), "headers", "body", "all"; a location is only inspected when its inspect_* flag
+# above is on. A pattern that fails to compile is rejected on load (or kept-previous on reload).
+# [[waf.rules]]
+# id = "block-wp-probes"
+# pattern = "(?i)/wp-(admin|login)"
+# target = "path"
+
+# --- TLS termination (optional) ---
+# When enabled, EdgeGuard serves HTTPS on the public port. Provide a certificate via
+# cert_path/key_path, or have ACME obtain one automatically (see [tls.acme]).
+[tls]
+enabled = false
+cert_path = ""   # PEM certificate chain (leaf first)
+key_path = ""    # PEM private key (PKCS#8/PKCS#1/SEC1)
+
+# Automatic certificates via ACME / Let's Encrypt (HTTP-01 challenge on port 80). The issued
+# certificate is written to the cert_path/key_path above. NOTE: requires a public domain and
+# inbound :80; the default directory is Let's Encrypt STAGING so a first run can't burn the
+# strict production rate limits — switch to production explicitly when ready.
+[tls.acme]
+enabled = false
+domains = []          # e.g. ["app.example.com"]
+email = ""            # ACME account contact
+directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
+cache_dir = "./acme"  # stores the ACME account key for renewals
+accept_tos = false    # must be true to accept the provider's Terms of Service

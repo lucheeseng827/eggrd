@@ -1,0 +1,14 @@
+# Competitor baseline: Caddy as a pure reverse proxy to the SAME upstream.
+# Go integrated proxy (the GC/memory comparison). auto_https off so it never tries ACME on the
+# plain :8080 listener; admin off trims the control surface. No access log block == logging off,
+# matching EdgeGuard's RUST_LOG=warn. reverse_proxy pools upstream connections by default.
+
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+
+:8080 {
+	reverse_proxy upstream:80
+}

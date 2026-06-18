@@ -1,0 +1,9 @@
+# Never commit state (holds the private key) or the pem.
+*.pem
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+*.tfvars
+# .terraform.lock.hcl is intentionally committed to pin provider versions across
+# machines — keep it tracked for reproducible runs.

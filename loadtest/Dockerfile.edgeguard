@@ -1,0 +1,27 @@
+# Build EdgeGuard for the load-test harness.
+#
+# The build context is the crate root (module_52), NOT the monorepo root — see the
+# `context: ..` in docker-compose.yml. Copied on its own, the crate builds standalone (its
+# Cargo.toml pins literal versions with no `workspace = true` inheritance), so it does not need
+# the parent workspace to compile.
+#
+# This is a load-test artifact, deliberately separate from the production deploy templates in
+# `examples/` (which wrap a user's app). Here EdgeGuard runs in front-proxy mode against the
+# nginx stub.
+
+FROM rust:1-bookworm AS build
+WORKDIR /src
+# Cache the dependency compile: copy the manifest first, build a stub, then the real sources.
+COPY Cargo.toml ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && cargo build --release --bin edgeguard 2>/dev/null || true
+COPY . .
+# Touch so cargo recompiles the real sources over the cached deps.
+RUN touch src/main.rs src/lib.rs && cargo build --release --bin edgeguard
+
+FROM debian:bookworm-slim
+RUN useradd -r -u 10001 edgeguard
+COPY --from=build /src/target/release/edgeguard /usr/local/bin/edgeguard
+USER edgeguard
+ENTRYPOINT ["edgeguard"]

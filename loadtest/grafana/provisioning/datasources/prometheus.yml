@@ -1,0 +1,14 @@
+# Auto-wire the Prometheus datasource so `docker compose --profile observability up` gives a
+# ready-to-use Grafana (anonymous Admin) pointed at the harness Prometheus. Dashboards can then
+# be built/imported against the `edgeguard_*` series; the key panels for the white paper are
+# request-outcome rate, p99 from `edgeguard_request_duration_seconds_bucket`, and WAF/limiter hits.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

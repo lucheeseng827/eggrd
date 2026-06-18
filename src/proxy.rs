@@ -1,0 +1,968 @@
+//! Request path: header-size limit -> rate limit (per-IP / per-route) -> auth -> per-key
+//! rate limit -> method allowlist -> body-size limit -> WAF input inspection -> forward to
+//! upstream.
+//! Response path: header injection (incl. CSP / CSP-report-only) -> cookie hardening ->
+//! strip leaky headers.
+//!
+//! All policy lives in [`Runtime`], held behind an [`ArcSwap`] so a config hot-reload swaps
+//! it atomically without blocking the request path or dropping in-flight connections. The
+//! upstream client and the metric registry sit *outside* the swap so the connection pool and
+//! counters survive a reload.
+
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+use axum::{
+    body::{Body, Bytes},
+    extract::{ConnectInfo, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode},
+};
+use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, RateLimiter};
+use http_body_util::{BodyExt, Full, Limited};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use tokio::net::TcpStream;
+use tracing::{debug, info, warn};
+
+use crate::auth::{AuthEngine, Challenge, Decision};
+use crate::config::{Config, HeadersCfg};
+use crate::limiter::{Admit, DistributedLimiter};
+use crate::metrics::Metrics;
+use crate::waf::{WafEngine, WafMode};
+
+pub type KeyedLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+/// Rate limiter keyed by the authenticated principal (per-key limiting).
+pub type StrLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+pub type UpstreamClient = Client<HttpConnector, Full<Bytes>>;
+
+/// Shared, cheaply-cloned handle the router hands to every request. Only the hot-swappable
+/// [`Runtime`] changes on reload; the client and metrics are stable.
+#[derive(Clone)]
+pub struct AppState {
+    pub client: UpstreamClient,
+    pub metrics: Arc<Metrics>,
+    pub runtime: Arc<ArcSwap<Runtime>>,
+}
+
+/// A per-route rate-limit override: requests whose path starts with `prefix` use `limiter`.
+pub struct RouteLimiter {
+    pub prefix: String,
+    pub limiter: Arc<KeyedLimiter>,
+}
+
+/// All request-handling policy derived from a [`Config`]. Rebuilt from scratch on reload and
+/// swapped in atomically.
+pub struct Runtime {
+    pub cfg: Arc<Config>,
+    pub upstream_base: Arc<String>,
+    pub auth: AuthEngine,
+    /// WAF-lite input screener. Inert (`evaluate` returns `None`) when `waf.mode = "off"`.
+    pub waf: WafEngine,
+    /// Shared-store (distributed) limiter, `Some` when `ratelimit.store` is `memory`/`redis`.
+    /// When present it replaces the three `governor` limiters below (which are then `None`).
+    pub distributed: Option<DistributedLimiter>,
+    /// Global per-client-IP limiter (`None` when rate limiting is disabled or distributed).
+    pub ip_limiter: Option<Arc<KeyedLimiter>>,
+    /// Per-route limiters (also keyed per IP), checked instead of `ip_limiter` on a match.
+    pub route_limiters: Vec<RouteLimiter>,
+    /// Per-principal limiter (`None` when per-key limiting is disabled or distributed).
+    pub key_limiter: Option<Arc<StrLimiter>>,
+    pub max_body: usize,
+    /// Cap on the buffered upstream response body; `0` means unbounded.
+    pub max_response_body: usize,
+    /// Cap on total request header bytes; `0` means disabled.
+    pub max_header_bytes: usize,
+    /// Max time for the upstream request + body read; `None` disables the timeout.
+    pub upstream_timeout: Option<Duration>,
+}
+
+/// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1).
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+pub async fn handle(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+) -> Response<Body> {
+    let started = Instant::now();
+    // One atomic load pins a consistent policy snapshot for the whole request, even if a
+    // reload swaps in a new Runtime mid-flight.
+    let rt = state.runtime.load();
+    let m = &state.metrics;
+
+    let method = req.method().clone();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
+    let ip = client_ip(req.headers(), peer, rt.cfg.server.trust_forwarded_for);
+
+    // Reserve the internal namespace: never forward `/__edgeguard/*` upstream. Registered
+    // internal routes are matched before this fallback, so anything reaching here under that
+    // prefix is an unknown internal path — a `404` from EdgeGuard, not a request leaked to the
+    // app. This is also what keeps the ops endpoints (health/ready/metrics) unserved on the
+    // public listener in public/private split mode, rather than proxying them to the upstream.
+    if req.uri().path().starts_with("/__edgeguard/") {
+        return finish(
+            m,
+            &method,
+            &path,
+            ip,
+            started,
+            "not_found",
+            text(StatusCode::NOT_FOUND, "Not Found"),
+        );
+    }
+
+    // 0) Total request-header-size limit.
+    if rt.max_header_bytes > 0 && header_bytes(req.headers()) > rt.max_header_bytes {
+        return finish(
+            m,
+            &method,
+            &path,
+            ip,
+            started,
+            "header_too_large",
+            text(
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "Request Header Fields Too Large",
+            ),
+        );
+    }
+
+    // 1) Rate limit. A matching per-route override replaces the global per-IP limit. A shared
+    //    store (distributed) limiter, when configured, replaces the in-process limiters; on a
+    //    store error it fails closed (`503`) unless `ratelimit.fail_open` is set.
+    if rt.cfg.ratelimit.enabled {
+        if let Some(d) = &rt.distributed {
+            match d.check_ip_route(ip, &path).await {
+                Admit::Allowed => {}
+                Admit::Limited(scope) => {
+                    m.record_ratelimit_hit(scope);
+                    return finish(
+                        m,
+                        &method,
+                        &path,
+                        ip,
+                        started,
+                        "rate_limited",
+                        text(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
+                    );
+                }
+                Admit::Error => {
+                    return finish(
+                        m,
+                        &method,
+                        &path,
+                        ip,
+                        started,
+                        "limiter_error",
+                        text(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
+                    );
+                }
+            }
+        } else {
+            let (limiter, scope) = match longest_route(&rt.route_limiters, &path) {
+                Some(r) => (Some(r.limiter.as_ref()), "route"),
+                None => (rt.ip_limiter.as_deref(), "ip"),
+            };
+            if let Some(limiter) = limiter {
+                if limiter.check_key(&ip).is_err() {
+                    m.record_ratelimit_hit(scope);
+                    return finish(
+                        m,
+                        &method,
+                        &path,
+                        ip,
+                        started,
+                        "rate_limited",
+                        text(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
+                    );
+                }
+            }
+        }
+    }
+
+    // 2) Authentication. On success we learn the principal for per-key limiting.
+    let principal = match rt.auth.authorize(&rt.cfg.auth, req.headers()).await {
+        Decision::Allow(principal) => principal,
+        Decision::Deny(challenge) => {
+            let mut resp = text(StatusCode::UNAUTHORIZED, "Unauthorized");
+            let challenge_value = match challenge {
+                Challenge::Basic(c) => Some(c),
+                Challenge::Bearer => Some("Bearer".to_string()),
+                Challenge::None => None,
+            };
+            if let Some(c) = challenge_value {
+                if let Ok(v) = HeaderValue::from_str(&c) {
+                    resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+                }
+            }
+            return finish(m, &method, &path, ip, started, "unauthorized", resp);
+        }
+    };
+
+    // 3) Per-key rate limit (only for authenticated principals). Routed to the distributed
+    //    limiter when configured, else the in-process per-key limiter.
+    if let Some(principal) = &principal {
+        let key_admit = if let Some(d) = &rt.distributed {
+            Some(d.check_key(principal).await)
+        } else {
+            rt.key_limiter.as_ref().map(|limiter| {
+                if limiter.check_key(principal).is_err() {
+                    Admit::Limited("key")
+                } else {
+                    Admit::Allowed
+                }
+            })
+        };
+        match key_admit {
+            Some(Admit::Limited(scope)) => {
+                m.record_ratelimit_hit(scope);
+                return finish(
+                    m,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "rate_limited",
+                    text(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
+                );
+            }
+            Some(Admit::Error) => {
+                return finish(
+                    m,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "limiter_error",
+                    text(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
+                );
+            }
+            Some(Admit::Allowed) | None => {}
+        }
+    }
+
+    // 4) Method allowlist.
+    let allow = &rt.cfg.validation.allow_methods;
+    if !allow.is_empty()
+        && !allow
+            .iter()
+            .any(|x| x.eq_ignore_ascii_case(method.as_str()))
+    {
+        return finish(
+            m,
+            &method,
+            &path,
+            ip,
+            started,
+            "method_not_allowed",
+            text(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed"),
+        );
+    }
+
+    // 5) Buffer the body up to the configured limit.
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, rt.max_body).await {
+        Ok(b) => b,
+        Err(_) => {
+            return finish(
+                m,
+                &method,
+                &path,
+                ip,
+                started,
+                "payload_too_large",
+                text(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
+            )
+        }
+    };
+
+    // 6) WAF-lite input inspection. A no-op unless `waf.mode` is report/block. The body is
+    //    already buffered above, so inspecting it adds no extra read. On a match: `block` mode
+    //    returns 403; `report` mode logs + counts and forwards. Both record the hit so a
+    //    report-only rollout shows up in `edgeguard_waf_hits_total`.
+    if let Some(hit) = rt.waf.evaluate(&path, &parts.headers, &body_bytes) {
+        m.record_waf_hit(hit.class);
+        match rt.waf.mode() {
+            WafMode::Block => {
+                warn!(
+                    rule = %hit.rule_id,
+                    class = hit.class,
+                    location = hit.location,
+                    client_ip = %ip,
+                    path = %path,
+                    "WAF blocked request"
+                );
+                return finish(
+                    m,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "forbidden",
+                    text(StatusCode::FORBIDDEN, "Forbidden"),
+                );
+            }
+            WafMode::Report => warn!(
+                rule = %hit.rule_id,
+                class = hit.class,
+                location = hit.location,
+                client_ip = %ip,
+                path = %path,
+                "WAF rule matched (report-only)"
+            ),
+            // `evaluate` returns `None` when off, so this arm is unreachable; kept for
+            // exhaustiveness.
+            WafMode::Off => {}
+        }
+    }
+
+    // 7) Build the upstream request.
+    let uri = format!("{}{}", rt.upstream_base, path);
+    let mut up = Request::builder().method(parts.method.clone()).uri(&uri);
+    {
+        let headers = up.headers_mut().expect("builder headers");
+        // Drop hop-by-hop headers (the fixed set plus any named by `Connection`) before
+        // forwarding, so they don't leak across the proxy boundary.
+        let mut forwarded = parts.headers.clone();
+        strip_hop_by_hop(&mut forwarded);
+        for (name, value) in forwarded.iter() {
+            if name == header::HOST {
+                continue; // let the client set Host for the upstream
+            }
+            headers.insert(name.clone(), value.clone());
+        }
+        // Standard forwarding headers.
+        if let Ok(v) = HeaderValue::from_str(&ip.to_string()) {
+            headers.insert(HeaderName::from_static("x-forwarded-for"), v);
+        }
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static(forwarded_proto(&rt.cfg, &parts.headers)),
+        );
+    }
+
+    let upstream_req = match up.body(Full::new(body_bytes)) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "failed to build upstream request");
+            return finish(
+                m,
+                &method,
+                &path,
+                ip,
+                started,
+                "bad_gateway",
+                text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+            );
+        }
+    };
+
+    // 8) Forward and collect the response under a single deadline, so a stalled upstream
+    //    can't pin this task. `None` => no timeout (validation.upstream_timeout = "0").
+    let deadline = rt.upstream_timeout.map(|d| tokio::time::Instant::now() + d);
+    let timed_out = || {
+        warn!(upstream = %uri, "upstream timed out");
+        text(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout")
+    };
+
+    let upstream_resp = match within(deadline, state.client.request(upstream_req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            warn!(error = %e, upstream = %uri, "upstream unreachable");
+            return finish(
+                m,
+                &method,
+                &path,
+                ip,
+                started,
+                "upstream_error",
+                text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+            );
+        }
+        Err(_) => {
+            return finish(
+                m,
+                &method,
+                &path,
+                ip,
+                started,
+                "upstream_timeout",
+                timed_out(),
+            )
+        }
+    };
+
+    let (mut resp_parts, resp_body) = upstream_resp.into_parts();
+    // Buffer the upstream body, optionally capped so a huge response can't OOM the proxy.
+    let resp_bytes = if rt.max_response_body > 0 {
+        match within(
+            deadline,
+            Limited::new(resp_body, rt.max_response_body).collect(),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c.to_bytes(),
+            Ok(Err(_)) => {
+                warn!(
+                    limit = rt.max_response_body,
+                    "upstream response exceeded max_response_body"
+                );
+                return finish(
+                    m,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "upstream_body_too_large",
+                    text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+                );
+            }
+            Err(_) => {
+                return finish(
+                    m,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "upstream_timeout",
+                    timed_out(),
+                )
+            }
+        }
+    } else {
+        match within(deadline, resp_body.collect()).await {
+            Ok(Ok(c)) => c.to_bytes(),
+            Ok(Err(e)) => {
+                warn!(error = %e, "failed reading upstream body");
+                return finish(
+                    m,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "upstream_body_error",
+                    text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+                );
+            }
+            Err(_) => {
+                return finish(
+                    m,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "upstream_timeout",
+                    timed_out(),
+                )
+            }
+        }
+    };
+
+    // The body was rebuffered, so let the server recompute framing; strip hop-by-hop headers
+    // (incl. any named by `Connection`) so they don't leak downstream.
+    strip_hop_by_hop(&mut resp_parts.headers);
+    resp_parts.headers.remove(header::CONTENT_LENGTH);
+
+    let mut response = Response::from_parts(resp_parts, Body::from(resp_bytes));
+    harden_response(&rt.cfg, &mut response);
+
+    finish(m, &method, &path, ip, started, "ok", response)
+}
+
+/// Readiness probe. Returns `200` only if the upstream accepts a TCP connection, so a
+/// platform's readiness check reflects whether EdgeGuard can actually serve traffic — not
+/// merely that the process booted. `503` while the upstream is unreachable. (Liveness, i.e.
+/// "is EdgeGuard itself up", is the separate unconditional `/__edgeguard/health`.)
+pub async fn ready(State(state): State<AppState>) -> StatusCode {
+    let rt = state.runtime.load();
+    let Some((host, port)) = rt.cfg.upstream_probe_addr() else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => StatusCode::OK,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// Prometheus scrape endpoint (`GET /__edgeguard/metrics`). Like health/ready, it is a
+/// dedicated route outside the proxy fallback, so it is not subject to auth or rate limits —
+/// restrict access to `/__edgeguard/*` at the network layer if that matters in your setup.
+pub async fn metrics_handler(State(state): State<AppState>) -> Response<Body> {
+    let body = state.metrics.render();
+    let mut resp = Response::new(Body::from(body));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    resp
+}
+
+/// CSP violation report sink (`POST /__edgeguard/csp-report`). Browsers POST a JSON report
+/// here when `headers.csp_report_uri` points at it; we count and log it, then `204`.
+pub async fn csp_report(State(state): State<AppState>, body: Bytes) -> StatusCode {
+    state.metrics.record_csp_report();
+    // This endpoint is unauthenticated and a report can carry the full document URL,
+    // referrer, and query strings — logging the whole blob at `info` is both a privacy leak
+    // and a log-flood vector. Record only the directive that fired, at `debug`.
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(report) => {
+            let directive = report
+                .get("csp-report")
+                .and_then(|r| {
+                    r.get("violated-directive")
+                        .or_else(|| r.get("effective-directive"))
+                })
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            debug!(target: "edgeguard::csp", directive, "CSP violation report");
+        }
+        Err(_) => warn!(
+            bytes = body.len(),
+            "CSP violation report with an unparseable body"
+        ),
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// Resolve the client IP. The peer socket address is authoritative; `X-Forwarded-For`
+/// (first hop) is honored only when `trust_forwarded` is set, because a directly
+/// reachable client can otherwise spoof it to forge their identity.
+fn client_ip(headers: &HeaderMap, peer: SocketAddr, trust_forwarded: bool) -> IpAddr {
+    if trust_forwarded {
+        if let Some(xff) = headers.get("x-forwarded-for") {
+            if let Ok(s) = xff.to_str() {
+                if let Some(first) = s.split(',').next() {
+                    if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                        return ip;
+                    }
+                }
+            }
+        }
+    }
+    peer.ip()
+}
+
+/// Total size of the request headers (sum of name + value bytes), used for the header-size
+/// policy limit. This is an application-layer approximation of the on-wire header size.
+fn header_bytes(headers: &HeaderMap) -> usize {
+    headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
+        .sum()
+}
+
+/// Remove hop-by-hop headers so they don't leak across the proxy boundary (RFC 7230 §6.1):
+/// the fixed [`HOP_BY_HOP`] set plus any header *named* in a `Connection` header. Applied in
+/// both directions (request to upstream, response to client).
+fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    // Header names listed in any `Connection` header are connection-specific; collect them
+    // before mutating (the borrow of `headers` must end before we remove).
+    let connection_named: Vec<HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .collect();
+    for name in HOP_BY_HOP {
+        headers.remove(*name);
+    }
+    for name in connection_named {
+        headers.remove(name);
+    }
+}
+
+/// Decide the `X-Forwarded-Proto` to send upstream. If EdgeGuard terminates TLS, the client
+/// hop is HTTPS. Otherwise, behind a trusted edge (`trust_forwarded_for`) we preserve the
+/// proto the edge reported (falling back to `http`); an untrusted client's `X-Forwarded-Proto`
+/// is never honored, mirroring the client-IP trust model. Returns a `'static` token so the
+/// caller can build a `HeaderValue` without fallible parsing.
+fn forwarded_proto(cfg: &Config, headers: &HeaderMap) -> &'static str {
+    if cfg.tls.enabled {
+        return "https";
+    }
+    if cfg.server.trust_forwarded_for {
+        if let Some(value) = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+        {
+            match value.split(',').next().map(str::trim) {
+                Some(p) if p.eq_ignore_ascii_case("https") => return "https",
+                Some(p) if p.eq_ignore_ascii_case("http") => return "http",
+                _ => {}
+            }
+        }
+    }
+    "http"
+}
+
+/// Pick the most specific (longest-prefix) per-route limiter matching `path`, if any.
+fn longest_route<'a>(routes: &'a [RouteLimiter], path: &str) -> Option<&'a RouteLimiter> {
+    routes
+        .iter()
+        .filter(|r| path.starts_with(&r.prefix))
+        .max_by_key(|r| r.prefix.len())
+}
+
+/// The HSTS header value EdgeGuard emits when `headers.hsts` is on: a two-year `max-age`
+/// including subdomains. A named constant so the live proxy and the static-host config
+/// generator ([`crate::generate`]) can't drift on it.
+pub const HSTS_VALUE: &str = "max-age=63072000; includeSubDomains";
+
+/// The constant security response headers EdgeGuard injects, derived from the `[headers]`
+/// policy. This is the **single source of truth** shared by the live response-hardening path
+/// ([`harden_response`]) and the static-host config generator ([`crate::generate`]), so a
+/// generated `_headers` file / edge-middleware snippet matches exactly what the proxy would add
+/// at runtime. Returns `(name, value)` pairs with canonically-cased names (for readable
+/// generated output); the proxy normalizes the case when it inserts them.
+///
+/// Cookie hardening and leaky-header *stripping* are deliberately **not** here: both rewrite the
+/// upstream's actual response (`Set-Cookie`, `Server`/`X-Powered-By`), which a static file that
+/// can only "always add this header" cannot express. The generator documents that gap; the
+/// WASM worker, which sees the real response, applies them too.
+pub fn security_headers(cfg: &HeadersCfg) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::with_capacity(6);
+    out.push(("X-Content-Type-Options", "nosniff".to_string()));
+    if !cfg.frame_options.is_empty() {
+        out.push(("X-Frame-Options", cfg.frame_options.clone()));
+    }
+    if !cfg.referrer_policy.is_empty() {
+        out.push(("Referrer-Policy", cfg.referrer_policy.clone()));
+    }
+    if !cfg.permissions_policy.is_empty() {
+        out.push(("Permissions-Policy", cfg.permissions_policy.clone()));
+    }
+    if !cfg.csp.is_empty() {
+        // Append a report-uri directive if configured, and choose enforce vs. report-only.
+        let mut value = cfg.csp.clone();
+        if !cfg.csp_report_uri.is_empty() {
+            value.push_str("; report-uri ");
+            value.push_str(&cfg.csp_report_uri);
+        }
+        let name = if cfg.csp_report_only {
+            "Content-Security-Policy-Report-Only"
+        } else {
+            "Content-Security-Policy"
+        };
+        out.push((name, value));
+    }
+    if cfg.hsts {
+        out.push(("Strict-Transport-Security", HSTS_VALUE.to_string()));
+    }
+    out
+}
+
+/// Inject security headers, harden Set-Cookie, and strip leaky headers.
+fn harden_response(cfg: &Config, resp: &mut Response<Body>) {
+    let h = resp.headers_mut();
+
+    // Inject the constant security headers (shared with the static-host generator via
+    // `security_headers`, so the two never diverge). `from_bytes` normalizes the canonical
+    // casing to lowercase; these names/values are all valid, so the inserts don't fail.
+    for (name, value) in security_headers(&cfg.headers) {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            h.insert(n, v);
+        }
+    }
+
+    // Strip leaky headers.
+    for name in &cfg.headers.strip {
+        if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
+            h.remove(hn);
+        }
+    }
+
+    // Harden cookies: ensure Secure, HttpOnly, and a SameSite default.
+    if cfg.headers.force_secure_cookies {
+        let cookies: Vec<HeaderValue> = h.get_all(header::SET_COOKIE).iter().cloned().collect();
+        if !cookies.is_empty() {
+            h.remove(header::SET_COOKIE);
+            for c in cookies {
+                if let Ok(s) = c.to_str() {
+                    let hardened = harden_cookie(s);
+                    if let Ok(v) = HeaderValue::from_str(&hardened) {
+                        h.append(header::SET_COOKIE, v);
+                    }
+                } else {
+                    h.append(header::SET_COOKIE, c);
+                }
+            }
+        }
+    }
+}
+
+fn harden_cookie(cookie: &str) -> String {
+    // Inspect attribute *names* (the tokens after the first `name=value` pair), not the
+    // whole string — otherwise a value like `session=securetoken` would look like it
+    // already carries `Secure` and we'd skip hardening it.
+    let attrs: std::collections::HashSet<String> = cookie
+        .split(';')
+        .skip(1)
+        .filter_map(|p| p.trim().split('=').next())
+        .map(|k| k.trim().to_ascii_lowercase())
+        .collect();
+
+    let mut out = cookie.trim_end_matches(';').to_string();
+    if !attrs.contains("secure") {
+        out.push_str("; Secure");
+    }
+    if !attrs.contains("httponly") {
+        out.push_str("; HttpOnly");
+    }
+    if !attrs.contains("samesite") {
+        out.push_str("; SameSite=Lax");
+    }
+    out
+}
+
+/// Run `fut` bounded by an optional deadline. `None` means no timeout. On success returns
+/// the future's own output; `Err(Elapsed)` if the deadline passed first.
+async fn within<F: Future>(
+    deadline: Option<tokio::time::Instant>,
+    fut: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match deadline {
+        Some(dl) => tokio::time::timeout_at(dl, fut).await,
+        None => Ok(fut.await),
+    }
+}
+
+fn text(status: StatusCode, msg: &str) -> Response<Body> {
+    let mut resp = Response::new(Body::from(msg.to_string()));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    resp
+}
+
+/// Emit a structured access-log line, record metrics, and return the response.
+fn finish(
+    metrics: &Metrics,
+    method: &Method,
+    path: &str,
+    ip: IpAddr,
+    started: Instant,
+    outcome: &str,
+    resp: Response<Body>,
+) -> Response<Body> {
+    let elapsed = started.elapsed();
+    info!(
+        %method,
+        path = %path,
+        client_ip = %ip,
+        status = resp.status().as_u16(),
+        outcome,
+        latency_ms = elapsed.as_millis() as u64,
+        "request"
+    );
+    metrics.record_request(outcome);
+    metrics.observe_latency(elapsed);
+    resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers_with(name: &'static str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(name, HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    #[test]
+    fn client_ip_ignores_xff_when_untrusted() {
+        let peer: SocketAddr = "203.0.113.9:55000".parse().unwrap();
+        let h = headers_with("x-forwarded-for", "1.2.3.4");
+        // Untrusted: a directly reachable client must not be able to spoof its IP.
+        assert_eq!(client_ip(&h, peer, false), peer.ip());
+    }
+
+    #[test]
+    fn client_ip_uses_first_xff_hop_when_trusted() {
+        let peer: SocketAddr = "203.0.113.9:55000".parse().unwrap();
+        let h = headers_with("x-forwarded-for", "1.2.3.4, 5.6.7.8");
+        assert_eq!(client_ip(&h, peer, true).to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_peer_on_missing_or_garbage_xff() {
+        let peer: SocketAddr = "203.0.113.9:55000".parse().unwrap();
+        assert_eq!(client_ip(&HeaderMap::new(), peer, true), peer.ip());
+        let garbage = headers_with("x-forwarded-for", "not-an-ip");
+        assert_eq!(client_ip(&garbage, peer, true), peer.ip());
+    }
+
+    #[test]
+    fn header_bytes_sums_names_and_values() {
+        let mut h = HeaderMap::new();
+        h.insert("a", HeaderValue::from_static("bb")); // 1 + 2
+        h.insert("ccc", HeaderValue::from_static("dddd")); // 3 + 4
+        assert_eq!(header_bytes(&h), 1 + 2 + 3 + 4);
+    }
+
+    #[test]
+    fn strip_hop_by_hop_removes_fixed_and_connection_named() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, X-Custom-Hop"),
+        );
+        h.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        h.insert("x-custom-hop", HeaderValue::from_static("secret"));
+        h.insert("content-type", HeaderValue::from_static("text/plain"));
+        strip_hop_by_hop(&mut h);
+        assert!(!h.contains_key("connection"));
+        assert!(!h.contains_key("keep-alive"));
+        // A header named by Connection is connection-specific and must be dropped.
+        assert!(!h.contains_key("x-custom-hop"));
+        // An end-to-end header is preserved.
+        assert!(h.contains_key("content-type"));
+    }
+
+    #[test]
+    fn forwarded_proto_reflects_tls_and_trust() {
+        let mut cfg = Config::default();
+
+        // We terminate TLS -> always https, regardless of any incoming header.
+        cfg.tls.enabled = true;
+        assert_eq!(
+            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "http")),
+            "https"
+        );
+
+        // Plain HTTP, untrusted: http, and an incoming XFP is NOT trusted.
+        cfg.tls.enabled = false;
+        cfg.server.trust_forwarded_for = false;
+        assert_eq!(
+            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "https")),
+            "http"
+        );
+
+        // Plain HTTP behind a trusted edge: preserve the edge's reported proto.
+        cfg.server.trust_forwarded_for = true;
+        assert_eq!(
+            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "https")),
+            "https"
+        );
+        assert_eq!(
+            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "http, https")),
+            "http"
+        );
+        // Missing or unrecognized -> http.
+        assert_eq!(forwarded_proto(&cfg, &HeaderMap::new()), "http");
+        assert_eq!(
+            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "garbage")),
+            "http"
+        );
+    }
+
+    #[test]
+    fn longest_route_picks_most_specific_prefix() {
+        let mk = |p: &str| RouteLimiter {
+            prefix: p.to_string(),
+            limiter: Arc::new(RateLimiter::keyed(governor::Quota::per_second(
+                std::num::NonZeroU32::new(1).unwrap(),
+            ))),
+        };
+        let routes = vec![mk("/api/"), mk("/api/admin/")];
+        assert_eq!(
+            longest_route(&routes, "/api/admin/users").map(|r| r.prefix.as_str()),
+            Some("/api/admin/")
+        );
+        assert_eq!(
+            longest_route(&routes, "/api/things").map(|r| r.prefix.as_str()),
+            Some("/api/")
+        );
+        assert!(longest_route(&routes, "/public").is_none());
+    }
+
+    #[test]
+    fn harden_cookie_adds_missing_flags() {
+        let out = harden_cookie("sid=abc");
+        assert!(out.contains("; Secure"), "{out}");
+        assert!(out.contains("; HttpOnly"), "{out}");
+        assert!(out.contains("; SameSite=Lax"), "{out}");
+    }
+
+    #[test]
+    fn harden_cookie_preserves_existing_attributes() {
+        let out = harden_cookie("sid=abc; HttpOnly; SameSite=Strict");
+        assert!(out.contains("; Secure"), "{out}");
+        assert!(out.contains("SameSite=Strict"), "{out}");
+        // existing SameSite isn't overridden, HttpOnly isn't duplicated
+        assert!(!out.contains("SameSite=Lax"), "{out}");
+        assert_eq!(out.matches("HttpOnly").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn harden_cookie_value_resembling_an_attr_is_not_skipped() {
+        // The value contains the substring "secure" but there is no Secure *attribute*;
+        // it must still be added (regression guard for the token-vs-substring fix).
+        let out = harden_cookie("session=securetoken");
+        assert!(out.contains("; Secure"), "{out}");
+    }
+
+    #[test]
+    fn security_headers_reflects_config_toggles() {
+        // Defaults: every header present, CSP enforced (not report-only).
+        let cfg = HeadersCfg::default();
+        let got = security_headers(&cfg);
+        let names: Vec<&str> = got.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"X-Content-Type-Options"));
+        assert!(names.contains(&"X-Frame-Options"));
+        assert!(names.contains(&"Referrer-Policy"));
+        assert!(names.contains(&"Permissions-Policy"));
+        assert!(names.contains(&"Content-Security-Policy"));
+        assert!(names.contains(&"Strict-Transport-Security"));
+        assert!(!names.contains(&"Content-Security-Policy-Report-Only"));
+
+        // Disabling HSTS and clearing frame_options drops exactly those; report-only flips the
+        // CSP header name and report_uri is appended to the value.
+        let cfg = HeadersCfg {
+            hsts: false,
+            frame_options: String::new(),
+            csp: "default-src 'self'".into(),
+            csp_report_only: true,
+            csp_report_uri: "/__edgeguard/csp-report".into(),
+            ..HeadersCfg::default()
+        };
+        let got = security_headers(&cfg);
+        let map: std::collections::HashMap<&str, String> =
+            got.iter().map(|(n, v)| (*n, v.clone())).collect();
+        assert!(!map.contains_key("Strict-Transport-Security"));
+        assert!(!map.contains_key("X-Frame-Options"));
+        assert!(!map.contains_key("Content-Security-Policy"));
+        assert_eq!(
+            map.get("Content-Security-Policy-Report-Only")
+                .map(|s| s.as_str()),
+            Some("default-src 'self'; report-uri /__edgeguard/csp-report")
+        );
+    }
+}

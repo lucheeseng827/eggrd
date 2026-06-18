@@ -1,0 +1,40 @@
+# Wrap-your-app template (Node) — drop this into your app repo as `Dockerfile`.
+#
+# EdgeGuard becomes the container entrypoint: it binds the platform-injected $PORT,
+# launches your app on $APP_PORT, and proxies to it. Your app needs ZERO changes —
+# just make sure it reads PORT from the environment (EdgeGuard sets PORT=$APP_PORT
+# for the child process).
+
+# ---- 1. Obtain the EdgeGuard binary -----------------------------------------
+# Option A (preferred once published): copy from the released image.
+#   COPY --from=ghcr.io/lucheeseng827/edgeguard:0.1.0 /usr/local/bin/edgeguard /usr/local/bin/edgeguard
+# Option B (until then): build from source.
+FROM rust:1.94-slim AS edgeguard
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install --git https://github.com/lucheeseng827/edgeguard --tag v0.1.0 --root /out
+
+# ---- 2. Build your app ------------------------------------------------------
+FROM node:22-slim AS app
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+# RUN npm run build   # uncomment if you have a build step
+
+# ---- 3. Final runtime image -------------------------------------------------
+FROM node:22-slim
+WORKDIR /app
+RUN useradd -r -u 10001 appuser
+COPY --from=app /app /app
+COPY --from=edgeguard /out/bin/edgeguard /usr/local/bin/edgeguard
+# Place edgeguard.toml at your repo root before building (grab the template from
+# EdgeGuard's examples/ — i.e. rust_modules/lab/module_52/edgeguard.toml).
+COPY edgeguard.toml /etc/edgeguard.toml
+
+# EdgeGuard binds $PORT (set by the platform); your app runs on $APP_PORT.
+ENV APP_PORT=3000
+USER appuser
+
+# Replace "node server.js" with your app's start command.
+ENTRYPOINT ["edgeguard", "--config", "/etc/edgeguard.toml", "--wrap", "node server.js"]

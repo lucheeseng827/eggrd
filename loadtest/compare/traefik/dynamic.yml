@@ -1,0 +1,17 @@
+# Traefik dynamic config: one catch-all router -> the shared upstream. No middlewares
+# (no auth/limit/headers) so this is the bare proxy tax, comparable to EdgeGuard's baseline.
+
+http:
+  routers:
+    catchall:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - web
+      service: backend
+
+  services:
+    backend:
+      loadBalancer:
+        passHostHeader: true
+        servers:
+          - url: "http://upstream:80"

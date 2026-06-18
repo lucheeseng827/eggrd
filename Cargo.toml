@@ -1,0 +1,103 @@
+[package]
+# Published to crates.io as `eggrd` ("edgeguard" is taken by an unrelated crate). The binary and
+# library keep the name `edgeguard` (see [lib]/[[bin]] below), so the CLI, env vars (EDGEGUARD_*),
+# the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
+# crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
+name = "eggrd"
+version = "0.1.1"
+edition = "2021"
+description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/nick-rust-project"
+readme = "README.md"
+keywords = ["proxy", "reverse-proxy", "security", "waf", "rate-limit"]
+categories = ["web-programming::http-server", "network-programming", "command-line-utilities"]
+# Keep the published package lean: ship the crate + its config reference + benches, not the load-test
+# rig, the detached wasm worker, docs, or deploy examples.
+exclude = ["loadtest/", "worker/", "docs/", "examples/", "tests/", ".github/", ".ossync.yaml"]
+
+# Package id is `eggrd`, but the compiled artifacts stay `edgeguard` so nothing downstream renames.
+[lib]
+name = "edgeguard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "edgeguard"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "server-auto", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+governor = "0.6"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# WAF-lite input inspection: the built-in SQLi/XSS/path-traversal heuristics and the
+# operator-supplied `[[waf.rules]]` deny patterns. The `regex` crate matches in linear time
+# and rejects backreferences/lookaround, so a user-supplied pattern can't trigger catastrophic
+# backtracking (ReDoS) — a safety property we rely on for the configurable rules.
+regex = "1"
+# JWT verification (HS*/RS*/ES*/PS*/EdDSA) and JWKS parsing.
+jsonwebtoken = "9"
+# JWKS fetch over HTTPS. `rustls-tls` avoids a system OpenSSL dependency; default features
+# (native-tls, gzip, …) are off — a plain GET is all the JWKS client needs.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Distributed (shared-store) rate limiter for multi-replica deployments: a Redis-backed GCRA
+# store (`ratelimit.store = "redis"`). `tokio-comp` for async, `connection-manager` for
+# auto-reconnect, `tokio-rustls-comp` so `rediss://` TLS uses rustls (no system OpenSSL),
+# matching the rest of the crate. Only used when the distributed limiter is enabled.
+redis = { version = "1", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
+# Lock-free atomic swap of the live policy, so config hot-reload never blocks the request
+# path nor drops in-flight connections.
+arc-swap = "1"
+# Watch the config file for changes (hot-reload).
+notify = "6"
+# TLS termination. `ring` pins a single crypto provider so the rustls config is deterministic
+# regardless of which provider other crates pull in.
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+# Adapt the axum router onto a manual hyper connection when terminating TLS ourselves.
+tower = { version = "0.5", features = ["util"] }
+# ACME / Let's Encrypt automatic certificates (HTTP-01), and CSR/key generation for it.
+instant-acme = "0.7"
+rcgen = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+# `std` pulls in `password-hash`'s getrandom-backed `OsRng` for the `--hash` helper's
+# salt generation (verification works without it; salting a fresh hash needs an RNG).
+argon2 = { version = "0.5", features = ["std"] }
+
+# Process-group signaling in the supervisor is Unix-only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Micro-benchmark harness for the request-path hot spots (auth gate, WAF regex eval, response
+# hardening, config parsing). Macro/throughput load testing lives out-of-process under
+# `loadtest/` (k6 + docker-compose); these criterion benches isolate the per-call cost of the
+# pure-Rust pipeline stages that the macro test can only measure end-to-end. See docs/TESTPLAN.md.
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "auth"
+harness = false
+
+[[bench]]
+name = "waf"
+harness = false
+
+[[bench]]
+name = "response"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

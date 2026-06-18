@@ -1,0 +1,32 @@
+# Cloudflare Workers config for the EdgeGuard edge build.
+#
+# Build: `worker-build` compiles this crate to wasm and emits the JS shim at build/worker/shim.mjs.
+#   cargo install worker-build      # once
+#   npx wrangler deploy             # runs [build].command, then deploys
+name = "edgeguard-worker"
+main = "build/worker/shim.mjs"
+# Pin the Workers runtime behavior. Set to the date this worker was authored against; bump it
+# (and re-test) to opt into newer runtime semantics. Cloudflare supports older dates indefinitely.
+compatibility_date = "2026-06-08"
+
+[build]
+command = "worker-build --release"
+
+# --- Non-secret configuration (safe to commit) ---
+# Mirrors EdgeGuard's [headers] policy + the edge-auth subset. See ../src/proxy.rs for the
+# response-hardening source of truth and README.md for the full variable contract.
+[vars]
+EDGEGUARD_ORIGIN = "https://origin.example.com"   # the app EdgeGuard fronts (REQUIRED)
+EDGEGUARD_AUTH_MODE = "none"                        # "none" | "basic" | "apikey"
+EDGEGUARD_REALM = "EdgeGuard"
+EDGEGUARD_API_KEY_HEADER = "X-API-Key"
+EDGEGUARD_HSTS = "true"
+EDGEGUARD_CSP = "default-src 'self'"
+EDGEGUARD_FRAME_OPTIONS = "DENY"
+EDGEGUARD_REFERRER_POLICY = "no-referrer"
+EDGEGUARD_PERMISSIONS_POLICY = "geolocation=(), microphone=(), camera=()"
+EDGEGUARD_STRIP = "Server,X-Powered-By"
+
+# --- Secrets: DO NOT put these in [vars]. Set them with `wrangler secret put <NAME>` ---
+#   EDGEGUARD_BASIC_USER   EDGEGUARD_BASIC_PASS    # for EDGEGUARD_AUTH_MODE = "basic"
+#   EDGEGUARD_API_KEYS                             # comma-separated; for "apikey"

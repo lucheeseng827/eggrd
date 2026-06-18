@@ -1,0 +1,24 @@
+# Load-test scenario: RATE LIMIT (in-process `governor` / GCRA).
+#
+# A high but finite per-IP limit. Under k6's offered load the limiter should admit ~`rate`
+# requests/sec and shed the rest as 429 — the k6 ratelimit script asserts the admitted rate
+# tracks the configured rate (within burst tolerance) and that shedding is cheap. This is the
+# `store = "local"` arm of the limiter comparison; ratelimit-redis.toml is the shared-store arm.
+
+[server]
+port = 8080
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = false   # direct k6 hop is untrusted, so per-IP limits key on the real peer (no XFF spoofing)
+
+[auth]
+mode = "none"
+
+[ratelimit]
+enabled = true
+rate = "5000/sec"
+burst = 500
+store = "local"
+
+[waf]
+mode = "off"

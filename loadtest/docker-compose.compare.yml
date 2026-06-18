@@ -1,0 +1,71 @@
+# Competitor overlay for the EdgeGuard load-test harness.
+#
+# Adds five market reverse proxies as drop-in alternatives to the `edgeguard` service, each in
+# pure-passthrough config to the SAME `upstream` (defined in docker-compose.yml). Run with both
+# files so the shared upstream/network/prometheus from the base harness are reused:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.compare.yml up -d upstream nginx-proxy
+#   podman  compose -f docker-compose.yml -f docker-compose.compare.yml up -d upstream nginx-proxy
+#
+# Easier: use ./run-compare.sh <target> [script], which wires this up and runs k6 for you.
+#
+# Each proxy listens on :8080 inside the compose network (so the k6 BASE_URL is uniform:
+# http://<service>:8080) and publishes a distinct host port for ad-hoc curl / readiness:
+#   nginx-proxy 8081 · haproxy 8082 · caddy 8083 · traefik 8084 · envoy 8085
+# (edgeguard itself stays on 8080, from the base compose file.)
+#
+# Reproducibility: images below are minor-version tags (mutable). For a *published*
+# comparison, pin each to its immutable digest so a tag re-point can't change the
+# proxy under test between runs. Resolve digests at pin time, e.g.:
+#   docker buildx imagetools inspect nginx:1.27-alpine --format '{{.Manifest.Digest}}'
+# then use `image: nginx:1.27-alpine@sha256:<digest>`.
+
+name: edgeguard-loadtest      # MUST match base compose so the `upstream` service & network are shared
+
+services:
+  nginx-proxy:
+    image: nginx:1.27-alpine
+    depends_on: [upstream]
+    volumes:
+      - ./compare/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8081:8080"
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    depends_on: [upstream]
+    volumes:
+      - ./compare/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    # maxconn 60000 needs ~120k FDs; Docker's default nofile (32768) is below that and HAProxy
+    # aborts at boot. Raise it (Podman's default was already high enough, so this only bit on Docker).
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    ports:
+      - "8082:8080"
+
+  caddy:
+    image: caddy:2.8-alpine
+    depends_on: [upstream]
+    volumes:
+      - ./compare/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "8083:8080"
+
+  traefik:
+    image: traefik:v3.1
+    depends_on: [upstream]
+    volumes:
+      - ./compare/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./compare/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    ports:
+      - "8084:8080"
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    depends_on: [upstream]
+    volumes:
+      - ./compare/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    ports:
+      - "8085:8080"

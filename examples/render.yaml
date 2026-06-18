@@ -1,0 +1,12 @@
+# Render Blueprint (render.yaml) — co-process mode.
+# Render builds your repo's Dockerfile (use examples/Dockerfile.node or .python).
+# Render injects $PORT; EdgeGuard binds it and wraps your app on APP_PORT.
+services:
+  - type: web
+    name: my-vibe-app
+    runtime: docker
+    healthCheckPath: /__edgeguard/health
+    envVars:
+      - key: APP_PORT
+        value: "3000"
+      # Set auth/rate-limit policy via the baked-in edgeguard.toml, or override here.

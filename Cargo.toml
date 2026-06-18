@@ -4,11 +4,11 @@
 # the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
 # crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
 name = "eggrd"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
 license = "Apache-2.0"
-repository = "https://github.com/lucheeseng827/nick-rust-project"
+repository = "https://github.com/lucheeseng827/eggrd"
 readme = "README.md"
 keywords = ["proxy", "reverse-proxy", "security", "waf", "rate-limit"]
 categories = ["web-programming::http-server", "network-programming", "command-line-utilities"]

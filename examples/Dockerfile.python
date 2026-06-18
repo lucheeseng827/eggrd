@@ -6,13 +6,13 @@
 # frameworks that read PORT directly).
 
 # ---- 1. Obtain the EdgeGuard binary -----------------------------------------
-# Option A (preferred once published):
-#   COPY --from=ghcr.io/lucheeseng827/edgeguard:0.1.0 /usr/local/bin/edgeguard /usr/local/bin/edgeguard
-# Option B (until then): build from source.
+# Option A (smallest image): copy the prebuilt binary from the released image.
+#   COPY --from=mancube/eggrd:latest /usr/local/bin/edgeguard /usr/local/bin/edgeguard
+# Option B: install the published crate from crates.io (package `eggrd`, binary `edgeguard`).
 FROM rust:1.94-slim AS edgeguard
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN cargo install --git https://github.com/lucheeseng827/edgeguard --tag v0.1.0 --root /out
+RUN cargo install eggrd --root /out
 
 # ---- 2. Build your app ------------------------------------------------------
 FROM python:3.12-slim AS app

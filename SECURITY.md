@@ -13,7 +13,7 @@ EdgeGuard is pre-1.0 (`0.x`). Only the latest released version receives security
 
 Instead, report privately via one of:
 
-- GitHub's [private vulnerability reporting](https://github.com/lucheeseng827/edgeguard/security/advisories/new)
+- GitHub's [private vulnerability reporting](https://github.com/lucheeseng827/eggrd/security/advisories/new)
   (preferred), or
 - email the maintainer directly.
 

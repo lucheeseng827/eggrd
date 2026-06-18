@@ -23,6 +23,85 @@ EdgeGuard owns the request path (auth, rate-limit, validation) and the response 
 > Redis, compiles but is proven only against a live deploy). Codename "EdgeGuard" is a working
 > title — see the [roadmap](docs/ROADMAP.md).
 
+## Where it fits
+
+EdgeGuard is a **reverse proxy you put directly in front of one app** — the secure front door
+between the public internet (or your platform's load balancer) and your application process. It
+terminates/authenticates the request, forwards it to your app *unchanged*, and hardens the
+response on the way back.
+
+```text
+         public internet
+    (clients · bots · scanners)
+               │   :443 / :8080
+               │   TLS · auth · rate-limit · WAF · request validation
+               ▼
+       ┌──────────────────┐
+       │     EdgeGuard     │   ◀── this project (the secure front door)
+       └──────────────────┘
+               │   plain HTTP on APP_PORT, localhost only
+               │   CSP · HSTS · cookie hardening · leaky-header stripping on the way back
+               ▼
+       ┌──────────────────┐
+       │      your app     │   ◀── unchanged (Node / Python / Go / Rust / …)
+       └──────────────────┘
+               │
+               ▼
+        DB · internal APIs
+```
+
+In the larger picture it sits **between your edge (CDN / platform LB / DNS) and your app** — one
+hop, one upstream:
+
+```text
+  DNS ─▶ [ CDN / platform LB ] ─▶ [ EdgeGuard ] ─▶ [ your app ] ─▶ [ DB / internal APIs ]
+          optional: caching, DDoS    this project     unchanged
+```
+
+Run it as the container **entrypoint that wraps your app**, or as a **separate front service**
+pointing at an upstream URL — see [Two deployment modes](#two-deployment-modes).
+
+### What it does *not* replace
+
+EdgeGuard is a focused security front door, not a platform. It does **not** replace:
+
+- **Your CDN / DDoS edge** (Cloudflare, Fastly, CloudFront) — it hardens one origin; no global
+  caching, anycast, or volumetric DDoS absorption. Run it *behind* the CDN.
+- **A full WAF** (ModSecurity, Coraza, AWS WAF) — the built-in [WAF-lite](#waf-lite-input-rules)
+  is heuristic and off by default: signatures, not a managed rule feed.
+- **An identity provider** (Auth0, Keycloak, Cognito) — it *verifies* tokens (JWT/JWKS) and gates
+  with Basic / API-key; it doesn't issue tokens, manage users, or run OAuth flows.
+- **An API gateway / service mesh** (Kong, Istio, Envoy mesh) — one upstream, no service
+  discovery, routing fabric, or request transformation beyond the security pipeline.
+- **Your app's own authorization** — it's a coarse front-door gate (is this request allowed in at
+  all); per-user / per-resource permissions still live in your app.
+- **Platform-terminated TLS** — on most PaaS you leave TLS off and let the platform manage certs;
+  TLS termination here is for the VPS / front-proxy path.
+
+### Moving an existing app behind it
+
+- **Exposed directly today, no proxy** (a Node/Python/Go server on a VPS or PaaS): make EdgeGuard
+  the entrypoint and bind your app to `APP_PORT` (localhost). One Dockerfile change (see
+  [`examples/`](examples/)) and the app gains auth + rate-limit + headers with **zero code
+  changes** — your app stops listening on the public port, EdgeGuard does.
+  ```bash
+  # before:  node server.js                      # app listens on $PORT, public
+  # after:   EdgeGuard binds $PORT, runs the app on APP_PORT
+  PORT=8080 APP_PORT=3000 edgeguard --config edgeguard.toml --wrap "node server.js"
+  ```
+- **Behind plain nginx / Caddy** (TLS + reverse proxy only, no auth/limits): drop EdgeGuard
+  between that proxy and the app, or replace the proxy — point `UPSTREAM` at your app and let
+  EdgeGuard own TLS too.
+  ```bash
+  UPSTREAM=http://127.0.0.1:3000 edgeguard --config edgeguard.toml
+  ```
+- **Coming off a hosted gate** (oauth2-proxy + nginx, or Cloudflare Access in front): EdgeGuard
+  folds the auth gate + rate-limit + header hardening into one static binary next to the app —
+  fewer moving parts, no extra network hop, self-hostable and portable across providers.
+- **Static / edge host** (Vercel, Netlify, Cloudflare Pages) where you can't run a long-lived
+  proxy: use [`edgeguard generate`](#static--edge-hosts) to emit the hardening config, or the
+  [Cloudflare Worker](worker/README.md) for auth + hardening at the edge.
+
 ## What it does
 
 - **Reverse proxy** to one upstream (a wrapped child process, or an external URL).

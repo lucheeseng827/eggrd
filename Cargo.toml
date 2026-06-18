@@ -4,7 +4,7 @@
 # the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
 # crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
 name = "eggrd"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
 license = "Apache-2.0"
@@ -14,7 +14,9 @@ keywords = ["proxy", "reverse-proxy", "security", "waf", "rate-limit"]
 categories = ["web-programming::http-server", "network-programming", "command-line-utilities"]
 # Keep the published package lean: ship the crate + its config reference + benches, not the load-test
 # rig, the detached wasm worker, docs, or deploy examples.
-exclude = ["loadtest/", "worker/", "docs/", "examples/", "tests/", ".github/", ".ossync.yaml"]
+# `ee/` is the PRIVATE control plane (its own workspace) — it must never be packaged into the
+# public `eggrd` crate. Keep it first; the rest just trims the published tarball.
+exclude = ["ee/", "loadtest/", "worker/", "docs/", "examples/", "tests/", ".github/", ".ossync.yaml"]
 
 # Package id is `eggrd`, but the compiled artifacts stay `edgeguard` so nothing downstream renames.
 [lib]

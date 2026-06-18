@@ -1,0 +1,185 @@
+# Changelog
+
+All notable changes to EdgeGuard are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.3] — 2026-06-19
+
+### Added
+- README **"Where it fits"** section: high-level architecture diagrams (front-door + wider-stack
+  placement), a "what it does *not* replace" list, and migration examples for moving an existing
+  app behind EdgeGuard (from no-proxy / plain nginx / a hosted gate / a static host).
+- **Multi-arch release image** `mancube/eggrd` (Docker Hub) — `linux/amd64` + `linux/arm64`, a
+  static musl binary on `distroless/static`; see `Dockerfile`.
+
+### Changed
+- Deploy templates and docs point the container image at `mancube/eggrd` (Docker Hub) and the
+  build-from-source step at `cargo install eggrd`; repository links use `lucheeseng827/eggrd`.
+
+## [0.1.2] — 2026-06-18
+
+### Changed
+- Crate `repository` metadata now points at the public mirror `lucheeseng827/eggrd` (was the
+  development monorepo, whose link 404s for the public). Metadata-only; no code change.
+
+## [0.1.1] — 2026-06-18
+
+### Changed
+- README rewritten to a neutral, data-plane-only tone — dropped the hosted/SaaS roadmap framing
+  and the commercial control-plane licensing note. No code change.
+
+## [0.1.0] — 2026-06-18
+
+First public release on crates.io, published as the **`eggrd`** package — the name `edgeguard`
+was already taken, so the crate is `eggrd` while the binary and library keep the name
+`edgeguard` (the CLI, the `EDGEGUARD_*` env vars, and the `/__edgeguard/*` namespace are
+unchanged). Ships the v0–v2.5 feature set below.
+
+> **Note:** 0.1.0 and 0.1.1 are **yanked** — they carried, respectively, a `repository` link to
+> the private monorepo and an interim README. Use **0.1.2+**.
+
+### Changed
+- **License consolidated to Apache-2.0** (was MIT OR Apache-2.0), pre-release.
+
+### Added
+- **Phase 5 / v2.5 (static/edge surface):**
+  - **Static-host / edge config generator** (`edgeguard generate --target <t>`): renders the
+    `[headers]` policy into a `_headers` file (Netlify / Cloudflare Pages), a `vercel.json` headers
+    block, a Vercel Edge Middleware (`middleware.ts`), or a Netlify Edge Function. `--out <path>`
+    writes to a file (otherwise stdout). Every target renders from a new shared
+    `proxy::security_headers` — the **same** source of truth the live proxy injects — so generated
+    config can't drift from runtime; an integration test cross-checks the generated `_headers`
+    against a real proxied response. (A static `_headers` file can only *add* headers, so cookie
+    hardening / leaky-header stripping / auth are documented as worker-only.) See `src/generate.rs`.
+  - **Rust→WASM Cloudflare Worker** (`worker/`): a detached-workspace crate that compiles to
+    `wasm32-unknown-unknown` via `worker-build`. It authenticates at the edge (HTTP Basic / static
+    API key, constant-time), forwards to the configured origin, and hardens the response (security
+    headers + cookie hardening + leaky-header stripping) — mirroring `src/proxy.rs` / `src/auth.rs`.
+    The pure logic (header set, auth decision, cookie hardening, env parsing, origin-URL joining)
+    is unit-tested on the native target and the wasm entrypoint compiles clean under
+    `cargo clippy --target wasm32-unknown-unknown -D warnings`; the `fetch` runtime is *proven only
+    against a live Cloudflare deploy* (like ACME / Redis). Rate limiting and JWT are out of scope
+    for the edge subset. See `worker/README.md`.
+  - Refactor: extracted `proxy::security_headers` + `proxy::HSTS_VALUE` as the single source of
+    truth for the injected security-header set, now shared by the live proxy and the generator.
+- **Phase 4 / v2 (WAF-lite), in progress:**
+  - **WAF-lite input inspection** (`[waf]`, **off by default**): built-in heuristic **SQLi**,
+    **XSS**, and **path-traversal** rulesets screen the request path/query (matched both raw and
+    percent-decoded) and, opt-in (`inspect_headers` / `inspect_body`), header values and the
+    size-capped request body. `mode = "report"` logs + counts matches without blocking;
+    `mode = "block"` returns `403 Forbidden`. Each built-in ruleset is individually toggleable.
+    Runs after auth and the size/method checks; the internal `/__edgeguard/*` endpoints are
+    never inspected. See `src/waf.rs`.
+  - **Custom deny patterns / pluggable rule sets** (`[[waf.rules]]`): operator-defined RE2 regex
+    rules with a per-rule `target` (`path` / `headers` / `body` / `all`), evaluated alongside the
+    built-ins. RE2 matching is linear-time and rejects backreferences/lookaround, so an operator
+    pattern can't cause catastrophic backtracking (ReDoS); a pattern that fails to compile (or an
+    unknown `target`) is rejected at startup/reload like any other config error.
+  - `edgeguard_waf_hits_total{rule="sqli|xss|path_traversal|custom"}` metric, counting both
+    report-only and blocked matches; blocked requests are additionally counted under the existing
+    `forbidden` request outcome. The startup log line now also reports the active `waf` mode.
+  - **Distributed (shared-store) rate limiter** (`ratelimit.store`): in addition to the default
+    in-process `governor` limiter (`"local"`), a **Redis**-backed shared store (`"redis"`) so
+    multiple replicas enforce one global GCRA limit (`redis_url` / `redis_prefix`, or the
+    `EDGEGUARD_REDIS_URL` env var; `rediss://` TLS supported). The GCRA check-and-update runs
+    atomically as a Redis Lua script. `ratelimit.fail_open` controls behavior when the store is
+    unreachable: fail-closed `503` (default) or fail-open allow — this is the failure path the
+    removed `fail_mode` knob was meant for. A `"memory"` store exercises the same shared-store
+    code path in-process. *The Redis transport is compiled but, like ACME, is not covered by the
+    in-process test suite (the GCRA core and the in-memory store are); see `src/limiter.rs`.*
+  - **Public/private service split** (`server.admin_port` / `server.admin_addr`, or the
+    `ADMIN_PORT` env var): when set, the internal ops endpoints (`/__edgeguard/health`, `/ready`,
+    `/metrics`) are served on a separate, plain-HTTP **private listener**, keeping them off the
+    public port; the public port serves only the proxy plus the browser-facing CSP report sink.
+    The `/__edgeguard/*` namespace is now **reserved** — unknown internal paths return `404`
+    rather than being forwarded upstream (`not_found` outcome). New `build_public_router` /
+    `build_admin_router`, and a `limiter_error` outcome for fail-closed store errors.
+- **Phase 3 / v1 (self-hostable & production-usable):**
+  - **JWT auth** (`auth.mode = "jwt"`): HS/RS/ES/PS/EdDSA verification with either a static
+    secret/PEM key or a fetched, **cached JWKS** (keys selected by `kid`, refreshed on miss or
+    TTL expiry). The configured algorithm is pinned, so a token can't substitute its own `alg`
+    (`alg=none`/HS-vs-RS confusion). Optional `issuer`/`audience`/leeway checks.
+  - **Static API-key / bearer-token gate** (`auth.mode = "apikey"`): constant-time match of
+    `Authorization: Bearer <key>` or a configurable header (default `X-API-Key`); keys may come
+    from `EDGEGUARD_API_KEYS`.
+  - **Per-route and per-key rate limits**: per-route overrides matched by longest path prefix
+    (`[[ratelimit.routes]]`) and an optional per-principal limit (`[ratelimit.per_key]`) keyed
+    by API-key id / JWT subject.
+  - **TLS termination** (`[tls]`) via `rustls` + `tokio-rustls`, loading a PEM cert/key, with
+    **ACME / Let's Encrypt** automatic certificates over HTTP-01 (`[tls.acme]`, via
+    `instant-acme` + `rcgen`; staging by default). *ACME is compiled/CI-checked but provable
+    only against a live CA — it binds port 80 and needs a public domain.*
+  - **Prometheus metrics** at `/__edgeguard/metrics`: requests by outcome, rate-limit hits by
+    scope, a request-latency histogram, and CSP report count (hand-rolled text exposition, no
+    new metrics dependency).
+  - **Config hot-reload** via `notify`: the config file is watched and policy is rebuilt and
+    swapped atomically (`arc-swap`) with no dropped connections; an invalid edit is logged and
+    the previous policy retained. The connection pool and metric counters survive a reload.
+  - **CSP report-only mode + violation sink**: `headers.csp_report_only` emits
+    `Content-Security-Policy-Report-Only`; `headers.csp_report_uri` appends a `report-uri`
+    directive, and `POST /__edgeguard/csp-report` logs + counts received reports.
+  - **Max-header-size limit** (`validation.max_header_bytes`): requests whose total header
+    bytes exceed the cap get `431` (completes the Phase 3 timeout/header-size item).
+- OSS launch scaffolding: dual `LICENSE-MIT` / `LICENSE-APACHE`, `CONTRIBUTING.md`, this
+  changelog, and the `docs/` set (`REQUIREMENTS.md`, `DEPLOYMENT.md`, `ROADMAP.md`).
+- `examples/` directory holding the deploy templates (`Dockerfile.node`,
+  `Dockerfile.python`, `render.yaml`, `fly.toml`).
+- Test suite (Phase 0): unit tests for `parse_size`, `parse_rate`, `client_ip` (XFF
+  parsing), `harden_cookie`, and `check_basic_auth` (plaintext + argon2 + bad-creds paths);
+  and in-process integration tests that drive the real pipeline against a stub upstream —
+  401 without auth, 200 with auth, 429 over the limit, 413 on oversized body, 405 on a
+  disallowed method, security headers injected, leaky headers stripped, cookie hardened, 502
+  when the upstream is down, plus the health/readiness endpoints.
+- `edgeguard --hash`: reads a password on stdin and prints an Argon2id PHC hash for
+  `auth.users`, so operators don't need a separate argon2 tool.
+- Configurable upstream timeout (`validation.upstream_timeout`, default `30s`; `0` disables):
+  the proxy bounds the upstream request + body read with a single deadline and returns
+  `504 Gateway Timeout` if the upstream stalls, instead of pinning the handler task.
+- Library target (`src/lib.rs`) exposing `build_state` / `build_router`, so the binary and
+  the tests share one code path rather than a reimplementation.
+
+### Changed
+- Restructured the repository into `src/` + `docs/` + `examples/` and rewrote the README as
+  a clean, user-facing document (the product/requirements prose moved to `docs/`).
+- `/__edgeguard/ready` now probes the upstream — it returns `200` only when the upstream
+  accepts a connection, `503` otherwise — instead of always returning `200`.
+  `/__edgeguard/health` remains unconditional liveness.
+- Made the co-process supervisor cross-platform: Unix keeps full process-group signaling;
+  Windows uses a `cmd /C` launch with a best-effort child kill on shutdown.
+- `libc` is now a Unix-only dependency (`[target.'cfg(unix)'.dependencies]`).
+- `argon2` now enables its `std` feature (provides the getrandom-backed `OsRng` the `--hash`
+  helper uses to generate a salt).
+
+### Removed
+- `server.fail_mode` config field. It was parsed but never honored, and v0 has no failure
+  path for it to govern (the in-memory limiter cannot fail; an unreachable upstream stays a
+  `502`). EdgeGuard remains fail-closed; a configurable fail-open returns with the
+  distributed limiter (see `docs/ROADMAP.md`, Phase 4). Configs that still set `fail_mode`
+  are ignored, not rejected.
+
+### Security
+- `X-Forwarded-For` is no longer trusted by default — client identity uses the real peer
+  address unless `server.trust_forwarded_for` is enabled (behind a trusted proxy). Prevents
+  spoofed per-IP rate limiting and forged access logs.
+- Cookie hardening now parses cookie attributes by token instead of substring matching, so
+  a value like `session=securetoken` can no longer skip the `Secure` flag.
+- The default `auth.users` value is a non-working placeholder rather than a plaintext
+  password, so the shipped config can't be copied straight to production.
+
+### Fixed
+- The crate now compiles on Windows (previously failed with 7 errors from Unix-only
+  `setsid`/`pre_exec`/`libc::kill` usage in the supervisor).
+- `parse_size` is now overflow-checked (returns an error instead of silently wrapping).
+- The startup readiness wait is skipped when pointing at an external `UPSTREAM`, avoiding a
+  needless cold-start stall.
+- Added an optional `validation.max_response_body` cap so a huge upstream response can't
+  OOM the proxy.
+
+[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/lucheeseng827/eggrd/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/lucheeseng827/eggrd/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/lucheeseng827/eggrd/releases/tag/v0.1.1
+[0.1.0]: https://crates.io/crates/eggrd/0.1.0

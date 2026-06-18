@@ -1,0 +1,15 @@
+# Keep the build context tiny + secret-free: only the crate sources are needed to build.
+.git
+target
+**/target
+loadtest
+docs
+.github
+*.md
+*.pem
+**/.terraform
+**/*.tfstate*
+**/instances.env
+**/config.env
+**/results
+ee

@@ -22,10 +22,10 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use edgeguard::config::Config;
+use edgeguard::config::{parse_duration, Config};
 use edgeguard::generate::{generate, Target};
 use edgeguard::{
-    acme, build_admin_router, build_public_router, build_router, build_state, hash_password,
+    acme, build_admin_router, build_public_router, build_router, build_state, cp, hash_password,
     reload, supervisor, tls,
 };
 
@@ -199,6 +199,10 @@ async fn main() -> Result<()> {
     let state = build_state(cfg.clone())?;
     // Keep a handle to the hot-swappable runtime for the reload watcher.
     let runtime = state.runtime.clone();
+    // Clones for the managed-mode background loops (grabbed before `state` is moved into the router).
+    let cp_client = state.cp.clone();
+    let cp_runtime = state.runtime.clone();
+    let cp_metrics = state.metrics.clone();
 
     // Optional private admin listener: when `server.admin_port` is set, the internal ops
     // endpoints (health/readiness/metrics) move to a separate plain-HTTP listener so they
@@ -236,6 +240,26 @@ async fn main() -> Result<()> {
                 warn!(error = format!("{e:#}"), "config watcher stopped");
             }
         });
+    }
+
+    // Managed mode: poll the control plane for policy (hot-reloading it) and report usage deltas.
+    if let Some(cp_client) = cp_client {
+        let poll = parse_duration(&cfg.control_plane.poll_interval).unwrap_or_else(|e| {
+            warn!(error = %e, interval = %cfg.control_plane.poll_interval, "invalid poll_interval; using 30s");
+            Duration::from_secs(30)
+        });
+        let report = parse_duration(&cfg.control_plane.report_interval).unwrap_or_else(|e| {
+            warn!(error = %e, interval = %cfg.control_plane.report_interval, "invalid report_interval; using 60s");
+            Duration::from_secs(60)
+        });
+        let base = cfg.clone();
+        let poll_rx = shutdown_rx.clone();
+        let poller = cp_client.clone();
+        tokio::spawn(async move { cp::poll_loop(poller, base, cp_runtime, poll, poll_rx).await });
+        let report_rx = shutdown_rx.clone();
+        tokio::spawn(
+            async move { cp::report_loop(cp_client, cp_metrics, report, report_rx).await },
+        );
     }
 
     // A single task flips the shutdown watch on Ctrl-C/SIGTERM; both the supervisor and the

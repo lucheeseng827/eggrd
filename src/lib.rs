@@ -8,6 +8,7 @@
 pub mod acme;
 pub mod auth;
 pub mod config;
+pub mod cp;
 pub mod generate;
 pub mod limiter;
 pub mod metrics;
@@ -139,6 +140,8 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
 /// Build the shared [`AppState`]: a fresh [`Runtime`] wrapped in an [`ArcSwap`] for
 /// hot-reload, the upstream HTTP client, and the metric registry.
 pub fn build_state(cfg: Arc<Config>) -> Result<AppState> {
+    // Build the managed-mode client (if `[control_plane]` is enabled) before `cfg` is consumed.
+    let cp = crate::cp::CpClient::from_cfg(&cfg.control_plane)?;
     let runtime = build_runtime(cfg)?;
     let client =
         Client::builder(TokioExecutor::new()).build_http::<http_body_util::Full<bytes::Bytes>>();
@@ -146,6 +149,7 @@ pub fn build_state(cfg: Arc<Config>) -> Result<AppState> {
         client,
         metrics: Arc::new(Metrics::new()),
         runtime: Arc::new(ArcSwap::from_pointee(runtime)),
+        cp,
     })
 }
 

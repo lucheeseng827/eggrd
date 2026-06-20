@@ -17,6 +17,45 @@ pub struct Config {
     pub headers: HeadersCfg,
     pub tls: TlsCfg,
     pub waf: WafCfg,
+    /// Optional "managed mode": pull policy from / report usage to a remote control plane. Off
+    /// by default; the edge is a standalone proxy unless this is configured.
+    pub control_plane: ControlPlaneCfg,
+}
+
+/// Managed-mode settings: when `enabled`, the edge pulls its policy from a remote control plane
+/// (and hot-reloads it), reports usage deltas, and forwards CSP reports. The policy the control
+/// plane pushes is the *policy subset* (auth/ratelimit/validation/headers/waf) — the edge keeps
+/// its own local `server`/`tls`. The edge token is a secret, so prefer `EDGEGUARD_CP_EDGE_TOKEN`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ControlPlaneCfg {
+    pub enabled: bool,
+    /// Base URL of the control plane, e.g. `https://cp.example`.
+    pub url: String,
+    /// This edge's tenant id at the control plane.
+    pub tenant_id: String,
+    /// Per-tenant edge token (Bearer). Prefer `EDGEGUARD_CP_EDGE_TOKEN`.
+    pub edge_token: String,
+    /// How often to poll for policy, e.g. `"30s"`.
+    pub poll_interval: String,
+    /// How often to flush a usage delta, e.g. `"60s"`.
+    pub report_interval: String,
+    /// Forward received CSP reports to the control plane (default true).
+    pub forward_csp: bool,
+}
+
+impl Default for ControlPlaneCfg {
+    fn default() -> Self {
+        ControlPlaneCfg {
+            enabled: false,
+            url: String::new(),
+            tenant_id: String::new(),
+            edge_token: String::new(),
+            poll_interval: "30s".into(),
+            report_interval: "60s".into(),
+            forward_csp: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -465,7 +504,37 @@ impl Config {
                 cfg.auth.api_keys = keys;
             }
         }
+        if let Ok(t) = env::var("EDGEGUARD_CP_EDGE_TOKEN") {
+            if !t.is_empty() {
+                cfg.control_plane.edge_token = t;
+            }
+        }
+        if let Ok(u) = env::var("EDGEGUARD_CP_URL") {
+            if !u.is_empty() {
+                cfg.control_plane.url = u;
+            }
+        }
         Ok(cfg)
+    }
+
+    /// Produce an effective config by overlaying a control-plane-pushed *policy* document onto
+    /// this (local) config: the policy sections (`auth`/`ratelimit`/`validation`/`headers`/`waf`)
+    /// come from the pushed TOML; `server`/`tls`/`control_plane` stay local (the control plane
+    /// manages security policy, not this edge's listener/plumbing). The result feeds the normal
+    /// `build_runtime` + hot-swap path, so a malformed policy is rejected like any bad reload.
+    pub fn with_policy_from(&self, policy_toml: &str) -> Result<Config> {
+        let p: Config =
+            toml::from_str(policy_toml).context("parsing control-plane policy document")?;
+        Ok(Config {
+            server: self.server.clone(),
+            tls: self.tls.clone(),
+            control_plane: self.control_plane.clone(),
+            auth: p.auth,
+            ratelimit: p.ratelimit,
+            validation: p.validation,
+            headers: p.headers,
+            waf: p.waf,
+        })
     }
 
     /// The upstream base URL EdgeGuard forwards to, e.g. "http://127.0.0.1:3000".
@@ -708,6 +777,31 @@ mod tests {
         // "0" disables (zero duration); callers map it to "no timeout"
         assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
         assert_eq!(parse_duration("  10s ").unwrap(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn with_policy_from_keeps_local_plumbing_takes_policy() {
+        let mut local = Config::default();
+        local.server.port = 9999;
+        local.server.upstream = "http://up:1".into();
+        local.control_plane.enabled = true;
+        // A pushed policy that changes auth + disables rate limiting.
+        let policy = "[auth]\nmode = \"apikey\"\n\n[ratelimit]\nenabled = false\n";
+        let merged = local.with_policy_from(policy).unwrap();
+        // Local server / control-plane settings are preserved...
+        assert_eq!(merged.server.port, 9999);
+        assert_eq!(merged.server.upstream, "http://up:1");
+        assert!(merged.control_plane.enabled);
+        // ...while the policy sections are taken from the pushed document.
+        assert_eq!(merged.auth.mode, "apikey");
+        assert!(!merged.ratelimit.enabled);
+    }
+
+    #[test]
+    fn with_policy_from_rejects_bad_toml() {
+        assert!(Config::default()
+            .with_policy_from("not = valid = toml")
+            .is_err());
     }
 
     #[test]

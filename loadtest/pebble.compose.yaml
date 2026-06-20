@@ -1,0 +1,38 @@
+# Local test ACME CA for the `#[ignore]`d HTTP-01 proof test (`src/acme.rs::acme_http01_issues_against_pebble`).
+#
+# Pebble (https://github.com/letsencrypt/pebble) is a tiny ACME CA for testing — it issues real
+# certs over a self-signed directory at https://localhost:14000/dir without the production rate
+# limits. `pebble-challtestsrv` provides the DNS so the test domain resolves to the host running
+# the proxy's :80 HTTP-01 challenge server.
+#
+# This is a STARTING POINT — adjust the validation network to your host. Bring it up:
+#   docker compose -f loadtest/pebble.compose.yaml up
+# then trust Pebble's CA and run the test (see the comment on the test):
+#   export SSL_CERT_FILE=/path/to/pebble.minica.pem
+#   EDGEGUARD_TEST_ACME_DIR=https://localhost:14000/dir sudo -E cargo test -p eggrd --lib acme_http01 -- --ignored
+name: eggrd-pebble
+
+services:
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    # Validate challenges immediately (no random sleep); point the resolver at challtestsrv so
+    # Pebble looks up the test domain there instead of real DNS.
+    command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "challtestsrv:8053"]
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+    ports:
+      - "14000:14000" # ACME directory
+      - "15000:15000" # management API
+    depends_on:
+      - challtestsrv
+
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    # Resolve every A query to the host gateway (where the cargo test binds the :80 challenge
+    # server). On Docker Desktop `host-gateway` maps to the host; on plain Linux set this to the
+    # host's IP reachable from the pebble container.
+    command: ["-defaultIPv4", "host-gateway", "-dns01", ":8053", "-management", ":8055"]
+    extra_hosts:
+      - "host-gateway:host-gateway"
+    ports:
+      - "8055:8055" # challtestsrv management (set/clear DNS at runtime if needed)

@@ -44,6 +44,9 @@ pub struct AppState {
     pub client: UpstreamClient,
     pub metrics: Arc<Metrics>,
     pub runtime: Arc<ArcSwap<Runtime>>,
+    /// Managed-mode control-plane client (`Some` only when `[control_plane]` is enabled). Used to
+    /// forward CSP reports; policy pull + usage reporting run as background tasks in `main`.
+    pub cp: Option<Arc<crate::cp::CpClient>>,
 }
 
 /// A per-route rate-limit override: requests whose path starts with `prefix` use `limiter`.
@@ -291,6 +294,8 @@ pub async fn handle(
             )
         }
     };
+    // Request (ingress) size for managed-mode usage, captured before the body is forwarded upstream.
+    let ingress_bytes = header_bytes(&parts.headers).saturating_add(body_bytes.len());
 
     // 6) WAF-lite input inspection. A no-op unless `waf.mode` is report/block. The body is
     //    already buffered above, so inspecting it adds no extra read. On a match: `block` mode
@@ -479,6 +484,13 @@ pub async fn handle(
     strip_hop_by_hop(&mut resp_parts.headers);
     resp_parts.headers.remove(header::CONTENT_LENGTH);
 
+    // Managed-mode usage: this is the proxied path, where both bodies are buffered, so the byte
+    // counts are exact. (`add_usage_request` is recorded for every request in `finish`.)
+    m.add_usage_bytes(
+        ingress_bytes,
+        header_bytes(&resp_parts.headers).saturating_add(resp_bytes.len()),
+    );
+
     let mut response = Response::from_parts(resp_parts, Body::from(resp_bytes));
     harden_response(&rt.cfg, &mut response);
 
@@ -522,6 +534,16 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response<Body> {
 /// here when `headers.csp_report_uri` points at it; we count and log it, then `204`.
 pub async fn csp_report(State(state): State<AppState>, body: Bytes) -> StatusCode {
     state.metrics.record_csp_report();
+    // Managed mode: forward the raw report to the control plane (fire-and-forget, so the browser's
+    // 204 is never delayed by an outbound call). Only when a control plane is configured and
+    // `forward_csp` is on.
+    if let Some(cp) = &state.cp {
+        if state.runtime.load().cfg.control_plane.forward_csp {
+            let cp = cp.clone();
+            let raw = body.clone();
+            tokio::spawn(async move { cp.forward_csp(&raw).await });
+        }
+    }
     // This endpoint is unauthenticated and a report can carry the full document URL,
     // referrer, and query strings — logging the whole blob at `info` is both a privacy leak
     // and a log-flood vector. Record only the directive that fired, at `debug`.
@@ -783,6 +805,9 @@ fn finish(
     );
     metrics.record_request(outcome);
     metrics.observe_latency(elapsed);
+    // Managed mode: count every finished request (proxied or rejected) toward the usage delta.
+    // Cheap (two relaxed atomic adds) and inert unless a control plane drains it for reporting.
+    metrics.add_usage_request();
     resp
 }
 

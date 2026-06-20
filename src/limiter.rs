@@ -517,4 +517,89 @@ mod tests {
         };
         assert!(DistributedLimiter::build(&bad, StoreMode::Redis).is_err());
     }
+
+    // ---- Live-Redis proof (the ◐ roadmap item) -----------------------------------------------
+    //
+    // These exercise the *real* Redis-backed GCRA Lua script (the in-process `memory` store tests
+    // above cover the algorithm). They are `#[ignore]`d so the default suite needs no Redis; run
+    // them against a live server:
+    //
+    //   docker run --rm -p 6379:6379 redis:7-alpine
+    //   cargo test -p eggrd --lib redis_ -- --ignored
+    //
+    // `EDGEGUARD_TEST_REDIS_URL` overrides the default `redis://127.0.0.1:6379`. Each test uses a
+    // unique key prefix so reruns don't inherit a stale GCRA state, and skips cleanly (no failure)
+    // if the server is unreachable.
+
+    fn redis_url() -> String {
+        std::env::var("EDGEGUARD_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Redis (EDGEGUARD_TEST_REDIS_URL, default redis://127.0.0.1:6379)"]
+    async fn redis_store_enforces_global_limit_live() {
+        let rl = RateLimitCfg {
+            enabled: true,
+            rate: "1/min".into(),
+            burst: 3,
+            store: "redis".into(),
+            redis_url: redis_url(),
+            redis_prefix: format!("egtest:global:{}:{}", std::process::id(), now_micros()),
+            ..Default::default()
+        };
+        let limiter = DistributedLimiter::build(&rl, StoreMode::Redis).unwrap();
+        let ip: IpAddr = "203.0.113.20".parse().unwrap();
+
+        // First request both proves reachability and consumes 1 of the burst. A store error means
+        // Redis is down (default fail-closed → Admit::Error) — skip rather than fail.
+        match limiter.check_ip_route(ip, "/").await {
+            Admit::Error => {
+                eprintln!("skipping redis_store_enforces_global_limit_live: Redis unreachable");
+                return;
+            }
+            Admit::Allowed => {}
+            other => panic!("unexpected first admit: {other:?}"),
+        }
+        // burst = 3: two more admitted, the fourth limited under the "ip" scope.
+        assert_eq!(limiter.check_ip_route(ip, "/").await, Admit::Allowed);
+        assert_eq!(limiter.check_ip_route(ip, "/").await, Admit::Allowed);
+        assert_eq!(limiter.check_ip_route(ip, "/").await, Admit::Limited("ip"));
+        // A different IP keys a fresh bucket.
+        let ip2: IpAddr = "203.0.113.21".parse().unwrap();
+        assert_eq!(limiter.check_ip_route(ip2, "/").await, Admit::Allowed);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Redis (EDGEGUARD_TEST_REDIS_URL, default redis://127.0.0.1:6379)"]
+    async fn redis_store_per_key_limit_live() {
+        let rl = RateLimitCfg {
+            enabled: true,
+            rate: "1000/min".into(), // generous global so only the per-key bucket bites
+            burst: 1000,
+            per_key: PerKeyRateLimit {
+                enabled: true,
+                rate: "1/min".into(),
+                burst: 1,
+            },
+            store: "redis".into(),
+            redis_url: redis_url(),
+            redis_prefix: format!("egtest:key:{}:{}", std::process::id(), now_micros()),
+            ..Default::default()
+        };
+        let limiter = DistributedLimiter::build(&rl, StoreMode::Redis).unwrap();
+
+        match limiter.check_key("apikey:abc").await {
+            Admit::Error => {
+                eprintln!("skipping redis_store_per_key_limit_live: Redis unreachable");
+                return;
+            }
+            Admit::Allowed => {}
+            other => panic!("unexpected first admit: {other:?}"),
+        }
+        // burst = 1: the second call for the same principal is limited under the "key" scope.
+        assert_eq!(limiter.check_key("apikey:abc").await, Admit::Limited("key"));
+        // A different principal has its own bucket.
+        assert_eq!(limiter.check_key("apikey:def").await, Admit::Allowed);
+    }
 }

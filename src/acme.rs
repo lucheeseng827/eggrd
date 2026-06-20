@@ -6,11 +6,12 @@
 //! generated key + CSR → write the issued chain and key to [`TlsCfg::cert_path`] /
 //! [`TlsCfg::key_path`], which the TLS listener then loads.
 //!
-//! NOTE: this path talks to a live ACME CA and binds port 80, so it cannot be exercised by
-//! the in-process test suite (no domain, no inbound :80). It is written against the real
-//! `instant-acme` 0.7 API and compiled in CI, but proven only against a real CA. The default
-//! directory is Let's Encrypt **staging** (see `AcmeCfg::directory_url`) precisely so a first
-//! run can't burn production rate limits.
+//! NOTE: this path talks to a live ACME CA and binds port 80, so it is not exercised by the
+//! *default* suite (no domain, no inbound :80). A `#[ignore]`d end-to-end test
+//! (`acme_http01_issues_against_pebble`) proves it against **Pebble** (a tiny test ACME CA) when
+//! run with `--ignored` — see the test for the setup recipe and `loadtest/pebble.compose.yaml`.
+//! The default directory is Let's Encrypt **staging** (see `AcmeCfg::directory_url`) precisely so
+//! a first run can't burn production rate limits.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -267,5 +268,75 @@ struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AcmeCfg, TlsCfg};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // End-to-end HTTP-01 issuance against **Pebble** (a tiny test ACME CA), proving the ◐ roadmap
+    // item without touching Let's Encrypt's rate limits. `#[ignore]`d — it needs a running CA, the
+    // privilege to bind :80 (the challenge port is fixed by RFC 8555), and a domain that resolves
+    // to this host. Recipe:
+    //
+    //   1. Run Pebble + pebble-challtestsrv (see https://github.com/letsencrypt/pebble; a starting
+    //      compose is at loadtest/pebble.compose.yaml). challtestsrv must resolve the test domain
+    //      to the host running this test, and Pebble's HTTP-01 validation must reach this host's :80.
+    //   2. Trust Pebble's self-signed directory cert for the ACME HTTPS client:
+    //        export SSL_CERT_FILE=/path/to/pebble.minica.pem
+    //   3. Run it:
+    //        EDGEGUARD_TEST_ACME_DIR=https://localhost:14000/dir \
+    //        EDGEGUARD_TEST_ACME_DOMAIN=edgeguard.test \
+    //        sudo -E cargo test -p eggrd --lib acme_http01 -- --ignored
+    //      (`sudo`/CAP_NET_BIND_SERVICE so the challenge server can bind :80.)
+    #[tokio::test]
+    #[ignore = "requires a live test ACME CA (Pebble) + :80 — see the module test comment"]
+    async fn acme_http01_issues_against_pebble() {
+        let Ok(directory_url) = std::env::var("EDGEGUARD_TEST_ACME_DIR") else {
+            eprintln!("skipping acme_http01_issues_against_pebble: set EDGEGUARD_TEST_ACME_DIR");
+            return;
+        };
+        let domain =
+            std::env::var("EDGEGUARD_TEST_ACME_DOMAIN").unwrap_or_else(|_| "edgeguard.test".into());
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("eg-acme-{stamp}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let cert_path = base.join("cert.pem").to_string_lossy().into_owned();
+        let key_path = base.join("key.pem").to_string_lossy().into_owned();
+
+        let acme = AcmeCfg {
+            enabled: true,
+            domains: vec![domain],
+            email: "ci@example.test".into(),
+            directory_url,
+            cache_dir: base.to_string_lossy().into_owned(),
+            accept_tos: true,
+        };
+        let tls = TlsCfg {
+            enabled: true,
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+            acme: acme.clone(),
+        };
+
+        obtain_certificate(&acme, &tls)
+            .await
+            .expect("ACME HTTP-01 issuance against Pebble");
+
+        let cert = std::fs::read_to_string(&cert_path).expect("issued certificate written");
+        assert!(
+            cert.contains("BEGIN CERTIFICATE"),
+            "issued PEM chain present"
+        );
+        let key = std::fs::read_to_string(&key_path).expect("private key written");
+        assert!(key.contains("BEGIN"), "private key PEM present");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -59,6 +59,12 @@ pub struct Metrics {
     latency_sum_micros: AtomicU64,
     latency_count: AtomicU64,
     csp_reports: AtomicU64,
+    /// Drainable usage accumulators for managed-mode reporting (requests + bandwidth *since the
+    /// last drain*). Kept separate from the monotonic Prometheus counters above precisely because
+    /// the usage reporter resets these to zero each period — a Prometheus counter must not decrease.
+    usage_requests: AtomicU64,
+    usage_ingress_bytes: AtomicU64,
+    usage_egress_bytes: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -71,6 +77,9 @@ impl Default for Metrics {
             latency_sum_micros: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             csp_reports: AtomicU64::new(0),
+            usage_requests: AtomicU64::new(0),
+            usage_ingress_bytes: AtomicU64::new(0),
+            usage_egress_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -122,6 +131,41 @@ impl Metrics {
     /// Count one received CSP violation report.
     pub fn record_csp_report(&self) {
         self.csp_reports.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one request toward the drainable usage accumulator (managed mode). Called once per
+    /// request from the single `finish` exit, so every request — proxied or rejected — counts.
+    pub fn add_usage_request(&self) {
+        self.usage_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add request (ingress) + response (egress) bytes to the drainable usage accumulator. Called
+    /// on the proxied path where both bodies are buffered and the counts are known.
+    pub fn add_usage_bytes(&self, ingress: usize, egress: usize) {
+        self.usage_ingress_bytes
+            .fetch_add(ingress as u64, Ordering::Relaxed);
+        self.usage_egress_bytes
+            .fetch_add(egress as u64, Ordering::Relaxed);
+    }
+
+    /// Atomically read-and-zero the usage accumulators, returning `(requests, ingress, egress)`
+    /// accrued since the last drain — the delta the usage reporter ships to the control plane.
+    pub fn drain_usage(&self) -> (u64, u64, u64) {
+        (
+            self.usage_requests.swap(0, Ordering::Relaxed),
+            self.usage_ingress_bytes.swap(0, Ordering::Relaxed),
+            self.usage_egress_bytes.swap(0, Ordering::Relaxed),
+        )
+    }
+
+    /// Add a previously-drained delta back, e.g. when a usage report failed to send — so the
+    /// next period reships it instead of losing billable usage. (New requests that arrived during
+    /// the failed send simply add on top, as intended.)
+    pub fn restore_usage(&self, requests: u64, ingress: u64, egress: u64) {
+        self.usage_requests.fetch_add(requests, Ordering::Relaxed);
+        self.usage_ingress_bytes
+            .fetch_add(ingress, Ordering::Relaxed);
+        self.usage_egress_bytes.fetch_add(egress, Ordering::Relaxed);
     }
 
     /// Render the Prometheus text exposition (format version 0.0.4).
@@ -263,6 +307,21 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("edgeguard_csp_reports_total 1"), "{text}");
+    }
+
+    #[test]
+    fn usage_accumulates_drains_and_restores() {
+        let m = Metrics::new();
+        m.add_usage_request();
+        m.add_usage_request();
+        m.add_usage_bytes(100, 250);
+        m.add_usage_bytes(0, 50);
+        // Drain returns the accrued delta and zeroes the accumulator.
+        assert_eq!(m.drain_usage(), (2, 100, 300));
+        assert_eq!(m.drain_usage(), (0, 0, 0));
+        // Restore (failed-report path) re-adds it for the next period.
+        m.restore_usage(2, 100, 300);
+        assert_eq!(m.drain_usage(), (2, 100, 300));
     }
 
     #[test]

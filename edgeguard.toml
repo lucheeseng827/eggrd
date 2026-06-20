@@ -172,3 +172,17 @@ email = ""            # ACME account contact
 directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
 cache_dir = "./acme"  # stores the ACME account key for renewals
 accept_tos = false    # must be true to accept the provider's Terms of Service
+
+# ── Managed mode (optional) ───────────────────────────────────────────────────────────────
+# Pull this edge's policy from a remote control plane and report usage to it. OFF by default —
+# leave disabled to run as a standalone proxy. When enabled, the control plane pushes the policy
+# sections (auth/ratelimit/validation/headers/waf); this edge keeps its own [server]/[tls].
+# The edge token is a secret — prefer the EDGEGUARD_CP_EDGE_TOKEN env var over this file.
+[control_plane]
+enabled = false
+url = ""               # control-plane base URL, e.g. "https://cp.example"
+tenant_id = ""         # this edge's tenant id
+edge_token = ""        # per-tenant bearer (prefer EDGEGUARD_CP_EDGE_TOKEN)
+poll_interval = "30s"  # how often to pull policy
+report_interval = "60s" # how often to flush a usage delta
+forward_csp = true     # forward received CSP reports to the control plane

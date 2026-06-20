@@ -396,9 +396,59 @@ roughly in sync (NTP).
   can't silently disable limiting) or **open** (allow the request — availability over strict
   limiting).
 
-> ⚠️ The Redis backend is implemented and compiled, but — like ACME — it can only be exercised
-> against a live Redis, so it isn't covered by the in-process test suite (the GCRA algorithm and
-> the in-memory store are). See [docs/ROADMAP.md](docs/ROADMAP.md), Phase 4.
+### Why a shared store
+
+A rate limit is only a real protection if it holds *in total*. The in-process limiter counts
+per replica, so horizontal scaling silently multiplies your effective rate by the replica count —
+scale a `"60/min"` policy to 10 pods and you've actually allowed `600/min`. That undermines the
+exact things a limit is for:
+
+- **Abuse / DoS throttling** — a brute-force or scraping cap that 10×'s under autoscale isn't a cap.
+- **Protecting a fragile upstream** — keep total load on the origin under a known ceiling regardless
+  of how many edges front it.
+- **Staying inside an upstream API quota** — one global budget, not one-per-replica.
+
+`store = "redis"` keeps the cap fixed no matter how many replicas run, by holding the GCRA state in
+Redis and running the check-and-update atomically (Lua script). The cost is one shared dependency
+and a Redis round-trip per limited request; `store = "local"` stays the right default for a single
+instance.
+
+### Run it
+
+**Local — one Redis, one proxy:**
+
+```sh
+docker run --rm -d -p 6379:6379 redis:7-alpine
+# edgeguard.toml has [ratelimit] store = "redis"
+EDGEGUARD_REDIS_URL=redis://127.0.0.1:6379 edgeguard --config edgeguard.toml
+```
+
+**Multi-replica — three proxies share one Redis and enforce one global limit** (compose):
+
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+  edge:
+    image: mancube/eggrd:latest
+    deploy: { replicas: 3 }          # three edges, one shared limit
+    command: ["--config", "/etc/edgeguard.toml"]
+    environment:
+      EDGEGUARD_REDIS_URL: redis://redis:6379   # overrides ratelimit.redis_url
+      UPSTREAM: http://app:3000
+    volumes: ["./edgeguard.toml:/etc/edgeguard.toml:ro"]   # store = "redis"
+  app:
+    image: ghcr.io/example/app:latest
+```
+
+Drive more than `burst` requests through the load balancer: the **total** admitted across the three
+replicas tracks the configured cap (~1×), versus ~3× with `store = "local"`. The [`loadtest/`](loadtest/README.md)
+harness automates this comparison (`--scale edgeguard=3`).
+
+> The Redis backend is exercised by `#[ignore]`d proof tests against a live server — the GCRA
+> algorithm and the in-memory store are covered by the default suite. To run the live ones:
+> `docker run -p 6379:6379 redis:7-alpine` then `cargo test --lib redis_ -- --ignored`. See
+> [docs/ROADMAP.md](docs/ROADMAP.md), Phase 4.
 
 ## Public/private split
 
@@ -446,6 +496,33 @@ request, forwards to your origin, and hardens the response — the same security
 cookie hardening as the proxy. Build and deploy with `worker-build` + `wrangler`; configure the
 origin, auth, and hardening via `wrangler.toml` vars / secrets. Like ACME, it compiles to wasm but
 is proven only against a live deploy; rate limiting and JWT are out of scope for the edge subset.
+
+## Managed mode (optional)
+
+By default each EdgeGuard runs standalone, configured from its local file/env. **Managed mode**
+(`[control_plane]`, off by default) instead lets a fleet of edges pull their policy from — and
+report to — a central **control plane**:
+
+- **Policy pull + hot-reload.** The edge polls the control plane for its policy (a conditional
+  `GET` with an ETag, so an unchanged policy is a cheap `304`) and applies it through the *same*
+  hot-reload path a local file edit uses — no restart, no dropped connections. The control plane
+  pushes the **policy** sections (auth, rate limits, validation, headers, WAF); the edge keeps its
+  own local `[server]` / `[tls]` (its port, upstream, and certs are edge-specific).
+- **Usage reporting.** The edge accumulates per-period request and bandwidth counts and POSTs a
+  delta to the control plane (for fleet visibility / usage-based plans).
+- **CSP forwarding.** Received CSP violation reports are forwarded to the control plane for
+  aggregate analytics, in addition to the local count.
+
+```toml
+[control_plane]
+enabled = true
+url = "https://cp.example"        # control-plane base URL
+tenant_id = "acme"                # this edge's tenant id
+# edge_token via EDGEGUARD_CP_EDGE_TOKEN (a per-tenant bearer); poll/report intervals tunable.
+```
+
+It's a thin, generic "pull config / report usage to a URL" client (`src/cp.rs`) — with no
+`[control_plane]` configured, the binary is byte-for-byte the standalone proxy.
 
 ## Build & test
 

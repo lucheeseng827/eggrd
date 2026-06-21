@@ -133,6 +133,7 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
         max_response_body,
         max_header_bytes,
         upstream_timeout,
+        stream_passthrough: cfg.validation.stream_passthrough,
         cfg,
     })
 }

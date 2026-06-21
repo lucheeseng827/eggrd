@@ -1,0 +1,116 @@
+# EdgeGuard (eggrd) monitoring stack — Podman Compose.
+#
+# A self-contained Prometheus + Grafana deployment whose only job is to prove the EdgeGuard
+# Prometheus exposition at `/__edgeguard/metrics` is real and useful: it scrapes a running
+# EdgeGuard, stores the `edgeguard_*` series, and renders them on a turnkey dashboard
+# (grafana/dashboards/edgeguard-overview.json) that is also published as an OSS reference
+# template. This is deliberately SEPARATE from `../loadtest/` (which spins the proxy to its
+# limits) — here the point is observability/validation, not load.
+#
+# Quick start (turnkey demo — brings up everything, dashboard lights up on its own):
+#
+#     podman compose -f monitoring/compose.yaml up -d
+#     # then open Grafana → http://localhost:3000 (anonymous, no login)
+#     #   Prometheus UI → http://localhost:9091   ·   EdgeGuard proxy → http://localhost:8080
+#
+# The bundled `edgeguard` + `upstream` + `traffic` services exist purely to generate live
+# metrics so the dashboard is populated out of the box. To instead point this stack at an
+# EdgeGuard you run yourself, see prometheus/prometheus.yml (host-gateway target) and the
+# "Monitor your own EdgeGuard" section of README.md.
+#
+# Tear down (and drop the Prometheus/Grafana volumes):
+#
+#     podman compose -f monitoring/compose.yaml down -v
+
+name: edgeguard-monitoring
+
+services:
+  # ── EdgeGuard under observation ────────────────────────────────────────────────────────────
+  # The published OSS image (see docs/DOCKERHUB.md). Runs in front-proxy mode with the
+  # public/private split ON: the proxy is on :8080 and the ops surface (health/ready/metrics)
+  # is on the private admin listener :9090, which is the listener Prometheus scrapes — exactly
+  # the split a real deployment uses to keep metrics off the public port.
+  edgeguard:
+    image: docker.io/mancube/eggrd:0.1.5
+    command: ["--config", "/etc/edgeguard/edgeguard.toml"]
+    depends_on:
+      - upstream
+    environment:
+      UPSTREAM: http://upstream:80
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./edgeguard.demo.toml:/etc/edgeguard/edgeguard.toml:ro
+    ports:
+      - "127.0.0.1:8080:8080"   # public proxy port — bound to localhost (demo-only stack)
+    expose:
+      - "9090"          # private admin/metrics listener — reached by Prometheus over the compose net
+
+  # Trivial backend so EdgeGuard has something to proxy to (static 200).
+  upstream:
+    image: docker.io/nginx:1.27-alpine
+    volumes:
+      - ./upstream.conf:/etc/nginx/conf.d/default.conf:ro
+    expose:
+      - "80"
+
+  # Generates a steady mix of clean + attack-shaped + over-limit traffic so every series on the
+  # dashboard (request outcomes, WAF report hits, rate-limit hits, latency histogram) actually
+  # moves. Remove/stop this service when pointing the stack at your own EdgeGuard.
+  traffic:
+    image: docker.io/curlimages/curl:8.10.1
+    depends_on:
+      - edgeguard
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sleep 5   # let EdgeGuard + upstream come up
+        echo "traffic generator: driving http://edgeguard:8080"
+        while true; do
+          # Clean requests (outcome=ok)
+          curl -s -o /dev/null "http://edgeguard:8080/" || true
+          curl -s -o /dev/null "http://edgeguard:8080/healthz" || true
+          # WAF report-mode probes (edgeguard_waf_hits_total{rule="sqli"|"xss"|"path_traversal"})
+          curl -s -o /dev/null "http://edgeguard:8080/?q=1%27%20OR%20%271%27%3D%271" || true
+          curl -s -o /dev/null "http://edgeguard:8080/%3Cscript%3Ealert(1)%3C/script%3E" || true
+          curl -s -o /dev/null "http://edgeguard:8080/../../etc/passwd" || true
+          # A short burst to trip the per-IP rate limiter (edgeguard_ratelimit_hits_total{scope="ip"})
+          for i in $$(seq 1 40); do curl -s -o /dev/null "http://edgeguard:8080/burst" || true; done
+          sleep 1
+        done
+
+  # ── Monitoring ─────────────────────────────────────────────────────────────────────────────
+  prometheus:
+    image: docker.io/prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      # Lets a `host.containers.internal` scrape target reach an EdgeGuard you run on the host
+      # (see the commented job in prometheus.yml). Harmless when unused.
+      - "host.containers.internal:host-gateway"
+    ports:
+      - "127.0.0.1:9091:9090"   # Prometheus UI — localhost only (mapped off its own :9090)
+
+  grafana:
+    image: docker.io/grafana/grafana:11.2.0
+    depends_on:
+      - prometheus
+    environment:
+      # Local validation stack: skip login so anyone can open the dashboard immediately.
+      # Anonymous is Admin ONLY because this is a throwaway local stack whose host port is bound
+      # to 127.0.0.1 below (not reachable off-host) — do NOT rebind it to a public interface.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD:-admin}
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"   # Grafana — localhost only (anonymous admin is enabled below)
+
+volumes:
+  prometheus-data:
+  grafana-data:

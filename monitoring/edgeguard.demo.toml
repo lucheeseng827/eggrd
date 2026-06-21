@@ -1,0 +1,39 @@
+# EdgeGuard config for the monitoring demo (front-proxy mode against the nginx stub).
+#
+# Tuned so the dashboard has something to show: the public/private split is on (metrics land on
+# the private admin listener Prometheus scrapes), the rate limiter is set low enough that the
+# traffic generator's bursts trip it, and the WAF runs in report mode so attack-shaped probes
+# are counted (edgeguard_waf_hits_total) without 403-ing the demo traffic. This is a DEMO config
+# — not a hardened production template (auth is off); see ../edgeguard.toml for the full
+# annotated reference.
+
+[server]
+port = 8080
+# Public/private split: serve /__edgeguard/{health,ready,metrics} on a second listener so the
+# public port carries only proxy traffic. admin_addr 0.0.0.0 so Prometheus can reach it over
+# the compose network (the listener has no auth — keep it on a trusted network in production).
+admin_port = 9090
+admin_addr = "0.0.0.0"
+
+[auth]
+# No auth so the demo traffic flows freely. Switch to "apikey"/"jwt"/"basic" for real use.
+mode = "none"
+
+[ratelimit]
+enabled = true
+rate = "20/sec"   # low enough that the traffic generator's 40-request bursts shed (scope="ip")
+burst = 10
+store = "local"
+
+[headers]
+hsts = true
+csp = "default-src 'self'"
+
+[waf]
+# Report mode: count attack signatures (edgeguard_waf_hits_total) without blocking, so the demo
+# traffic still gets a 200 from the upstream while the WAF panels move.
+mode = "report"
+sqli = true
+xss = true
+path_traversal = true
+inspect_path = true

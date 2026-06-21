@@ -116,6 +116,13 @@ upstream_timeout = "30s"
 max_header_bytes = "0"
 # Empty list = allow all methods.
 allow_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+# Forward `text/event-stream` (SSE) responses unbuffered, frame-by-frame as they arrive,
+# instead of buffering the whole body first. Off by default (the proxy buffers so it can apply
+# `max_response_body` and count exact bytes). Turn on for Server-Sent Events / streaming
+# backends so clients see events immediately (time-to-first-byte is preserved). When a response
+# streams this way, `max_response_body` and the body-read timeout don't apply (the
+# connect/first-byte `upstream_timeout` still does). Non-SSE responses are unaffected.
+stream_passthrough = false
 
 [headers]
 hsts = true

@@ -1,0 +1,13 @@
+# Auto-load any dashboard JSON in this directory on startup, so `--profile observability up`
+# gives a ready-to-view EdgeGuard dashboard (no manual import). The JSON files sit alongside this
+# provider and are mounted with the rest of provisioning/ by docker-compose.
+apiVersion: 1
+
+providers:
+  - name: edgeguard
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

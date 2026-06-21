@@ -13,3 +13,4 @@ docs
 **/config.env
 **/results
 ee
+llm-bench

@@ -105,6 +105,10 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
 ## What it does
 
 - **Reverse proxy** to one upstream (a wrapped child process, or an external URL).
+- **Streaming / LLM-proxy passthrough** (`validation.stream_passthrough`, off by default):
+  forward `text/event-stream` (SSE) responses **unbuffered, frame-by-frame** — so EdgeGuard fronts
+  **streaming LLM backends** (OpenAI-compatible token streams) and any SSE app without collapsing
+  time-to-first-byte. Egress bytes are still counted as frames flow.
 - **Co-process supervisor**: launches your app, restarts it on crash, and forwards
   termination signals on shutdown (acts as a tiny container init). *Full process-group
   signaling on Unix; best-effort child kill on Windows.*
@@ -291,6 +295,12 @@ namespace is reserved — it is never forwarded upstream:
 | `/__edgeguard/ready` | **readiness** — `200` only when the upstream accepts a connection, else `503` |
 | `/__edgeguard/metrics` | Prometheus metrics (text exposition v0.0.4) |
 | `/__edgeguard/csp-report` | CSP violation report sink (`POST`, logs + counts, returns `204`) |
+
+For a turnkey way to validate and visualize the `edgeguard_*` metrics, the
+[`monitoring/`](monitoring/) directory ships a self-contained **Prometheus + Grafana** stack
+(Podman/Docker Compose) plus a reusable **reference Grafana dashboard** you can import into your
+own Grafana — `podman compose -f monitoring/compose.yaml up -d`, then open
+http://localhost:3000. See [`monitoring/README.md`](monitoring/README.md).
 
 ## Platform support
 

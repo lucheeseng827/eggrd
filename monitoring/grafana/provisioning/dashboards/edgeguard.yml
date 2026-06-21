@@ -1,0 +1,17 @@
+# Load the EdgeGuard dashboard(s) from disk on startup, so Grafana boots with the overview
+# already installed (no manual import). The JSON in /var/lib/grafana/dashboards is mounted from
+# monitoring/grafana/dashboards in compose.yaml.
+
+apiVersion: 1
+
+providers:
+  - name: edgeguard
+    orgId: 1
+    folder: EdgeGuard
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

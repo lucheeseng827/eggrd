@@ -1,0 +1,14 @@
+# Auto-wire the Prometheus datasource so Grafana comes up pointed at this stack's Prometheus,
+# with no manual setup. The provisioned EdgeGuard dashboard binds to it via the `datasource`
+# template variable (which defaults to whichever Prometheus datasource is marked default).
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: edgeguard-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

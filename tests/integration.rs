@@ -1041,3 +1041,134 @@ async fn public_private_split_serves_internal_endpoints_only_on_admin() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// Raw-TCP `text/event-stream` upstream: writes one chunk immediately, waits `gap`, then writes
+/// a second chunk and ends the chunked body. Lets a test observe whether the proxy forwards the
+/// first event before the upstream has finished (streamed) or only after (buffered). Hand-rolled
+/// over `TcpStream` so no stream/SSE helper crate is needed.
+async fn spawn_sse_upstream(gap: Duration) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn write_chunk(sock: &mut tokio::net::TcpStream, data: &[u8]) {
+        sock.write_all(format!("{:x}\r\n", data.len()).as_bytes())
+            .await
+            .unwrap();
+        sock.write_all(data).await.unwrap();
+        sock.write_all(b"\r\n").await.unwrap();
+        sock.flush().await.unwrap();
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                // Drain the request head (a GET fits in one read); we don't parse it.
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                write_chunk(&mut sock, b"data: one\n\n").await;
+                tokio::time::sleep(gap).await;
+                write_chunk(&mut sock, b"data: two\n\n").await;
+                sock.write_all(b"0\r\n\r\n").await.unwrap(); // terminating chunk
+                sock.flush().await.unwrap();
+            });
+        }
+    });
+    addr
+}
+
+/// Read a response body frame-by-frame, returning (full text, time-to-first-byte, time-to-last)
+/// measured from `start` — which must be taken *before* the request is sent, so a buffered proxy
+/// (headers+body delivered together at the end) shows a late first byte rather than an instant one.
+async fn read_streamed(
+    resp: Response<hyper::body::Incoming>,
+    start: std::time::Instant,
+) -> (String, Duration, Duration) {
+    let mut body = resp.into_body();
+    let (mut first, mut last, mut text) = (None, Duration::ZERO, String::new());
+    while let Some(frame) = body.frame().await {
+        let frame = frame.unwrap();
+        if let Some(data) = frame.data_ref() {
+            if !data.is_empty() {
+                let t = start.elapsed();
+                first.get_or_insert(t);
+                last = t;
+                text.push_str(&String::from_utf8_lossy(data));
+            }
+        }
+    }
+    (text, first.unwrap_or(Duration::ZERO), last)
+}
+
+/// With `stream_passthrough` on, an SSE response is forwarded frame-by-frame: the first event
+/// reaches the client well before the upstream sends the last one (time-to-first-byte preserved).
+#[tokio::test]
+async fn sse_passthrough_streams_frames_as_they_arrive() {
+    let gap = Duration::from_millis(500);
+    let up = spawn_sse_upstream(gap).await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.validation.stream_passthrough = true;
+    let proxy = spawn_proxy(cfg).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .uri(format!("http://{proxy}/stream"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let start = std::time::Instant::now();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (text, first, last) = read_streamed(resp, start).await;
+
+    assert!(
+        text.contains("one") && text.contains("two"),
+        "got: {text:?}"
+    );
+    // The two events are separated by `gap`; streaming means we saw the first long before the last.
+    assert!(first < gap, "first byte too late: {first:?}");
+    assert!(last >= gap, "last byte too early: {last:?}");
+    assert!(
+        last - first >= gap / 2,
+        "frames not separated (buffered?): first={first:?} last={last:?}"
+    );
+}
+
+/// With passthrough off (default), the same SSE response is buffered: the client gets nothing
+/// until the upstream has finished, so the first byte arrives no earlier than the inter-event gap.
+#[tokio::test]
+async fn buffered_response_withholds_body_until_complete() {
+    let gap = Duration::from_millis(500);
+    let up = spawn_sse_upstream(gap).await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    // stream_passthrough defaults to false.
+    let proxy = spawn_proxy(cfg).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .uri(format!("http://{proxy}/stream"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let start = std::time::Instant::now();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (text, first, _last) = read_streamed(resp, start).await;
+
+    assert!(
+        text.contains("one") && text.contains("two"),
+        "got: {text:?}"
+    );
+    assert!(
+        first >= gap,
+        "body was not buffered — first byte at {first:?}, expected >= {gap:?}"
+    );
+}

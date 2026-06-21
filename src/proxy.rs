@@ -11,7 +11,9 @@
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -22,6 +24,7 @@ use axum::{
 };
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, RateLimiter};
 use http_body_util::{BodyExt, Full, Limited};
+use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -79,6 +82,9 @@ pub struct Runtime {
     pub max_header_bytes: usize,
     /// Max time for the upstream request + body read; `None` disables the timeout.
     pub upstream_timeout: Option<Duration>,
+    /// Forward `text/event-stream` responses unbuffered (SSE passthrough). See
+    /// [`crate::config::ValidationCfg::stream_passthrough`].
+    pub stream_passthrough: bool,
 }
 
 /// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1).
@@ -414,6 +420,29 @@ pub async fn handle(
     };
 
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
+
+    // 8a) SSE passthrough: forward a `text/event-stream` response frame-by-frame instead of
+    //     buffering the whole body, so the client sees events as they arrive (time-to-first-byte
+    //     is preserved). The buffering path below would hold the entire stream until the upstream
+    //     finished, which defeats SSE. On a streamed body the `max_response_body` cap and the
+    //     body-read deadline don't apply — the connect/first-byte `upstream_timeout` already
+    //     bounded time-to-headers — and egress bytes are tallied by `CountingBody` as frames flow.
+    //     Response hardening is headers-only, so it stays correct on a streaming body.
+    if rt.stream_passthrough && is_event_stream(&resp_parts.headers) {
+        strip_hop_by_hop(&mut resp_parts.headers);
+        resp_parts.headers.remove(header::CONTENT_LENGTH);
+        let header_egress = header_bytes(&resp_parts.headers);
+        let body = Body::new(CountingBody::new(
+            resp_body,
+            Arc::clone(m),
+            ingress_bytes,
+            header_egress,
+        ));
+        let mut response = Response::from_parts(resp_parts, body);
+        harden_response(&rt.cfg, &mut response);
+        return finish(m, &method, &path, ip, started, "ok", response);
+    }
+
     // Buffer the upstream body, optionally capped so a huge response can't OOM the proxy.
     let resp_bytes = if rt.max_response_body > 0 {
         match within(
@@ -592,6 +621,83 @@ fn header_bytes(headers: &HeaderMap) -> usize {
         .iter()
         .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
         .sum()
+}
+
+/// True if the response is a Server-Sent Events stream (`Content-Type: text/event-stream`,
+/// ignoring any `; charset=…` parameter and leading whitespace). The signal we use to forward a
+/// response unbuffered when `validation.stream_passthrough` is on.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .map(str::trim)
+                .map(|ct| ct.eq_ignore_ascii_case("text/event-stream"))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Wraps a streaming upstream body to tally egress bytes (response headers + each data frame)
+/// and report them to managed-mode usage when the body is dropped — i.e. after the final frame
+/// is sent, or earlier if the client disconnects mid-stream (we count what actually went out).
+/// Used for SSE passthrough: the body isn't buffered, so the exact byte count the buffered path
+/// takes up front can only be accumulated as frames flow.
+struct CountingBody<B> {
+    inner: B,
+    metrics: Arc<Metrics>,
+    ingress: usize,
+    /// Running egress total: response header bytes, then each data frame as it passes.
+    egress: usize,
+}
+
+impl<B> CountingBody<B> {
+    fn new(inner: B, metrics: Arc<Metrics>, ingress: usize, header_egress: usize) -> Self {
+        Self {
+            inner,
+            metrics,
+            ingress,
+            egress: header_egress,
+        }
+    }
+}
+
+impl<B> HttpBody for CountingBody<B>
+where
+    B: HttpBody<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                this.egress = this.egress.saturating_add(data.len());
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl<B> Drop for CountingBody<B> {
+    fn drop(&mut self) {
+        self.metrics.add_usage_bytes(self.ingress, self.egress);
+    }
 }
 
 /// Remove hop-by-hop headers so they don't leak across the proxy boundary (RFC 7230 §6.1):

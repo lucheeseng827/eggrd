@@ -227,6 +227,15 @@ pub struct ValidationCfg {
     pub max_header_bytes: String,
     /// Allowed HTTP methods; empty list means allow all.
     pub allow_methods: Vec<String>,
+    /// Stream (don't buffer) responses whose `Content-Type` is `text/event-stream`. Off by
+    /// default: the proxy normally buffers the whole upstream body so it can cap size
+    /// (`max_response_body`) and account exact egress bytes. That buffering defeats Server-Sent
+    /// Events / chunked streaming — the client only sees the body once the upstream finishes.
+    /// Turn this on to forward SSE responses frame-by-frame as they arrive (preserving
+    /// time-to-first-byte). When a response is streamed this way the `max_response_body` cap and
+    /// the body-read deadline don't apply (the connect/first-byte `upstream_timeout` still
+    /// does); egress bytes are tallied as frames flow. Non-SSE responses are unaffected.
+    pub stream_passthrough: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -315,6 +324,7 @@ impl Default for ValidationCfg {
             upstream_timeout: "30s".into(),
             max_header_bytes: "0".into(),
             allow_methods: vec![],
+            stream_passthrough: false,
         }
     }
 }

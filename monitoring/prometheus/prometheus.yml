@@ -1,0 +1,35 @@
+# Scrape EdgeGuard's Prometheus exposition (`/__edgeguard/metrics`) so Grafana can render the
+# `edgeguard_*` series — request outcomes, rate-limit hits, WAF hits, the latency histogram,
+# and CSP reports. The default target is the bundled demo `edgeguard` service's PRIVATE admin
+# listener (:9090), the same metrics/health split a real deployment uses.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: edgeguard
+    metrics_path: /__edgeguard/metrics
+    static_configs:
+      - targets: ["edgeguard:9090"]
+        labels:
+          service: edgeguard
+          instance: demo
+
+  # Monitor your OWN EdgeGuard instead of the bundled demo:
+  #   1. Run EdgeGuard with the admin listener bound on a reachable interface, e.g.
+  #        [server]
+  #        admin_port = 9090
+  #        admin_addr = "0.0.0.0"
+  #   2. Comment out the `edgeguard:9090` target above (and stop the bundled demo services).
+  #   3. Uncomment the job below. `host.containers.internal` is the Podman host gateway wired
+  #      up by the `extra_hosts` entry in compose.yaml — it resolves to the machine running
+  #      Podman, so this scrapes an EdgeGuard listening on the host.
+  #
+  # - job_name: edgeguard-host
+  #   metrics_path: /__edgeguard/metrics
+  #   static_configs:
+  #     - targets: ["host.containers.internal:9090"]
+  #       labels:
+  #         service: edgeguard
+  #         instance: host

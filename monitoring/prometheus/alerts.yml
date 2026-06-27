@@ -1,0 +1,90 @@
+# Prometheus alerting rules for the EdgeGuard `edgeguard_*` metrics. Reusable as-is: drop this
+# file next to your prometheus.yml and reference it under `rule_files:`. The bundled demo wires
+# it automatically (see monitoring/prometheus/prometheus.yml).
+#
+# Thresholds are deliberately conservative starting points — tune them to your traffic. Each
+# alert is annotated with what it means and where to look first.
+
+groups:
+  - name: edgeguard
+    rules:
+      # --- Availability ------------------------------------------------------------------------
+      - alert: EdgeGuardHighUpstream5xx
+        # Share of requests failing at the upstream/gateway layer (502/504/etc.) over 5m.
+        expr: |
+          (
+            sum(rate(edgeguard_requests_total{outcome=~"bad_gateway|upstream_error|upstream_timeout|upstream_body_error|upstream_body_too_large"}[5m]))
+            /
+            clamp_min(sum(rate(edgeguard_requests_total[5m])), 1e-9)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "EdgeGuard: >5% of requests are failing upstream"
+          description: "More than 5% of requests over the last 5m returned a gateway error (502/504/…). The upstream app is likely down, slow, or erroring."
+
+      - alert: EdgeGuardUpstreamTimeouts
+        expr: sum(rate(edgeguard_requests_total{outcome="upstream_timeout"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EdgeGuard: sustained upstream timeouts"
+          description: "Requests are hitting validation.upstream_timeout (504) for 10m+. The upstream is too slow or stalled."
+
+      - alert: EdgeGuardHighLatencyP95
+        # p95 end-to-end latency from the histogram, over 5m.
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(edgeguard_request_duration_seconds_bucket[5m])) by (le)
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EdgeGuard: p95 latency above 1s"
+          description: "95th-percentile request latency has been above 1s for 10m. Check the upstream and any rate-limit/WAF overhead."
+
+      # --- Abuse / security signal -------------------------------------------------------------
+      - alert: EdgeGuardAuthFailureSpike
+        # A burst of 401s often means credential stuffing / a broken client integration.
+        expr: sum(rate(edgeguard_requests_total{outcome="unauthorized"}[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EdgeGuard: elevated authentication failures"
+          description: "Sustained 401s (>5/s over 5m for 10m). Possible credential stuffing, an expired key, or a misconfigured client."
+
+      - alert: EdgeGuardWafBlockSpike
+        # Rising WAF blocks: either an attack, or a false-positive rule that needs tuning.
+        expr: sum(rate(edgeguard_waf_hits_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "EdgeGuard: elevated WAF matches"
+          description: "WAF rule matches are elevated for 10m. Confirm it's an attack and not a false positive (check the rule class in the logs); a report-only rollout would show here too."
+
+      - alert: EdgeGuardRateLimitSaturation
+        # Lots of 429s: clients are hitting the cap — intended throttling, or a limit set too low.
+        expr: sum(rate(edgeguard_ratelimit_hits_total[5m])) > 10
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "EdgeGuard: rate limiter frequently tripping"
+          description: "Rate-limit rejections (429) are high for 10m. Either abuse is being throttled as intended, or the configured rate is too low for legitimate traffic."
+
+      # --- Limiter health ----------------------------------------------------------------------
+      - alert: EdgeGuardLimiterErrors
+        # 503s from the shared-store limiter mean the backing store (Redis) is unreachable.
+        expr: sum(rate(edgeguard_requests_total{outcome="limiter_error"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "EdgeGuard: rate-limiter store errors"
+          description: "The distributed limiter is returning 503 (store unreachable) for 5m+. Check Redis connectivity; with fail_open=false this is rejecting traffic."

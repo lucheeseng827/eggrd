@@ -84,6 +84,7 @@ services:
     image: docker.io/prom/prometheus:v2.54.1
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     extra_hosts:
       # Lets a `host.containers.internal` scrape target reach an EdgeGuard you run on the host

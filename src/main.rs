@@ -25,8 +25,8 @@ use tracing_subscriber::EnvFilter;
 use edgeguard::config::{parse_duration, Config};
 use edgeguard::generate::{generate, Target};
 use edgeguard::{
-    acme, build_admin_router, build_public_router, build_router, build_state, cp, hash_password,
-    reload, supervisor, tls,
+    acme, build_admin_router, build_public_router, build_router, build_runtime, build_state, cp,
+    doctor, hash_password, reload, scaffold, supervisor, tls,
 };
 
 /// The selected mode of operation. `serve` is the default; `hash` and `generate` are standalone
@@ -44,6 +44,10 @@ enum Cmd {
         target: String,
         out: Option<String>,
     },
+    /// `edgeguard doctor`: load + validate the config and print advisory warnings.
+    Doctor { config: Option<String> },
+    /// `edgeguard init`: scaffold a starter `edgeguard.toml` (+ a wrap-your-app Dockerfile).
+    Init { force: bool },
 }
 
 fn parse_args() -> Result<Cmd> {
@@ -79,6 +83,41 @@ fn parse_args() -> Result<Cmd> {
         });
     }
 
+    // `doctor`: validate the config and report foot-guns. Flag-only after the subcommand word.
+    if argv.first().map(String::as_str) == Some("doctor") {
+        let mut it = argv.iter().skip(1);
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                "--config" => config = Some(require_value(&mut it, "--config")?),
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                // Reject unknown flags rather than ignoring them: a typo like `--confg` must not
+                // silently fall through to validating the default config instead of the file meant.
+                other => anyhow::bail!("unknown argument for `edgeguard doctor`: {other}"),
+            }
+        }
+        return Ok(Cmd::Doctor { config });
+    }
+
+    // `init`: scaffold a starter config (+ Dockerfile). Refuses to clobber an existing
+    // edgeguard.toml unless `--force`.
+    if argv.first().map(String::as_str) == Some("init") {
+        let mut force = false;
+        for arg in argv.iter().skip(1) {
+            match arg.as_str() {
+                "--force" | "-f" => force = true,
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => anyhow::bail!("unknown argument for `edgeguard init`: {other}"),
+            }
+        }
+        return Ok(Cmd::Init { force });
+    }
+
     let mut hash = false;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -112,6 +151,8 @@ fn require_value<'a, I: Iterator<Item = &'a String>>(it: &mut I, flag: &str) -> 
 fn print_help() {
     eprintln!(
         "edgeguard [--wrap \"<start command>\"] [--config <path>]\n\
+         edgeguard init [--force]               # scaffold edgeguard.toml + a wrap-your-app Dockerfile\n\
+         edgeguard doctor [--config <path>]     # validate the config and warn on foot-guns\n\
          edgeguard --hash                       # read a password on stdin, print an argon2 hash\n\
          edgeguard generate [--target <t>] [--config <path>] [--out <path>]\n\
          \x20                                    # emit static-host / edge config from [headers]\n\
@@ -156,6 +197,94 @@ fn run_hash() -> Result<()> {
     Ok(())
 }
 
+/// `edgeguard doctor`: load + validate the config and print advisory findings. Reuses the exact
+/// load + `build_runtime` paths the proxy uses (so it can't drift from real startup behavior),
+/// then layers the [`doctor`] lints on top. Exits non-zero if anything is a hard error, so it
+/// can gate a deploy in CI.
+fn run_doctor(config: Option<String>) -> Result<()> {
+    use doctor::Level;
+
+    let cfg = match Config::load(config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("✗ [error] config failed to load: {e:#}");
+            std::process::exit(1);
+        }
+    };
+
+    let findings = doctor::lint(&cfg);
+    // Hard validation: the same startup sequence the proxy runs. `build_state` does
+    // `CpClient::from_cfg` (managed mode) before `build_runtime`, so a broken `[control_plane]`
+    // would pass `doctor` if we only built the runtime — validate both, mirroring real boot.
+    let cp_err = cp::CpClient::from_cfg(&cfg.control_plane).err();
+    let build_err = build_runtime(Arc::new(cfg)).err();
+
+    let mut errors = 0usize;
+    let mut warns = 0usize;
+    for f in &findings {
+        match f.level {
+            Level::Error => errors += 1,
+            Level::Warn => warns += 1,
+            Level::Info => {}
+        }
+        println!("{} [{}] {}", f.level.glyph(), f.level.label(), f.message);
+    }
+    if let Some(e) = &cp_err {
+        errors += 1;
+        println!("✗ [error] control-plane config does not build: {e:#}");
+    }
+    if let Some(e) = &build_err {
+        errors += 1;
+        println!("✗ [error] config does not build: {e:#}");
+    }
+
+    // Only claim a clean bill of health when there was genuinely nothing to report — info-level
+    // findings (e.g. "TLS disabled") are still output above, so they must suppress the banner.
+    if findings.is_empty() && cp_err.is_none() && build_err.is_none() {
+        println!("✓ no issues found");
+    }
+    println!("\n{errors} error(s), {warns} warning(s)");
+    if errors > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `edgeguard init`: scaffold a starter `edgeguard.toml` and a wrap-your-app
+/// `Dockerfile.edgeguard`, tailored to the runtime detected from the working directory. Refuses
+/// to overwrite either file unless `--force`, so re-running it never silently clobbers edits.
+fn run_init(force: bool) -> Result<()> {
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(".") {
+        for e in rd.flatten() {
+            entries.push(e.file_name().to_string_lossy().into_owned());
+        }
+    }
+    let runtime = scaffold::Runtime::detect(&entries);
+
+    // Refuse to clobber existing files — re-running `init` must never silently overwrite edits.
+    // This is an expected user condition, not a crash, so exit cleanly (no error backtrace).
+    if !force {
+        for path in ["edgeguard.toml", "Dockerfile.edgeguard"] {
+            if std::path::Path::new(path).exists() {
+                eprintln!(
+                    "{path} already exists; re-run `edgeguard init --force` to overwrite it."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    std::fs::write("edgeguard.toml", scaffold::EDGEGUARD_TOML).context("writing edgeguard.toml")?;
+    std::fs::write("Dockerfile.edgeguard", scaffold::dockerfile(runtime))
+        .context("writing Dockerfile.edgeguard")?;
+
+    eprintln!("Detected runtime: {}", runtime.label());
+    eprintln!("Wrote edgeguard.toml and Dockerfile.edgeguard.\n");
+    eprint!("{}", scaffold::next_steps(runtime));
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // `--hash` and `generate` are standalone utilities: no logging setup, no listener. `serve`
@@ -167,6 +296,8 @@ async fn main() -> Result<()> {
             target,
             out,
         } => return run_generate(config, &target, out),
+        Cmd::Doctor { config } => return run_doctor(config),
+        Cmd::Init { force } => return run_init(force),
         Cmd::Serve { wrap, config } => (wrap, config),
     };
 
@@ -203,6 +334,14 @@ async fn main() -> Result<()> {
     let cp_client = state.cp.clone();
     let cp_runtime = state.runtime.clone();
     let cp_metrics = state.metrics.clone();
+    let cp_quota = state.quota.clone();
+
+    // Hard quota needs the managed-mode client to poll verdicts; without it the gate would stay
+    // permissive forever. Fail fast rather than silently not enforcing a configured cap.
+    anyhow::ensure!(
+        !(cfg.control_plane.enforce_quota && cp_client.is_none()),
+        "control_plane.enforce_quota requires control_plane.enabled = true (with url/tenant_id/edge_token)"
+    );
 
     // Optional private admin listener: when `server.admin_port` is set, the internal ops
     // endpoints (health/readiness/metrics) move to a separate plain-HTTP listener so they
@@ -256,6 +395,20 @@ async fn main() -> Result<()> {
         let poll_rx = shutdown_rx.clone();
         let poller = cp_client.clone();
         tokio::spawn(async move { cp::poll_loop(poller, base, cp_runtime, poll, poll_rx).await });
+        // Quota enforcement poller (opt-in): publishes the edge's quota verdict to the shared
+        // QuotaState the proxy hard-stops on.
+        if cfg.control_plane.enforce_quota {
+            let quota_interval = parse_duration(&cfg.control_plane.quota_poll_interval)
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, interval = %cfg.control_plane.quota_poll_interval, "invalid quota_poll_interval; using 30s");
+                    Duration::from_secs(30)
+                });
+            let quota_rx = shutdown_rx.clone();
+            let quota_client = cp_client.clone();
+            tokio::spawn(async move {
+                cp::quota_loop(quota_client, cp_quota, quota_interval, quota_rx).await
+            });
+        }
         let report_rx = shutdown_rx.clone();
         tokio::spawn(
             async move { cp::report_loop(cp_client, cp_metrics, report, report_rx).await },

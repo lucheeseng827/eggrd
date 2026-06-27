@@ -10,6 +10,7 @@
 //! logic; it just speaks the control plane's edge HTTP API with a per-tenant bearer token. Built
 //! on the same `reqwest` + rustls stack as the JWKS fetcher (`auth.rs`).
 
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,42 @@ pub struct UsageDelta {
 struct PolicyResp {
     etag: String,
     body: String,
+}
+
+/// The subset of the control plane's `QuotaStatus` the edge needs to enforce a hard stop.
+#[derive(Debug, Deserialize)]
+struct QuotaResp {
+    over_quota: bool,
+    #[serde(default)]
+    reset_epoch: i64,
+}
+
+/// Shared, hot-reload-surviving quota verdict the proxy enforces. The [`quota_loop`] writes it from
+/// the control plane's verdict; the proxy reads it per request. It lives in `AppState` (not the
+/// hot-swappable `Runtime`) so a policy reload never resets the enforcement state.
+#[derive(Debug, Default)]
+pub struct QuotaState {
+    /// `true` while the edge is over its quota — the proxy returns `429`.
+    pub over_quota: AtomicBool,
+    /// Unix second the quota resets (period rollover); `0` = unknown. The `Retry-After` hint.
+    pub reset_epoch: AtomicI64,
+}
+
+impl QuotaState {
+    /// Whether the proxy should currently hard-stop the edge's traffic.
+    pub fn blocked(&self) -> bool {
+        self.over_quota.load(Ordering::Relaxed)
+    }
+
+    /// The reset-epoch hint last reported by the control plane (`0` if none yet).
+    pub fn reset_epoch(&self) -> i64 {
+        self.reset_epoch.load(Ordering::Relaxed)
+    }
+
+    fn apply(&self, over_quota: bool, reset_epoch: i64) {
+        self.over_quota.store(over_quota, Ordering::Relaxed);
+        self.reset_epoch.store(reset_epoch, Ordering::Relaxed);
+    }
 }
 
 /// Outcome of a conditional policy pull.
@@ -125,6 +162,22 @@ impl CpClient {
             .error_for_status()
             .context("control plane rejected usage report")?;
         Ok(())
+    }
+
+    /// Pull the tenant's current quota verdict (`over_quota` + `reset_epoch`). Any non-success
+    /// status is an error so the caller keeps the last verdict rather than acting on a partial read.
+    pub async fn pull_quota(&self) -> Result<(bool, i64)> {
+        let resp = self
+            .http
+            .get(format!("{}/quota", self.edge_base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("pulling quota")?
+            .error_for_status()
+            .context("control plane rejected quota poll")?;
+        let q: QuotaResp = resp.json().await.context("parsing quota verdict")?;
+        Ok((q.over_quota, q.reset_epoch))
     }
 
     /// Forward a raw CSP report body (best-effort; errors are logged, never surfaced).
@@ -229,9 +282,42 @@ pub async fn report_loop(
     // Best-effort final flush on graceful shutdown so billable usage isn't lost.
     let (requests, ingress_bytes, egress_bytes) = metrics.drain_usage();
     if requests > 0 || ingress_bytes > 0 || egress_bytes > 0 {
-        let delta = UsageDelta { requests, ingress_bytes, egress_bytes };
+        let delta = UsageDelta {
+            requests,
+            ingress_bytes,
+            egress_bytes,
+        };
         if let Err(e) = client.report_usage(&delta).await {
-            warn!(error = format!("{e:#}"), "final usage report on shutdown failed");
+            warn!(
+                error = format!("{e:#}"),
+                "final usage report on shutdown failed"
+            );
+        }
+    }
+}
+
+/// Background loop: poll the control plane for the tenant's quota verdict and publish it to the
+/// shared [`QuotaState`] the proxy enforces. A failed poll keeps the last verdict (fail-static), so
+/// a control-plane blip neither suddenly blocks nor suddenly unblocks the edge.
+pub async fn quota_loop(
+    client: Arc<CpClient>,
+    quota: Arc<QuotaState>,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    info!(?interval, "control-plane quota poller started");
+    loop {
+        match client.pull_quota().await {
+            Ok((over_quota, reset_epoch)) => {
+                quota.apply(over_quota, reset_epoch);
+            }
+            Err(e) => warn!(
+                error = format!("{e:#}"),
+                "quota poll failed; keeping last verdict"
+            ),
+        }
+        if sleep_or_shutdown(&mut shutdown, interval).await {
+            break;
         }
     }
 }
@@ -282,11 +368,20 @@ mod tests {
         StatusCode::ACCEPTED
     }
 
+    async fn quota() -> axum::response::Response {
+        // A trimmed QuotaStatus: the edge only reads over_quota + reset_epoch.
+        Json(serde_json::json!({
+            "over_quota": true, "reset_epoch": 1_782_864_000_i64
+        }))
+        .into_response()
+    }
+
     async fn spawn_stub() -> (SocketAddr, Stub) {
         let stub = Stub::default();
         let app = Router::new()
             .route("/v3/edge/t1/policy", get(policy))
             .route("/v3/edge/t1/usage", post(usage))
+            .route("/v3/edge/t1/quota", get(quota))
             .with_state(stub.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -358,5 +453,42 @@ mod tests {
         assert_eq!(got["requests"], 3);
         assert_eq!(got["ingress_bytes"], 100);
         assert_eq!(got["egress_bytes"], 250);
+    }
+
+    #[tokio::test]
+    async fn quota_pull_returns_verdict() {
+        let (addr, _) = spawn_stub().await;
+        let c = client(addr);
+        let (over, reset) = c.pull_quota().await.unwrap();
+        assert!(over);
+        assert_eq!(reset, 1_782_864_000);
+    }
+
+    #[tokio::test]
+    async fn quota_loop_publishes_to_shared_state() {
+        let (addr, _) = spawn_stub().await;
+        let c = client(addr);
+        let state = Arc::new(QuotaState::default());
+        assert!(!state.blocked(), "starts permissive");
+
+        let (tx, rx) = watch::channel(false);
+        let st = state.clone();
+        let handle =
+            tokio::spawn(async move { quota_loop(c, st, Duration::from_millis(50), rx).await });
+
+        // Give the loop one poll, then assert the verdict landed, and shut it down.
+        for _ in 0..50 {
+            if state.blocked() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state.blocked(),
+            "verdict from the control plane should publish"
+        );
+        assert_eq!(state.reset_epoch(), 1_782_864_000);
+        let _ = tx.send(true);
+        let _ = handle.await;
     }
 }

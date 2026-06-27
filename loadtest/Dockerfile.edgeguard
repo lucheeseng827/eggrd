@@ -1,6 +1,6 @@
 # Build EdgeGuard for the load-test harness.
 #
-# The build context is the crate root (module_52), NOT the monorepo root — see the
+# The build context is the crate root, NOT a parent directory — see the
 # `context: ..` in docker-compose.yml. Copied on its own, the crate builds standalone (its
 # Cargo.toml pins literal versions with no `workspace = true` inheritance), so it does not need
 # the parent workspace to compile.

@@ -23,8 +23,8 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use edgeguard::config::{
-    AuthCfg, Config, HeadersCfg, JwtCfg, PerKeyRateLimit, RateLimitCfg, RouteRateLimit, ServerCfg,
-    WafCfg, WafRule,
+    AuthCfg, Config, CorsCfg, HeadersCfg, JwtCfg, PerKeyRateLimit, RateLimitCfg, RouteRateLimit,
+    ServerCfg, UpstreamRoute, WafCfg, WafRule,
 };
 use edgeguard::{build_admin_router, build_public_router, build_router, build_state};
 
@@ -63,6 +63,25 @@ async fn spawn_proxy(cfg: Config) -> SocketAddr {
         .unwrap();
     });
     addr
+}
+
+/// Spawn EdgeGuard with `cfg`, returning its address **and** a handle to the shared quota verdict,
+/// so a test can flip `over_quota` and assert the proxy's hard-stop gate.
+async fn spawn_proxy_with_quota(cfg: Config) -> (SocketAddr, Arc<edgeguard::cp::QuotaState>) {
+    let state = build_state(Arc::new(cfg)).unwrap();
+    let quota = state.quota.clone();
+    let app = build_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (addr, quota)
 }
 
 /// Stub upstream that sleeps `delay` before responding, to exercise the upstream timeout.
@@ -140,6 +159,57 @@ async fn send(addr: SocketAddr, method: &str, path: &str, auth: Option<&str>, bo
 
 async fn get(addr: SocketAddr, auth: Option<&str>) -> Resp {
     send(addr, "GET", "/", auth, Bytes::new()).await
+}
+
+/// The opt-in managed-mode quota hard-stop: when the shared verdict flips to over-quota, the proxy
+/// returns `429` (with a `Retry-After` hint) for the tenant's traffic, while the internal ops
+/// endpoints keep serving; clearing the verdict restores service.
+#[tokio::test]
+async fn over_quota_hard_stops_with_429() {
+    use std::sync::atomic::Ordering;
+
+    let upstream = spawn_upstream().await;
+    let mut cfg = base_cfg(format!("http://{upstream}"));
+    cfg.control_plane.enforce_quota = true;
+    let (addr, quota) = spawn_proxy_with_quota(cfg).await;
+
+    // Under quota -> authenticated request proxies normally.
+    let ok = get(addr, Some(&basic("admin", "secret"))).await;
+    assert_eq!(ok.status, StatusCode::OK);
+
+    // Over quota -> hard stop, before auth even (the whole tenant is paused), with a reset hint.
+    quota.over_quota.store(true, Ordering::Relaxed);
+    quota.reset_epoch.store(4_000_000_000, Ordering::Relaxed);
+    let blocked = get(addr, Some(&basic("admin", "secret"))).await;
+    assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.headers.get(header::RETRY_AFTER).is_some());
+    // Even an unauthenticated request is paused (the gate runs before auth).
+    assert_eq!(get(addr, None).await.status, StatusCode::TOO_MANY_REQUESTS);
+
+    // Ops endpoints are exempt — health checks must not flap when a tenant is over quota.
+    let health = send(addr, "GET", "/__edgeguard/health", None, Bytes::new()).await;
+    assert_eq!(health.status, StatusCode::OK);
+
+    // Clearing the verdict (next successful poll) restores normal service.
+    quota.over_quota.store(false, Ordering::Relaxed);
+    let restored = get(addr, Some(&basic("admin", "secret"))).await;
+    assert_eq!(restored.status, StatusCode::OK);
+}
+
+/// With `enforce_quota` off (the default), an over-quota verdict is ignored — metering without a cap.
+#[tokio::test]
+async fn quota_not_enforced_when_disabled() {
+    use std::sync::atomic::Ordering;
+
+    let upstream = spawn_upstream().await;
+    let cfg = base_cfg(format!("http://{upstream}")); // enforce_quota defaults to false
+    let (addr, quota) = spawn_proxy_with_quota(cfg).await;
+    quota.over_quota.store(true, Ordering::Relaxed);
+    // The gate is inert, so the request still proxies.
+    assert_eq!(
+        get(addr, Some(&basic("admin", "secret"))).await.status,
+        StatusCode::OK
+    );
 }
 
 /// Send a request with arbitrary headers (for the API-key / JWT / header-size tests).
@@ -1170,5 +1240,375 @@ async fn buffered_response_withholds_body_until_complete() {
     assert!(
         first >= gap,
         "body was not buffered — first byte at {first:?}, expected >= {gap:?}"
+    );
+}
+
+/// CORS: a browser preflight (OPTIONS + Origin + Access-Control-Request-Method) is answered by
+/// EdgeGuard directly, *before* auth (preflights carry no credentials), with the matching allow
+/// headers — and the actual authenticated response is decorated with Access-Control-Allow-Origin
+/// + Vary: Origin. A disallowed origin gets no CORS headers, so the browser blocks it.
+#[tokio::test]
+async fn cors_preflight_and_decoration() {
+    let upstream = spawn_upstream().await;
+    let mut cfg = base_cfg(format!("http://{upstream}")); // basic auth admin/secret
+    cfg.cors = CorsCfg {
+        enabled: true,
+        allow_origins: vec!["https://app.example.com".into()],
+        allow_credentials: true,
+        ..Default::default()
+    };
+    let addr = spawn_proxy(cfg).await;
+
+    // Preflight from an allowed origin: 204, no auth required, ACAO echoes the origin, the
+    // requested headers are reflected, and the credentials flag is set.
+    let pre = send_with_headers(
+        addr,
+        "OPTIONS",
+        "/api/thing",
+        &[
+            ("origin", "https://app.example.com"),
+            ("access-control-request-method", "POST"),
+            ("access-control-request-headers", "content-type"),
+        ],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(pre.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        pre.headers
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(
+        pre.headers
+            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(
+        pre.headers
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .unwrap(),
+        "content-type"
+    );
+
+    // Preflight from a disallowed origin: still 204, but no CORS headers (browser refuses it).
+    let bad = send_with_headers(
+        addr,
+        "OPTIONS",
+        "/api/thing",
+        &[
+            ("origin", "https://evil.example"),
+            ("access-control-request-method", "POST"),
+        ],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::NO_CONTENT);
+    assert!(bad
+        .headers
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .is_none());
+
+    // Actual authenticated request: response is decorated with ACAO + Vary: Origin.
+    let resp = send_with_headers(
+        addr,
+        "GET",
+        "/",
+        &[
+            ("origin", "https://app.example.com"),
+            ("authorization", &basic("admin", "secret")),
+        ],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.headers
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "https://app.example.com"
+    );
+    assert!(resp
+        .headers
+        .get_all(header::VARY)
+        .iter()
+        .any(|v| v.to_str().unwrap().eq_ignore_ascii_case("origin")));
+}
+
+/// IP access control: `deny` drops a matching client with `403` before auth, and a non-empty
+/// `allow` is a whitelist (a client outside it is rejected even with no auth gate).
+#[tokio::test]
+async fn ip_access_deny_and_allow() {
+    let upstream = spawn_upstream().await;
+
+    // Deny loopback -> 403 (the test client connects from 127.0.0.1 / ::1).
+    let mut deny_cfg = base_cfg(format!("http://{upstream}"));
+    deny_cfg.auth.mode = "none".into();
+    deny_cfg.access.deny = vec!["127.0.0.1/32".into(), "::1/128".into()];
+    let denied = spawn_proxy(deny_cfg).await;
+    assert_eq!(get(denied, None).await.status, StatusCode::FORBIDDEN);
+
+    // Allowlist that excludes loopback -> 403 (whitelist semantics).
+    let mut allow_other = base_cfg(format!("http://{upstream}"));
+    allow_other.auth.mode = "none".into();
+    allow_other.access.allow = vec!["10.0.0.0/8".into()];
+    let blocked = spawn_proxy(allow_other).await;
+    assert_eq!(get(blocked, None).await.status, StatusCode::FORBIDDEN);
+
+    // Allowlist including loopback -> 200.
+    let mut allow_lo = base_cfg(format!("http://{upstream}"));
+    allow_lo.auth.mode = "none".into();
+    allow_lo.access.allow = vec!["127.0.0.1/32".into(), "::1/128".into()];
+    let ok = spawn_proxy(allow_lo).await;
+    assert_eq!(get(ok, None).await.status, StatusCode::OK);
+}
+
+/// A minimal upstream that performs an HTTP `Upgrade` handshake: it answers `101` (echoing the
+/// requested `Upgrade` token) and then echoes every byte on the upgraded connection. Lets the
+/// WebSocket-passthrough test assert the proxy splices bytes both ways, without pulling in a full
+/// WebSocket framing library — the proxy's job is protocol-agnostic byte tunneling after a `101`.
+async fn spawn_ws_echo_upstream() -> SocketAddr {
+    async fn handler(req: Request<Body>) -> Response<Body> {
+        let proto = req.headers().get(header::UPGRADE).cloned();
+        let on_upgrade = hyper::upgrade::on(req);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if let Ok(upgraded) = on_upgrade.await {
+                let mut io = hyper_util::rt::TokioIo::new(upgraded);
+                let mut buf = vec![0u8; 1024];
+                loop {
+                    match io.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if io.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+        resp.headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        if let Some(p) = proto {
+            resp.headers_mut().insert(header::UPGRADE, p);
+        }
+        resp
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// WebSocket / `Upgrade` passthrough: with `validation.websocket_passthrough` on, an upgrade
+/// request is forwarded intact, the upstream's `101` reaches the client, and the connection
+/// becomes a raw bidirectional tunnel (bytes written by the client are echoed back through the
+/// proxy). Uses a raw TCP client so the test isn't tied to a WebSocket client library.
+#[tokio::test]
+async fn websocket_passthrough_tunnels_bytes() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let upstream = spawn_ws_echo_upstream().await;
+    let mut cfg = base_cfg(format!("http://{upstream}"));
+    cfg.auth.mode = "none".into();
+    cfg.validation.websocket_passthrough = true;
+    let addr = spawn_proxy(cfg).await;
+
+    // Bound the whole exchange: if the proxy regresses and never returns 101 or stops echoing,
+    // fail fast with a clear message instead of hanging until the test harness kills us.
+    let exchange = async {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET /ws HTTP/1.1\r\nHost: edgeguard\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        // Read the response head (up to the blank line that ends the headers).
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = stream.read(&mut byte).await.unwrap();
+            assert_ne!(n, 0, "connection closed before the 101 head");
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&head);
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "expected 101, got: {head}"
+        );
+
+        // The connection is now a raw tunnel — bytes are echoed by the upstream.
+        stream.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+    };
+    tokio::time::timeout(Duration::from_secs(5), exchange)
+        .await
+        .expect("websocket tunnel did not complete within 5s");
+}
+
+/// Upstream that reflects the `X-Request-Id` it received into a response header, so the test can
+/// assert EdgeGuard both forwards the id upstream and echoes it to the client.
+async fn spawn_reflect_upstream() -> SocketAddr {
+    async fn handler(req: Request<Body>) -> Response<Body> {
+        let seen = req.headers().get("x-request-id").cloned();
+        let mut resp = Response::new(Body::from("ok"));
+        if let Some(v) = seen {
+            resp.headers_mut().insert("x-saw-request-id", v);
+        }
+        resp
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// A request id is generated when absent, forwarded upstream, and echoed on the response; a
+/// well-formed inbound id is reused verbatim end to end (for cross-service log correlation).
+#[tokio::test]
+async fn request_id_is_generated_echoed_and_forwarded() {
+    let upstream = spawn_reflect_upstream().await;
+    let mut cfg = base_cfg(format!("http://{upstream}"));
+    cfg.auth.mode = "none".into();
+    let addr = spawn_proxy(cfg).await;
+
+    // No inbound id -> EdgeGuard generates one, echoes it, and the upstream saw the same value.
+    let r = send_with_headers(addr, "GET", "/", &[], Bytes::new()).await;
+    let echoed = r
+        .headers
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(!echoed.is_empty());
+    assert_eq!(r.headers.get("x-saw-request-id").unwrap(), echoed.as_str());
+
+    // Inbound id -> reused verbatim, client-echoed and upstream-forwarded.
+    let r = send_with_headers(
+        addr,
+        "GET",
+        "/",
+        &[("x-request-id", "trace-abc-123")],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(r.headers.get("x-request-id").unwrap(), "trace-abc-123");
+    assert_eq!(r.headers.get("x-saw-request-id").unwrap(), "trace-abc-123");
+}
+
+/// A trivial upstream that always responds with a fixed label, to tell two upstreams apart.
+async fn spawn_labeled_upstream(label: &'static str) -> SocketAddr {
+    let app = Router::new().fallback(any(move || async move { label }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// `[[upstreams]]`: a path-prefix override routes matching requests to a second upstream, while
+/// everything else falls back to the default upstream.
+#[tokio::test]
+async fn path_based_upstream_routing() {
+    let default_up = spawn_labeled_upstream("default-upstream").await;
+    let api_up = spawn_labeled_upstream("api-upstream").await;
+    let admin_up = spawn_labeled_upstream("admin-upstream").await;
+    let mut cfg = base_cfg(format!("http://{default_up}"));
+    cfg.auth.mode = "none".into();
+    // Overlapping prefixes, declared broad-first, to prove longest-prefix wins (not declaration
+    // order).
+    cfg.upstreams = vec![
+        UpstreamRoute {
+            path: "/api/".into(),
+            target: format!("http://{api_up}"),
+        },
+        UpstreamRoute {
+            path: "/api/admin/".into(),
+            target: format!("http://{admin_up}"),
+        },
+    ];
+    let addr = spawn_proxy(cfg).await;
+
+    assert_eq!(get(addr, None).await.body, "default-upstream");
+    assert_eq!(
+        send(addr, "GET", "/api/users", None, Bytes::new())
+            .await
+            .body,
+        "api-upstream"
+    );
+    // The deeper, more specific prefix wins over the broader `/api/` one.
+    assert_eq!(
+        send(addr, "GET", "/api/admin/users", None, Bytes::new())
+            .await
+            .body,
+        "admin-upstream"
+    );
+    // A non-matching prefix still goes to the default.
+    assert_eq!(
+        send(addr, "GET", "/static/app.js", None, Bytes::new())
+            .await
+            .body,
+        "default-upstream"
+    );
+}
+
+/// An upstream returning a sizable, compressible body (above the compressor's small-response
+/// floor) so the gzip path actually engages.
+async fn spawn_big_upstream() -> SocketAddr {
+    async fn handler() -> Response<Body> {
+        Response::new(Body::from("compress me ".repeat(64)))
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// With `validation.compress_responses` on and a client that advertises `Accept-Encoding: gzip`,
+/// a compressible response comes back gzip-encoded.
+#[tokio::test]
+async fn gzip_compression_when_enabled() {
+    let upstream = spawn_big_upstream().await;
+    let mut cfg = base_cfg(format!("http://{upstream}"));
+    cfg.auth.mode = "none".into();
+    cfg.validation.compress_responses = true;
+    let addr = spawn_proxy(cfg).await;
+
+    let r = send_with_headers(
+        addr,
+        "GET",
+        "/",
+        &[("accept-encoding", "gzip")],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(
+        r.headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip")
     );
 }

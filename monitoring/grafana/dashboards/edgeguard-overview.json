@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Overview of an EdgeGuard (eggrd) edge proxy from its /__edgeguard/metrics exposition: request rate by outcome, latency percentiles, rate-limit and WAF activity, and scrape health. Reference template — see github.com/lucheeseng827 -> rust_modules/lab/module_52/monitoring.",
+  "description": "Overview of an EdgeGuard (eggrd) edge proxy from its /__edgeguard/metrics exposition: request rate by outcome, latency percentiles, rate-limit and WAF activity, and scrape health. Reference template — see the monitoring/ directory in the repo.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,

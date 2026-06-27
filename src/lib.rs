@@ -5,15 +5,19 @@
 //! `build_router` entry points the binary uses, so tests exercise the real request path
 //! rather than a reimplementation of it.
 
+pub mod access;
 pub mod acme;
 pub mod auth;
 pub mod config;
+pub mod cors;
 pub mod cp;
+pub mod doctor;
 pub mod generate;
 pub mod limiter;
 pub mod metrics;
 pub mod proxy;
 pub mod reload;
+pub mod scaffold;
 pub mod supervisor;
 pub mod tls;
 pub mod waf;
@@ -109,10 +113,37 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
         None
     };
 
+    // Per-path upstream overrides ([[upstreams]]): normalize each target like `upstream_base`
+    // (trim a trailing '/'). A bad/empty entry fails here so it surfaces at startup/reload.
+    let mut upstream_routes = Vec::with_capacity(cfg.upstreams.len());
+    for route in &cfg.upstreams {
+        anyhow::ensure!(!route.path.is_empty(), "upstreams[].path must not be empty");
+        // The path is a URL path prefix matched against request paths (which start with '/'), so a
+        // value like "api/" could never match — reject it at startup instead of silently routing
+        // everything to the default upstream.
+        anyhow::ensure!(
+            route.path.starts_with('/'),
+            "upstreams[].path must start with '/' (got {:?})",
+            route.path
+        );
+        anyhow::ensure!(
+            !route.target.is_empty(),
+            "upstreams[].target must not be empty (path {:?})",
+            route.path
+        );
+        let base = route.target.trim_end_matches('/').to_string();
+        upstream_routes.push((route.path.clone(), std::sync::Arc::new(base)));
+    }
+
     let auth = AuthEngine::build(&cfg.auth)?;
     // Compile the WAF here too, so a bad custom pattern fails fast at startup/reload rather
     // than per-request (and a broken hot-reload keeps the previous policy).
     let waf = crate::waf::WafEngine::build(&cfg.waf)?;
+    // Compile the CORS policy (None when disabled). An incoherent policy — credentialed
+    // wildcard, enabled-but-no-origins — fails here, so it's caught at startup/reload.
+    let cors = crate::cors::CorsPolicy::build(&cfg.cors)?;
+    // Compile the IP allow/deny lists (None when both empty). A bad CIDR fails here.
+    let access = crate::access::AccessPolicy::build(&cfg.access)?;
 
     let max_body = parse_size(&cfg.validation.max_body)?;
     let max_response_body = parse_size(&cfg.validation.max_response_body)?;
@@ -123,8 +154,11 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
 
     Ok(Runtime {
         upstream_base: Arc::new(cfg.upstream_base()),
+        upstream_routes,
         auth,
         waf,
+        cors,
+        access,
         distributed,
         ip_limiter,
         route_limiters,
@@ -134,6 +168,7 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
         max_header_bytes,
         upstream_timeout,
         stream_passthrough: cfg.validation.stream_passthrough,
+        websocket_passthrough: cfg.validation.websocket_passthrough,
         cfg,
     })
 }
@@ -151,6 +186,7 @@ pub fn build_state(cfg: Arc<Config>) -> Result<AppState> {
         metrics: Arc::new(Metrics::new()),
         runtime: Arc::new(ArcSwap::from_pointee(runtime)),
         cp,
+        quota: Arc::new(crate::cp::QuotaState::default()),
     })
 }
 
@@ -161,19 +197,33 @@ pub fn build_state(cfg: Arc<Config>) -> Result<AppState> {
 /// handler, so the default layer is disabled there; the CSP sink keeps a small explicit cap
 /// since it parses the body.
 pub fn build_router(state: AppState) -> Router {
-    public_routes()
+    let router = public_routes()
         .merge(admin_routes())
-        .layer(DefaultBodyLimit::disable())
-        .with_state(state)
+        .layer(DefaultBodyLimit::disable());
+    maybe_compress(router, &state).with_state(state)
+}
+
+/// Optionally wrap the router in a gzip [`CompressionLayer`] when `validation.compress_responses`
+/// is set. Compression is a listener-level concern (not hot-reloadable), so it reads the *initial*
+/// config from `state`. The predicate excludes `text/event-stream` so SSE streaming is never held
+/// back by the compressor (on top of the default skip-small / skip-already-compressed rules).
+fn maybe_compress(router: Router<AppState>, state: &AppState) -> Router<AppState> {
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+    use tower_http::compression::CompressionLayer;
+
+    if !state.runtime.load().cfg.validation.compress_responses {
+        return router;
+    }
+    let predicate = DefaultPredicate::new().and(NotForContentType::const_new("text/event-stream"));
+    router.layer(CompressionLayer::new().compress_when(predicate))
 }
 
 /// The **public** router (used in public/private split mode): the catch-all proxy plus the
 /// browser-facing CSP report sink. The ops endpoints (health/readiness/metrics) are *not* here
 /// — they live on the private [`build_admin_router`] listener, so they aren't exposed publicly.
 pub fn build_public_router(state: AppState) -> Router {
-    public_routes()
-        .layer(DefaultBodyLimit::disable())
-        .with_state(state)
+    let router = public_routes().layer(DefaultBodyLimit::disable());
+    maybe_compress(router, &state).with_state(state)
 }
 
 /// The **private/admin** router (used in public/private split mode): the internal ops endpoints
@@ -260,5 +310,30 @@ mod tests {
             burst: 5,
         }];
         assert!(build_runtime(Arc::new(cfg)).is_err());
+    }
+
+    #[test]
+    fn build_runtime_validates_upstream_route_paths() {
+        // A leading '/' is required — "api/" could never match a request path.
+        let bad = Config {
+            upstreams: vec![crate::config::UpstreamRoute {
+                path: "api/".into(),
+                target: "http://api:4000".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(build_runtime(Arc::new(bad)).is_err());
+
+        // A well-formed route compiles, with the target's trailing slash trimmed.
+        let ok = Config {
+            upstreams: vec![crate::config::UpstreamRoute {
+                path: "/api/".into(),
+                target: "http://api:4000/".into(),
+            }],
+            ..Default::default()
+        };
+        let rt = build_runtime(Arc::new(ok)).unwrap();
+        assert_eq!(rt.pick_upstream("/api/x"), "http://api:4000");
+        assert_eq!(rt.pick_upstream("/other"), rt.upstream_base.as_str());
     }
 }

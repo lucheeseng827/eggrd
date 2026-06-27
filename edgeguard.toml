@@ -29,6 +29,18 @@ trust_forwarded_for = false
 admin_port = 0            # 0 = keep internal endpoints on the public port (default)
 admin_addr = "127.0.0.1"  # loopback (same-host scraper); "0.0.0.0" for a private interface
 
+# --- Per-path upstream overrides (optional; single upstream by default) ---
+# Everything goes to server.upstream/app_port unless a prefix below matches. The common use is a
+# static frontend + an /api backend. Longest matching prefix wins; no match falls back to the
+# default upstream. This is a STATIC PREFIX MAP, not a gateway — no service discovery, load
+# balancing, or request rewriting (the path is forwarded unchanged).
+# [[upstreams]]
+# path = "/api/"
+# target = "http://api.internal:4000"
+# [[upstreams]]
+# path = "/auth/"
+# target = "http://auth.internal:5000"
+
 [auth]
 # Gate applied to every proxied request (the internal /__edgeguard/* endpoints are exempt):
 #   "none"   — no authentication
@@ -123,6 +135,17 @@ allow_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 # streams this way, `max_response_body` and the body-read timeout don't apply (the
 # connect/first-byte `upstream_timeout` still does). Non-SSE responses are unaffected.
 stream_passthrough = false
+# Tunnel WebSocket (and other `Upgrade`) connections to the upstream. Off by default: the normal
+# path strips the hop-by-hop Upgrade/Connection headers, so a WebSocket handshake would be
+# forwarded as a plain HTTP request and fail. Turn this on to proxy WS apps (chat, live
+# dashboards, dev HMR): an authenticated, rate-limited upgrade request is forwarded intact and,
+# on the upstream's 101, EdgeGuard splices the two connections into a raw bidirectional tunnel.
+# Response hardening / WAF body inspection don't apply to a tunneled connection.
+websocket_passthrough = false
+# gzip-compress responses for clients that send `Accept-Encoding: gzip`. Off by default. Skips
+# already-compressed content types and (always) `text/event-stream`, so SSE streaming is never
+# held back by the compressor. Applied at the listener, so toggling it needs a restart.
+compress_responses = false
 
 [headers]
 hsts = true
@@ -160,6 +183,40 @@ inspect_body = false    # inspect the (size-capped) request body — opt in
 # pattern = "(?i)/wp-(admin|login)"
 # target = "path"
 
+# --- IP access control (optional; allow-all by default) ---
+# Coarse network gate by client IP, evaluated before auth and rate limiting. Both lists accept
+# plain IPs and CIDR ranges (IPv4 and IPv6). `deny` wins over `allow`; a non-empty `allow` means
+# "only these may connect". Both empty (the default) = allow all. A bad entry fails at startup.
+# NB: keys on the resolved client IP — behind a trusted proxy/LB, set server.trust_forwarded_for
+# so this sees the real client rather than the proxy.
+[access]
+allow = []   # e.g. ["10.0.0.0/8", "203.0.113.7"]  — lock the app to an office/VPN range
+deny = []    # e.g. ["198.51.100.0/24"]            — drop an abusive subnet (wins over allow)
+
+# --- CORS (optional; OFF by default) ---
+# Cross-Origin Resource Sharing. Turn this on when the app's browser frontend is served from a
+# DIFFERENT origin than EdgeGuard (a separate static host, a preview URL, localhost:5173 in dev) —
+# otherwise the browser blocks those cross-origin fetch/XHR calls. EdgeGuard answers preflight
+# OPTIONS requests itself (before auth — a preflight carries no credentials) and adds the matching
+# Access-Control-* headers to actual responses.
+[cors]
+enabled = false
+# Allowed origins, matched exactly (scheme + host + port). The single entry ["*"] allows any
+# origin, but a wildcard CANNOT be combined with allow_credentials = true (rejected at startup).
+allow_origins = []                # e.g. ["https://app.example.com", "http://localhost:5173"]
+# Methods advertised in the preflight. [] = a sensible default (GET/POST/PUT/PATCH/DELETE/OPTIONS/HEAD).
+allow_methods = []
+# Request headers advertised in Access-Control-Allow-Headers. [] = reflect what the browser asks
+# for in Access-Control-Request-Headers (the common, permissive default).
+allow_headers = []
+# Response headers the browser page is allowed to read. [] = only the CORS-safelisted set.
+expose_headers = []
+# Send Access-Control-Allow-Credentials: true so the browser may include cookies / HTTP auth.
+# Requires an explicit allow_origins list (no "*").
+allow_credentials = false
+# How long the browser may cache the preflight result. "0" omits Access-Control-Max-Age.
+max_age = "600s"
+
 # --- TLS termination (optional) ---
 # When enabled, EdgeGuard serves HTTPS on the public port. Provide a certificate via
 # cert_path/key_path, or have ACME obtain one automatically (see [tls.acme]).
@@ -181,15 +238,21 @@ cache_dir = "./acme"  # stores the ACME account key for renewals
 accept_tos = false    # must be true to accept the provider's Terms of Service
 
 # ── Managed mode (optional) ───────────────────────────────────────────────────────────────
-# Pull this edge's policy from a remote control plane and report usage to it. OFF by default —
-# leave disabled to run as a standalone proxy. When enabled, the control plane pushes the policy
-# sections (auth/ratelimit/validation/headers/waf); this edge keeps its own [server]/[tls].
+# Pull this edge's policy from a remote control plane and report operational metrics to it. OFF
+# by default — leave disabled to run as a standalone proxy. When enabled, the control plane pushes
+# the policy sections (auth/ratelimit/validation/headers/waf); this edge keeps its own [server]/[tls].
 # The edge token is a secret — prefer the EDGEGUARD_CP_EDGE_TOKEN env var over this file.
 [control_plane]
 enabled = false
 url = ""               # control-plane base URL, e.g. "https://cp.example"
-tenant_id = ""         # this edge's tenant id
-edge_token = ""        # per-tenant bearer (prefer EDGEGUARD_CP_EDGE_TOKEN)
+tenant_id = ""         # this edge's id at the control plane
+edge_token = ""        # edge bearer token (prefer EDGEGUARD_CP_EDGE_TOKEN)
 poll_interval = "30s"  # how often to pull policy
-report_interval = "60s" # how often to flush a usage delta
+report_interval = "60s" # how often to flush a metrics delta
 forward_csp = true     # forward received CSP reports to the control plane
+# Enforce the configured quota as a 429 hard-stop (turns the rate signal into a hard cap). OFF by
+# default. When on, the edge polls the control plane's quota verdict and rejects traffic with
+# 429 + Retry-After while the edge is over its quota; the internal /__edgeguard/* endpoints stay
+# served. Prefer EDGEGUARD_CP_QUOTA_ENFORCE.
+enforce_quota = false
+quota_poll_interval = "30s"  # how often to poll the quota verdict

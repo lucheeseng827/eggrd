@@ -17,6 +17,7 @@ use std::time::Duration;
 const OUTCOMES: &[&str] = &[
     "ok",
     "rate_limited",
+    "over_quota",
     "limiter_error",
     "unauthorized",
     "forbidden",

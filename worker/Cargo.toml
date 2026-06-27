@@ -6,9 +6,9 @@ license = "Apache-2.0"
 description = "EdgeGuard's response-hardening + edge-auth subset as a Rust->WASM Cloudflare Worker."
 publish = false
 
-# Detached from the parent monorepo workspace on purpose: this crate targets
+# Detached from the parent workspace on purpose: this crate targets
 # wasm32-unknown-unknown and pulls in the Cloudflare `worker` runtime, neither of which the
-# native workspace build (or module_52's CI) should try to compile. An empty [workspace] table
+# native workspace build (or this crate's CI) should try to compile. An empty [workspace] table
 # makes this crate its own workspace root, so the outer workspace ignores it. Build it with
 # `worker-build` / `wrangler` — see README.md.
 [workspace]

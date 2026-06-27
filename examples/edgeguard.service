@@ -1,0 +1,58 @@
+# EdgeGuard as a systemd service (VPS / front-proxy path).
+#
+# Install:
+#   sudo cp target/release/edgeguard /usr/local/bin/edgeguard
+#   sudo mkdir -p /etc/edgeguard && sudo cp edgeguard.toml /etc/edgeguard/
+#   sudo cp examples/edgeguard.service /etc/systemd/system/edgeguard.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now edgeguard
+#
+# This runs EdgeGuard in front-proxy mode (UPSTREAM points at your app). To have EdgeGuard
+# supervise the app instead, set WRAP_CMD and drop UPSTREAM (see the README).
+
+[Unit]
+Description=EdgeGuard — security front door
+Documentation=https://github.com/lucheeseng827/eggrd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PORT=443
+Environment=APP_PORT=3000
+Environment=UPSTREAM=http://127.0.0.1:3000
+Environment=RUST_LOG=info
+
+# Secrets via files, not inline env: systemd's credential store mounts them read-only under
+# %d (LoadCredential) and EdgeGuard reads them through its `*_FILE` env convention, so the
+# secret never appears in the unit, the environment, or `ps`. Uncomment to use:
+# LoadCredential=jwt:/etc/edgeguard/jwt-secret
+# Environment=EDGEGUARD_JWT_SECRET_FILE=%d/jwt
+
+ExecStart=/usr/local/bin/edgeguard --config /etc/edgeguard/edgeguard.toml
+Restart=on-failure
+RestartSec=2s
+
+# Bind low ports (80 for ACME HTTP-01, 443 for TLS) without running as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Sandboxing — EdgeGuard is a single static binary that needs only the network and its config.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc/edgeguard
+# If ACME is enabled, EdgeGuard writes the issued cert/key + account key here — allow it:
+# ReadWritePaths=/etc/edgeguard/acme
+
+[Install]
+WantedBy=multi-user.target

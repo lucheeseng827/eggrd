@@ -80,4 +80,4 @@ cargo test          # native target: header set, auth decisions, cookie hardenin
 
 This crate is a **detached workspace** (note the empty `[workspace]` in `Cargo.toml`): it targets
 wasm and depends on the Cloudflare `worker` runtime, so it is intentionally excluded from the
-monorepo's native build and from module_52's CI. Build it only with `worker-build` / `wrangler`.
+the parent workspace's native build and from this crate's CI. Build it only with `worker-build` / `wrangler`.

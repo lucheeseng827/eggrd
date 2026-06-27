@@ -28,7 +28,7 @@ correctness validation, not load.
 
 ## Quick start (turnkey demo)
 
-From the crate root (`rust_modules/lab/module_52`):
+From the crate root:
 
 ```bash
 podman compose -f monitoring/compose.yaml up -d

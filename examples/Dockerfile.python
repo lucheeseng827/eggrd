@@ -30,7 +30,7 @@ COPY --from=app /usr/local/lib/python3.*/site-packages /usr/local/lib/python3.*/
 COPY --from=app /app /app
 COPY --from=edgeguard /out/bin/edgeguard /usr/local/bin/edgeguard
 # Place edgeguard.toml at your repo root before building (grab the template from
-# EdgeGuard's examples/ — i.e. rust_modules/lab/module_52/edgeguard.toml).
+# EdgeGuard's edgeguard.toml at the repo root).
 COPY edgeguard.toml /etc/edgeguard.toml
 
 ENV APP_PORT=3000

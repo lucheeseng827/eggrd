@@ -87,3 +87,51 @@ becomes the public listener and forwards to it.** Four ways to wire that:
 > Static/edge hosts (Vercel, Netlify, Cloudflare Pages) can't run a long-lived proxy
 > process; those are a separate surface — now implemented in Phase 5 as `edgeguard generate`
 > (config generation) and the Rust→WASM Worker (`../worker/`), not this binary.
+
+## TLS — bring your own certificate
+
+EdgeGuard terminates TLS with `rustls` and serves **whatever certificate chain + key you give it**
+— it doesn't validate who issued them, so a cert from a public CA, an internal/corporate CA, or a
+self-signed cert all work the same way.
+
+1. **Prepare two PEM files.**
+   - **Certificate chain** (`fullchain.pem`) — **leaf first**, then any intermediates. The
+     **root CA does not go in this file** — it lives in the *client's* trust store.
+   - **Private key** (`key.pem`) — PKCS#8, PKCS#1, or SEC1.
+
+2. **Point the config at them** and listen on 443:
+   ```toml
+   [server]
+   port = 443
+
+   [tls]
+   enabled   = true
+   cert_path = "/etc/edgeguard/tls/fullchain.pem"
+   key_path  = "/etc/edgeguard/tls/key.pem"
+   ```
+
+3. **Mount the files** (keep keys out of the image):
+   ```bash
+   docker run -p 443:443 \
+     -v "$PWD/tls:/etc/edgeguard/tls:ro" \
+     -v "$PWD/edgeguard.toml:/etc/edgeguard/edgeguard.toml:ro" \
+     mancube/eggrd:latest --config /etc/edgeguard/edgeguard.toml
+   ```
+   On Kubernetes, mount a `Secret` at that path and map the secret keys to `fullchain.pem` and
+   `key.pem` (or create the Secret with those exact filenames). A default `kubernetes.io/tls`
+   Secret exposes `tls.crt` / `tls.key`, so use `items` in the volume definition to remap them,
+   or use `kubectl create secret generic` with the expected key names instead.
+
+4. **Make clients trust the issuer.** For a public CA this is automatic. For an **internal/own CA**,
+   distribute your CA root to the clients' trust stores (OS/browser, or `curl --cacert ca.pem …`) —
+   EdgeGuard sends the chain, the client validates it against the root it trusts. For a
+   **self-signed leaf**, clients must trust that cert directly (e.g. `curl --cacert cert.pem …`)
+   — there is no CA root to validate against.
+
+**Notes & limits.**
+- A file-provided certificate is loaded at **startup** — rotating it needs a restart. (Only
+  `[tls.acme]` certificates renew live in the background.)
+- EdgeGuard is built **without client-certificate auth** (no mutual-TLS / client-CA verification);
+  gate callers with Basic / API-key / JWT instead.
+- Prefer **automatic certificates** instead? Set `[tls.acme]` (Let's Encrypt, HTTP-01) — it obtains
+  and renews the cert for you (staging directory by default).

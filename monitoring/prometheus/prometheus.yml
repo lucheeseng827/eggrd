@@ -7,6 +7,11 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# Reusable EdgeGuard alerting rules (5xx ratio, auth/WAF spikes, limiter errors, p95 latency).
+# Mounted read-only by the compose stack; reuse alerts.yml in your own Prometheus too.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: edgeguard
     metrics_path: /__edgeguard/metrics

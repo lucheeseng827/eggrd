@@ -29,7 +29,7 @@ RUN useradd -r -u 10001 appuser
 COPY --from=app /app /app
 COPY --from=edgeguard /out/bin/edgeguard /usr/local/bin/edgeguard
 # Place edgeguard.toml at your repo root before building (grab the template from
-# EdgeGuard's examples/ — i.e. rust_modules/lab/module_52/edgeguard.toml).
+# EdgeGuard's examples/ — i.e. the edgeguard.toml at the repo root).
 COPY edgeguard.toml /etc/edgeguard.toml
 
 # EdgeGuard binds $PORT (set by the platform); your app runs on $APP_PORT.

@@ -1,7 +1,7 @@
 # EdgeGuard developer/CI entry points. The load-test harness has its own driver
 # (loadtest/run.sh); these targets cover the in-crate checks plus convenient shortcuts.
 #
-# Usage: make <target>   (run from the crate root, rust_modules/lab/module_52)
+# Usage: make <target>   (run from the crate root)
 
 .PHONY: help fmt lint test test-all bench loadtest-up loadtest-down whitepaper-check
 

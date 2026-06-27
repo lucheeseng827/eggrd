@@ -4,7 +4,7 @@
 # the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
 # crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
 name = "eggrd"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
 license = "Apache-2.0"
@@ -66,11 +66,17 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 # Adapt the axum router onto a manual hyper connection when terminating TLS ourselves.
 tower = { version = "0.5", features = ["util"] }
+# Optional response compression (gzip), applied only when `validation.compress_responses` is on
+# and never to streamed `text/event-stream` responses.
+tower-http = { version = "0.6", features = ["compression-gzip"] }
 # ACME / Let's Encrypt automatic certificates (HTTP-01), and CSR/key generation for it.
 instant-acme = "0.7"
 rcgen = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+# Generate a request id (UUID v4) when an inbound request doesn't carry one, for end-to-end log
+# correlation (`X-Request-Id`).
+uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 # `std` pulls in `password-hash`'s getrandom-backed `OsRng` for the `--hash` helper's
 # salt generation (verification works without it; salting a fresh hash needs an RNG).

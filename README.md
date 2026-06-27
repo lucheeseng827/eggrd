@@ -109,6 +109,21 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
   forward `text/event-stream` (SSE) responses **unbuffered, frame-by-frame** — so EdgeGuard fronts
   **streaming LLM backends** (OpenAI-compatible token streams) and any SSE app without collapsing
   time-to-first-byte. Egress bytes are still counted as frames flow.
+- **WebSocket / `Upgrade` passthrough** (`validation.websocket_passthrough`, off by default):
+  forward an authenticated, rate-limited upgrade request intact and splice the connections into a
+  raw bidirectional tunnel on the upstream's `101` — so EdgeGuard fronts WebSocket apps (chat,
+  live dashboards, dev HMR). Off by default because the normal path strips the hop-by-hop
+  `Upgrade` header.
+- **IP access control** (`[access]`, allow-all by default): coarse CIDR allow/deny lists evaluated
+  by client IP before auth and rate limiting — lock the app to an office/VPN range, or drop an
+  abusive subnet.
+- **Request IDs** (`X-Request-Id`): reuse a well-formed inbound id or mint a UUID v4, forward it
+  upstream, echo it on every response, and tag the access log with it — one id correlates the
+  client, EdgeGuard, and the app.
+- **Per-path upstreams** (`[[upstreams]]`, single upstream by default): a static path-prefix map
+  so `/api` can go to a backend and everything else to a static frontend (longest prefix wins).
+- **Response compression** (`validation.compress_responses`, off by default): gzip for clients
+  that ask, skipping already-compressed types and (always) SSE streams.
 - **Co-process supervisor**: launches your app, restarts it on crash, and forwards
   termination signals on shutdown (acts as a tiny container init). *Full process-group
   signaling on Unix; best-effort child kill on Windows.*
@@ -127,6 +142,10 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
   rollout mode. A match is logged and counted (`edgeguard_waf_hits_total`); in `block` mode it
   returns `403`. Screens the URL path/query by default (also percent-decoded); headers and body
   are opt-in.
+- **CORS** (`[cors]`, **off by default**): answer browser **preflight** `OPTIONS` requests (before
+  auth — preflights carry no credentials) and decorate responses with the matching
+  `Access-Control-*` headers, so a separate-origin frontend can call the app. A credentialed
+  wildcard is rejected at startup.
 - **TLS termination** via `rustls`, with optional **ACME / Let's Encrypt** (HTTP-01)
   automatic certificates.
 - **Prometheus metrics** at `/__edgeguard/metrics` (request rate by outcome, rate-limit
@@ -163,6 +182,17 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
 
 ## Quickstart (local)
 
+The fastest path is to let EdgeGuard scaffold itself in your app's repo, then validate the config
+before you run it:
+
+```bash
+edgeguard init                       # writes edgeguard.toml + Dockerfile.edgeguard (detects Node/Python/Go/Rust)
+echo -n 'your-password' | edgeguard --hash   # paste the $argon2id$… into edgeguard.toml
+edgeguard doctor --config edgeguard.toml     # validate + warn on foot-guns (exits non-zero on errors)
+```
+
+Or build and wrap an app directly:
+
 ```bash
 cargo build --release
 
@@ -179,6 +209,109 @@ curl -u "$EDGEGUARD_USER:$EDGEGUARD_PASS" http://localhost:8080/
 > the default `users` value is a non-working placeholder. **Before exposing anything**,
 > replace it with an `$argon2` hash (see [Configuration](#configuration)).
 
+## Onboard an app with `edgeguard init` and `edgeguard doctor`
+
+These two commands take you from "an app with no front door" to "a validated, secure-by-default
+config" without hand-writing TOML or reading this whole README. Run them from your app's repo root.
+
+### 1. Scaffold the config — `edgeguard init`
+
+`init` detects your app's runtime from the files in the directory (Node / Python / Go / Rust) and
+writes two files:
+
+```bash
+$ edgeguard init
+Detected runtime: Node.js
+Wrote edgeguard.toml and Dockerfile.edgeguard.
+
+Next steps:
+1. Set a real credential — the shipped edgeguard.toml ships a non-working placeholder:
+     echo -n 'your-password' | edgeguard --hash
+     ...
+```
+
+- **`edgeguard.toml`** — the annotated, secure-by-default config reference (the *same* one
+  documented below, embedded into the binary so it can't drift).
+- **`Dockerfile.edgeguard`** — a wrap-your-app Dockerfile that copies the `edgeguard` binary from
+  the published image and makes it your container entrypoint (binding `$PORT`, running your app on
+  `APP_PORT`), tailored to the detected runtime.
+
+`init` **never overwrites** an existing `edgeguard.toml` or `Dockerfile.edgeguard` — re-run with
+`edgeguard init --force` if you actually want to regenerate them.
+
+### 2. Set a real credential
+
+The shipped config ships a deliberately **non-working** placeholder so nothing is exposed by
+accident. Replace it with an Argon2id hash (the helper reads the password on stdin, so it never
+lands in your shell history or the process list):
+
+```bash
+echo -n 'your-password' | edgeguard --hash
+# → $argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>
+```
+
+Paste that string as the user's value in `edgeguard.toml`:
+
+```toml
+[auth]
+mode = "basic"
+users = { admin = "$argon2id$v=19$m=19456,t=2,p=1$..." }
+```
+
+### 3. Validate before you deploy — `edgeguard doctor`
+
+`doctor` loads your config through the **exact same path the proxy uses** (so it can't drift from
+real startup) and then lints for the foot-guns people actually ship. It exits non-zero on a hard
+error, so you can gate a deploy with it in CI.
+
+Run it against the freshly-scaffolded config and it will flag the still-placeholder credential:
+
+```bash
+$ edgeguard doctor --config edgeguard.toml
+✗ [error] auth.users["admin"] is not a valid argon2 hash (the shipped placeholder?): no one can
+  authenticate. Run `edgeguard --hash` and paste the result.
+ℹ [info] tls.enabled = false: EdgeGuard serves plain HTTP. Fine when your platform terminates TLS
+  in front of it; ...
+
+1 error(s), 0 warning(s)
+$ echo $?
+1
+```
+
+Once you've pasted a real hash, it comes back clean:
+
+```bash
+$ edgeguard doctor --config edgeguard.toml
+ℹ [info] tls.enabled = false: ...
+
+0 error(s), 0 warning(s)
+$ echo $?
+0
+```
+
+`doctor` checks, among others: the placeholder/plaintext credential, `auth.mode = "none"` on a
+public port, secrets committed to the file (prefer the env vars / `*_FILE`), an over-permissive or
+credentialed-wildcard CORS policy, a `redis` limiter store with no URL, and `enforce_quota` without
+managed mode. Wire it into CI to fail the build on a misconfiguration:
+
+```yaml
+# .github/workflows — fail the pipeline on a bad EdgeGuard config
+- run: edgeguard doctor --config edgeguard.toml
+```
+
+### 4. Run it
+
+```bash
+# Co-process (the generated Dockerfile does this for you):
+PORT=8080 APP_PORT=3000 edgeguard --config edgeguard.toml --wrap "npm start"
+
+# now hit it with the credential you set
+curl -u admin:your-password http://localhost:8080/
+```
+
+That's the whole loop: **`init` → `--hash` → `doctor` → run**. Editing `edgeguard.toml` while
+EdgeGuard is running hot-reloads the policy in place (see [Configuration](#configuration)).
+
 ## Project layout
 
 ```text
@@ -190,9 +323,13 @@ curl -u "$EDGEGUARD_USER:$EDGEGUARD_PASS" http://localhost:8080/
 ├── CONTRIBUTING.md
 ├── LICENSE               # Apache-2.0
 ├── src/
-│   ├── main.rs           # CLI (serve / --hash / generate), bootstrap, graceful shutdown
+│   ├── main.rs           # CLI (serve / init / doctor / --hash / generate), bootstrap, shutdown
 │   ├── config.rs         # env-first config + TOML overlay, size/rate parsing
-│   ├── proxy.rs          # request/response pipeline (auth, limit, hardening)
+│   ├── proxy.rs          # request/response pipeline (auth, limit, hardening, WS tunnel)
+│   ├── access.rs         # IP allow/deny CIDR matching (`[access]`)
+│   ├── cors.rs           # CORS preflight + response decoration (`[cors]`)
+│   ├── doctor.rs         # config linter (`edgeguard doctor`)
+│   ├── scaffold.rs       # project scaffolding (`edgeguard init`)
 │   ├── generate.rs       # static-host / edge config generator (`edgeguard generate`)
 │   └── supervisor.rs     # co-process supervisor (Unix signals / Windows fallback)
 ├── docs/
@@ -202,6 +339,8 @@ curl -u "$EDGEGUARD_USER:$EDGEGUARD_PASS" http://localhost:8080/
 ├── examples/
 │   ├── Dockerfile.node   # wrap-your-app template (Node)
 │   ├── Dockerfile.python # wrap-your-app template (Python)
+│   ├── docker-compose.yml # front EdgeGuard + app (file-mounted secrets)
+│   ├── edgeguard.service # systemd unit (VPS / front-proxy path)
 │   ├── render.yaml       # Render blueprint
 │   └── fly.toml          # Fly.io config
 └── worker/               # Rust→WASM Cloudflare Worker (edge build; detached crate)
@@ -223,12 +362,23 @@ All config is optional; EdgeGuard ships secure defaults. See
 | `EDGEGUARD_JWT_SECRET` | HS* JWT secret (overrides `auth.jwt.secret`) | — |
 | `EDGEGUARD_API_KEYS` | API keys, comma-separated (overrides `auth.api_keys`) | — |
 | `EDGEGUARD_REDIS_URL` | shared-store limiter URL (overrides `ratelimit.redis_url`) | — |
+| `EDGEGUARD_CP_URL` | managed-mode control-plane URL (overrides `control_plane.url`) | — |
+| `EDGEGUARD_CP_EDGE_TOKEN` | managed-mode per-tenant edge token (overrides `control_plane.edge_token`) | — |
 | `RUST_LOG` | log filter, e.g. `info`, `edgeguard=debug` | `info` |
 
-Auth, rate limits, TLS/ACME, CSP reporting, and the header/size limits are configured in the
-TOML file — see the annotated [`edgeguard.toml`](./edgeguard.toml). Editing that file while
-EdgeGuard is running **hot-reloads** the policy in place (auth, limits, headers, validation);
-changing the listen port or TLS settings still needs a restart.
+**Secrets from files (`*_FILE`).** Every secret env var above also accepts a `*_FILE` variant
+(`EDGEGUARD_JWT_SECRET_FILE`, `EDGEGUARD_API_KEYS_FILE`, `EDGEGUARD_REDIS_URL_FILE`,
+`EDGEGUARD_CP_EDGE_TOKEN_FILE`) pointing at a file whose contents are the value — the convention
+Docker / Kubernetes secret mounts and systemd `LoadCredential` use, so the secret never lands in
+the config file or a `ps`-visible environment. The direct variable wins when both are set; a
+`*_FILE` that can't be read is a hard startup error (a misconfigured mount fails loudly rather
+than silently running with no secret). A trailing newline is trimmed.
+
+Auth, rate limits, TLS/ACME, CSP reporting, the header/size limits, CORS, and IP access are
+configured in the TOML file — see the annotated [`edgeguard.toml`](./edgeguard.toml). Editing that
+file while EdgeGuard is running **hot-reloads** the policy in place (auth, limits, headers,
+validation except `compress_responses`, CORS, access); changing compression, the listen port, or
+TLS settings still needs a restart.
 
 **Hashing a password** (do this before any real deployment — the shipped placeholder will
 not authenticate). EdgeGuard ships a built-in helper so you don't need an external tool:
@@ -259,8 +409,11 @@ front of your app):
 - **Render** — see [`examples/render.yaml`](./examples/render.yaml); health check
   `/__edgeguard/health`.
 - **Fly.io** — see [`examples/fly.toml`](./examples/fly.toml).
-- **VPS / Coolify** — run the binary under systemd, or `docker compose` with EdgeGuard as
-  the front container.
+- **VPS / Coolify** — run the binary under systemd with the hardened
+  [`examples/edgeguard.service`](./examples/edgeguard.service) unit (sandboxed, binds 80/443 via
+  `CAP_NET_BIND_SERVICE`, loads secrets via `LoadCredential` + `*_FILE`), or use
+  [`examples/docker-compose.yml`](./examples/docker-compose.yml) with EdgeGuard as the front
+  container and the app only reachable through it.
 
 The full strategy (interface patterns, platform matrix, rollout order) is in
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
@@ -273,12 +426,16 @@ The full strategy (interface patterns, platform matrix, rollout order) is in
 
 **Request:** client-IP resolution (honors `X-Forwarded-For` only when
 `server.trust_forwarded_for = true`; disabled by default so clients cannot spoof
-their IP) → header-size limit → rate-limit (per-IP / per-route) → auth → per-key
-rate-limit → method allowlist → body-size limit → WAF input inspection (off by default) →
+their IP) → IP access control (`[access]`, allow-all by default) → header-size limit →
+rate-limit (per-IP / per-route) → CORS preflight
+(answered before auth, when `[cors]` is on) → auth → per-key
+rate-limit → method allowlist → WebSocket/`Upgrade` tunnel (when
+`websocket_passthrough` is on) → body-size limit → WAF input inspection (off by default) →
 forward to upstream (bounded by `validation.upstream_timeout`, default 30s — a stalled
 upstream returns `504` instead of pinning the request).
 **Response:** security-header injection (CSP/CSP-Report-Only) → cookie hardening → strip
-leaky headers.
+leaky headers → CORS response headers (when `[cors]` is on) → `X-Request-Id` stamped on every
+response → optional gzip (when `compress_responses` is on, never for SSE).
 
 Built on `axum` + `hyper` (server), `hyper-util` (upstream client), `governor` + `redis` (rate
 limit), `argon2` + `jsonwebtoken` (auth), `rustls` + `instant-acme` (TLS/ACME), `arc-swap`
@@ -300,7 +457,10 @@ For a turnkey way to validate and visualize the `edgeguard_*` metrics, the
 [`monitoring/`](monitoring/) directory ships a self-contained **Prometheus + Grafana** stack
 (Podman/Docker Compose) plus a reusable **reference Grafana dashboard** you can import into your
 own Grafana — `podman compose -f monitoring/compose.yaml up -d`, then open
-http://localhost:3000. See [`monitoring/README.md`](monitoring/README.md).
+http://localhost:3000. See [`monitoring/README.md`](monitoring/README.md). It also ships reusable
+**Prometheus alert rules** ([`monitoring/prometheus/alerts.yml`](monitoring/prometheus/alerts.yml):
+upstream-5xx ratio, p95 latency, auth-failure / WAF / rate-limit spikes, limiter-store errors) you
+can drop into your own Prometheus.
 
 ## Platform support
 
@@ -374,6 +534,107 @@ inspect_body = false    # screen the (size-capped) request body (opt in)
   noisy. The path is matched both raw and percent-decoded, so `%2e%2e%2f` is caught as `../`.
 - **Where it runs.** After auth and the size/method checks, just before the request is
   forwarded — so the internal `/__edgeguard/*` endpoints are never inspected.
+
+## CORS
+
+A drop-in front door is often deployed in front of an app whose browser frontend lives on a
+**different origin** — a separate static host, a preview deployment, `http://localhost:5173`
+during development. Browsers block those cross-origin `fetch`/`XHR` calls unless the server answers
+with the right `Access-Control-*` headers. EdgeGuard adds a small, explicit CORS policy
+(`[cors]`, **off by default** — opening cross-origin access is a deliberate choice):
+
+```toml
+[cors]
+enabled = true
+allow_origins = ["https://app.example.com", "http://localhost:5173"]  # or ["*"] for any
+allow_methods = []          # [] = GET/POST/PUT/PATCH/DELETE/OPTIONS/HEAD
+allow_headers = []          # [] = reflect the browser's Access-Control-Request-Headers
+expose_headers = []         # response headers the page may read
+allow_credentials = false   # send Access-Control-Allow-Credentials; requires explicit origins
+max_age = "600s"            # how long the browser may cache the preflight ("0" omits it)
+```
+
+- **Preflight, before auth.** A browser preflight (`OPTIONS` + `Origin` +
+  `Access-Control-Request-Method`) is answered by EdgeGuard directly with `204` + the allow
+  headers. This runs *before* the auth gate, because a preflight carries no credentials — gating
+  it would make every cross-origin call fail. A plain `OPTIONS` (no preflight headers) falls
+  through to normal handling.
+- **Decoration.** Actual responses get `Access-Control-Allow-Origin` (echoing the request `Origin`
+  with `Vary: Origin` for an explicit allow-list, or the cacheable `*` for a wildcard), plus the
+  credentials / expose-headers directives.
+- **Credentialed wildcard is rejected.** `allow_credentials = true` with `allow_origins = ["*"]` is
+  refused at startup/reload — the Fetch spec forbids it and browsers ignore the combination, so
+  EdgeGuard fails fast rather than emitting a policy that silently doesn't work (`edgeguard doctor`
+  flags it too).
+
+## IP access control
+
+A coarse network gate by client IP, evaluated **before auth and rate limiting** (`[access]`,
+allow-all by default). Both lists accept plain IPs and CIDR ranges (IPv4 and IPv6):
+
+```toml
+[access]
+allow = ["10.0.0.0/8", "203.0.113.7"]   # only these may connect (empty = allow all)
+deny  = ["198.51.100.0/24"]             # always rejected — wins over allow
+```
+
+`deny` takes precedence over `allow`; a non-empty `allow` is a whitelist (anything outside it gets
+`403`). A denied client is dropped before consuming a limiter token or any auth work. It keys on
+the **resolved** client IP — the same one rate limiting uses — so behind a trusted proxy set
+`server.trust_forwarded_for = true` for this to see the real client rather than the proxy. A bad
+CIDR fails at startup/reload.
+
+## WebSocket passthrough
+
+By default EdgeGuard strips the hop-by-hop `Upgrade`/`Connection` headers (per RFC 7230), so a
+WebSocket handshake forwarded through it would fail — fine for the request/response apps that are
+the common case, but a blocker for chat, live dashboards, or dev HMR. Turn on
+`validation.websocket_passthrough` to tunnel them:
+
+```toml
+[validation]
+websocket_passthrough = true
+```
+
+An upgrade request (`Connection: upgrade` + `Upgrade:`) is still **authenticated and
+rate-limited**, then forwarded to the upstream intact; on the upstream's `101 Switching Protocols`,
+EdgeGuard splices the client and upstream connections into a raw bidirectional byte tunnel for the
+life of the socket. Response hardening and WAF body inspection don't apply to a tunneled connection
+(there's no buffered response to rewrite). A non-`101` upstream reply is passed back unchanged, so a
+rejected handshake surfaces normally.
+
+## Request IDs
+
+For every request EdgeGuard resolves an `X-Request-Id`: it reuses a well-formed inbound one (a
+short, printable-ASCII token a CDN/LB already set — validated so a hostile client can't inject
+control characters into the log) or mints a UUID v4. That id is **forwarded upstream**, **echoed on
+the response** (including error responses), and added to the JSON access-log line — so a single id
+ties together the client, EdgeGuard, and the app's own logs. Always on; no configuration.
+
+## Per-path upstreams
+
+EdgeGuard fronts one app by default, but the one split many setups want is "static frontend + an
+`/api` backend". `[[upstreams]]` is a minimal static prefix map for exactly that:
+
+```toml
+[[upstreams]]
+path = "/api/"
+target = "http://api.internal:4000"
+```
+
+Longest matching prefix wins; anything unmatched goes to the default `server.upstream`/`app_port`.
+This is deliberately **not** a gateway — no service discovery, load balancing, health-based
+routing, or request rewriting (the path is forwarded unchanged). For those, keep EdgeGuard in front
+of one app and put a real gateway/mesh behind it. The readiness probe still tracks the default
+upstream.
+
+## Response compression
+
+`validation.compress_responses = true` gzip-compresses responses for clients that send
+`Accept-Encoding: gzip`. It skips small and already-compressed responses (the standard predicate)
+and **always** skips `text/event-stream`, so SSE streaming is never held back by the compressor.
+It's a listener-level setting (applied when the server starts), so toggling it needs a restart
+rather than a hot-reload.
 
 ## Distributed rate limiting
 
@@ -518,8 +779,14 @@ report to — a central **control plane**:
   hot-reload path a local file edit uses — no restart, no dropped connections. The control plane
   pushes the **policy** sections (auth, rate limits, validation, headers, WAF); the edge keeps its
   own local `[server]` / `[tls]` (its port, upstream, and certs are edge-specific).
-- **Usage reporting.** The edge accumulates per-period request and bandwidth counts and POSTs a
-  delta to the control plane (for fleet visibility / usage-based plans).
+- **Metrics reporting.** The edge accumulates per-period request and bandwidth counts and POSTs a
+  delta to the control plane (for fleet visibility).
+- **Quota enforcement** (`enforce_quota`, off by default). Beyond *reporting* metrics, the edge can
+  *enforce* a configured quota: it polls the control plane's quota verdict and, while the
+  edge is over its configured ceiling, rejects traffic with `429` + a `Retry-After` reset hint —
+  the internal `/__edgeguard/*` endpoints stay served so health checks don't flap. A failed poll
+  keeps the last verdict (fail-static). This is what turns the meter into a cap; leave it off to
+  meter without blocking.
 - **CSP forwarding.** Received CSP violation reports are forwarded to the control plane for
   aggregate analytics, in addition to the local count.
 

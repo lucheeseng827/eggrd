@@ -1,0 +1,41 @@
+# EdgeGuard as the front door for your app (docker compose).
+#
+# `edge` terminates the public port and proxies to `app` over the internal compose network.
+# `app` is only `expose`d (not `ports`-published), so it is reachable *only* through EdgeGuard —
+# the whole point of a front door.
+#
+#   docker compose -f examples/docker-compose.yml up
+#
+# Replace the `app` image with your own, put your policy in ./edgeguard.toml (generate a starter
+# with `edgeguard init`), and your JWT secret in ./secrets/jwt_secret.txt.
+
+services:
+  edge:
+    image: mancube/eggrd:latest
+    ports:
+      - "8080:8080"                 # public; switch to "443:8080" once TLS is configured
+    environment:
+      UPSTREAM: http://app:3000
+      RUST_LOG: info
+      # Prefer file-mounted secrets over inline env — see the `secrets:` block below.
+      EDGEGUARD_JWT_SECRET_FILE: /run/secrets/jwt_secret
+    command: ["--config", "/etc/edgeguard/edgeguard.toml"]
+    volumes:
+      - ./edgeguard.toml:/etc/edgeguard/edgeguard.toml:ro
+    secrets:
+      - jwt_secret
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  app:
+    image: ghcr.io/example/your-app:latest
+    expose:
+      - "3000"                      # internal only — never published to the host
+    environment:
+      PORT: "3000"
+    restart: unless-stopped
+
+secrets:
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt

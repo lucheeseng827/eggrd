@@ -17,13 +17,25 @@ pub struct Config {
     pub headers: HeadersCfg,
     pub tls: TlsCfg,
     pub waf: WafCfg,
-    /// Optional "managed mode": pull policy from / report usage to a remote control plane. Off
+    /// Optional per-path-prefix upstream overrides. Empty by default (everything goes to the
+    /// single `server.upstream`/`app_port`). A common use: `/api` → a backend, everything else →
+    /// a static frontend. Longest matching prefix wins; no match falls back to the default
+    /// upstream. This is a static prefix map, not a service mesh — see [`UpstreamRoute`].
+    pub upstreams: Vec<UpstreamRoute>,
+    /// IP allow/deny lists (CIDR). Empty by default (allow all); when set, requests are gated by
+    /// client IP before auth/rate-limit. See [`AccessCfg`].
+    pub access: AccessCfg,
+    /// Cross-Origin Resource Sharing policy. Off by default; when enabled, EdgeGuard answers
+    /// browser preflights and decorates responses so a separate-origin frontend can call the
+    /// app it fronts. See [`CorsCfg`].
+    pub cors: CorsCfg,
+    /// Optional "managed mode": pull policy from / report metrics to a remote control plane. Off
     /// by default; the edge is a standalone proxy unless this is configured.
     pub control_plane: ControlPlaneCfg,
 }
 
 /// Managed-mode settings: when `enabled`, the edge pulls its policy from a remote control plane
-/// (and hot-reloads it), reports usage deltas, and forwards CSP reports. The policy the control
+/// (and hot-reloads it), reports metric deltas, and forwards CSP reports. The policy the control
 /// plane pushes is the *policy subset* (auth/ratelimit/validation/headers/waf) — the edge keeps
 /// its own local `server`/`tls`. The edge token is a secret, so prefer `EDGEGUARD_CP_EDGE_TOKEN`.
 #[derive(Debug, Clone, Deserialize)]
@@ -38,10 +50,18 @@ pub struct ControlPlaneCfg {
     pub edge_token: String,
     /// How often to poll for policy, e.g. `"30s"`.
     pub poll_interval: String,
-    /// How often to flush a usage delta, e.g. `"60s"`.
+    /// How often to flush a metrics delta, e.g. `"60s"`.
     pub report_interval: String,
     /// Forward received CSP reports to the control plane (default true).
     pub forward_csp: bool,
+    /// Enforce the configured quota as a **hard stop**: poll the control plane's
+    /// `/v3/edge/{id}/quota` and, while the edge is over its quota, reject the edge's
+    /// traffic with `429` (a `Retry-After` reset hint). Off by default — opt in to turn the
+    /// rate signal into a hard cap. Prefer `EDGEGUARD_CP_QUOTA_ENFORCE`.
+    pub enforce_quota: bool,
+    /// How often to poll the quota verdict, e.g. `"30s"`. A failed poll keeps the last verdict, so
+    /// a control-plane blip neither over- nor under-enforces.
+    pub quota_poll_interval: String,
 }
 
 impl Default for ControlPlaneCfg {
@@ -54,6 +74,8 @@ impl Default for ControlPlaneCfg {
             poll_interval: "30s".into(),
             report_interval: "60s".into(),
             forward_csp: true,
+            enforce_quota: false,
+            quota_poll_interval: "30s".into(),
         }
     }
 }
@@ -236,6 +258,20 @@ pub struct ValidationCfg {
     /// the body-read deadline don't apply (the connect/first-byte `upstream_timeout` still
     /// does); egress bytes are tallied as frames flow. Non-SSE responses are unaffected.
     pub stream_passthrough: bool,
+    /// Tunnel WebSocket (and other `Upgrade`) connections through to the upstream. Off by
+    /// default: the normal path strips the hop-by-hop `Upgrade`/`Connection` headers, so an
+    /// upgrade request would be forwarded as a plain HTTP request and the handshake would fail.
+    /// When on, an authenticated, rate-limited upgrade request is forwarded *with* its upgrade
+    /// headers and, on the upstream's `101 Switching Protocols`, EdgeGuard splices the two
+    /// connections into a raw bidirectional tunnel. Response hardening / WAF body inspection
+    /// don't apply to a tunneled connection (there is no buffered response). Non-upgrade requests
+    /// are unaffected.
+    pub websocket_passthrough: bool,
+    /// gzip-compress responses for clients that send `Accept-Encoding: gzip`. Off by default.
+    /// Skips already-compressed content types and (always) `text/event-stream`, so SSE streaming
+    /// is never buffered by the compressor. Applied at the listener, so toggling it needs a
+    /// restart (it is not part of the hot-reloadable policy).
+    pub compress_responses: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -325,6 +361,8 @@ impl Default for ValidationCfg {
             max_header_bytes: "0".into(),
             allow_methods: vec![],
             stream_passthrough: false,
+            websocket_passthrough: false,
+            compress_responses: false,
         }
     }
 }
@@ -462,6 +500,83 @@ impl Default for WafRule {
     }
 }
 
+/// A per-path-prefix upstream override (a `[[upstreams]]` entry). Requests whose path starts with
+/// `path` are forwarded to `target` instead of the default `server.upstream`; the longest matching
+/// prefix wins. This is deliberately a *static prefix map* for the common "static frontend + `/api`
+/// backend" shape — not a gateway: no service discovery, load balancing, health-based routing, or
+/// request rewriting (the path is forwarded unchanged). For those, put EdgeGuard behind a real
+/// gateway/mesh.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UpstreamRoute {
+    /// Path prefix this upstream applies to, e.g. `/api/`.
+    pub path: String,
+    /// Upstream base URL for this prefix, e.g. `http://api.internal:4000`.
+    pub target: String,
+}
+
+/// IP allow/deny lists, matched against the resolved client IP (the same IP rate limiting keys
+/// on — so behind a trusted proxy, set `server.trust_forwarded_for` for this to see the real
+/// client). Both lists accept plain IPs (`203.0.113.7`, `::1`) and CIDR ranges
+/// (`10.0.0.0/8`, `2001:db8::/32`). `deny` wins over `allow`; a non-empty `allow` means
+/// "only these may connect". Both empty (the default) = allow all. Compiled into a
+/// `crate::access::AccessPolicy`; an unparseable entry fails at startup/reload.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AccessCfg {
+    /// CIDRs/IPs allowed in. Empty = allow all (subject to `deny`).
+    pub allow: Vec<String>,
+    /// CIDRs/IPs always rejected (takes precedence over `allow`).
+    pub deny: Vec<String>,
+}
+
+/// Cross-Origin Resource Sharing policy. A drop-in front door commonly sits in front of an app
+/// whose browser frontend is served from a *different* origin (a separate static host, a
+/// preview URL, `localhost:5173` in dev); without CORS those `fetch` calls are blocked by the
+/// browser. When `enabled`, EdgeGuard answers preflight `OPTIONS` requests itself (before auth —
+/// preflights carry no credentials) and adds the matching `Access-Control-*` headers to actual
+/// responses. Off by default: opening cross-origin access is a deliberate choice. Compiled into
+/// a `crate::cors::CorsPolicy`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CorsCfg {
+    pub enabled: bool,
+    /// Allowed request origins, matched exactly (scheme + host + port), e.g.
+    /// `["https://app.example.com"]`. The single entry `["*"]` allows any origin — but a
+    /// wildcard cannot be combined with `allow_credentials = true` (the Fetch spec forbids it),
+    /// so that combination is rejected at startup.
+    pub allow_origins: Vec<String>,
+    /// Methods advertised in the preflight `Access-Control-Allow-Methods`. Empty = a sensible
+    /// default set (`GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD`).
+    pub allow_methods: Vec<String>,
+    /// Request headers advertised in `Access-Control-Allow-Headers`. Empty = reflect whatever the
+    /// browser asks for in `Access-Control-Request-Headers` (the common, permissive default).
+    pub allow_headers: Vec<String>,
+    /// Response headers the browser is allowed to read, advertised in
+    /// `Access-Control-Expose-Headers`. Empty = none beyond the CORS-safelisted set.
+    pub expose_headers: Vec<String>,
+    /// Send `Access-Control-Allow-Credentials: true` so the browser may send cookies / HTTP auth.
+    /// Requires explicit `allow_origins` (no `"*"`).
+    pub allow_credentials: bool,
+    /// How long a browser may cache the preflight result, e.g. `"600s"`, `"1h"`. `"0"` omits the
+    /// `Access-Control-Max-Age` header (the browser uses its own short default).
+    pub max_age: String,
+}
+
+impl Default for CorsCfg {
+    fn default() -> Self {
+        CorsCfg {
+            enabled: false,
+            allow_origins: vec![],
+            allow_methods: vec![],
+            allow_headers: vec![],
+            expose_headers: vec![],
+            allow_credentials: false,
+            max_age: "600s".into(),
+        }
+    }
+}
+
 impl Config {
     /// Load defaults, overlay an optional TOML file, then apply env overrides.
     pub fn load(path: Option<&str>) -> Result<Config> {
@@ -493,18 +608,16 @@ impl Config {
                 cfg.server.upstream = u;
             }
         }
-        // Keep secrets out of the config file: let the environment supply them.
-        if let Ok(s) = env::var("EDGEGUARD_JWT_SECRET") {
-            if !s.is_empty() {
-                cfg.auth.jwt.secret = s;
-            }
+        // Keep secrets out of the config file: let the environment supply them, either directly
+        // (`EDGEGUARD_JWT_SECRET`) or from a file (`EDGEGUARD_JWT_SECRET_FILE`) for Docker/K8s
+        // secret mounts. The direct variable wins when both are set; see `env_or_file`.
+        if let Some(s) = env_or_file("EDGEGUARD_JWT_SECRET")? {
+            cfg.auth.jwt.secret = s;
         }
-        if let Ok(u) = env::var("EDGEGUARD_REDIS_URL") {
-            if !u.is_empty() {
-                cfg.ratelimit.redis_url = u;
-            }
+        if let Some(u) = env_or_file("EDGEGUARD_REDIS_URL")? {
+            cfg.ratelimit.redis_url = u;
         }
-        if let Ok(keys) = env::var("EDGEGUARD_API_KEYS") {
+        if let Some(keys) = env_or_file("EDGEGUARD_API_KEYS")? {
             let keys: Vec<String> = keys
                 .split(',')
                 .map(|k| k.trim().to_string())
@@ -514,23 +627,32 @@ impl Config {
                 cfg.auth.api_keys = keys;
             }
         }
-        if let Ok(t) = env::var("EDGEGUARD_CP_EDGE_TOKEN") {
-            if !t.is_empty() {
-                cfg.control_plane.edge_token = t;
-            }
+        if let Some(t) = env_or_file("EDGEGUARD_CP_EDGE_TOKEN")? {
+            cfg.control_plane.edge_token = t;
         }
-        if let Ok(u) = env::var("EDGEGUARD_CP_URL") {
-            if !u.is_empty() {
-                cfg.control_plane.url = u;
+        if let Some(u) = env_or_file("EDGEGUARD_CP_URL")? {
+            cfg.control_plane.url = u;
+        }
+        if let Ok(v) = env::var("EDGEGUARD_CP_QUOTA_ENFORCE") {
+            // Only an explicit, recognized value overrides the file config; an empty value is a
+            // no-op and a typo is a hard error rather than silently disabling a security control.
+            match v.trim().to_ascii_lowercase().as_str() {
+                "" => {}
+                "1" | "true" | "yes" | "on" => cfg.control_plane.enforce_quota = true,
+                "0" | "false" | "no" | "off" => cfg.control_plane.enforce_quota = false,
+                other => anyhow::bail!(
+                    "invalid EDGEGUARD_CP_QUOTA_ENFORCE value {other:?}; expected 1/true/yes/on or 0/false/no/off"
+                ),
             }
         }
         Ok(cfg)
     }
 
     /// Produce an effective config by overlaying a control-plane-pushed *policy* document onto
-    /// this (local) config: the policy sections (`auth`/`ratelimit`/`validation`/`headers`/`waf`)
-    /// come from the pushed TOML; `server`/`tls`/`control_plane` stay local (the control plane
-    /// manages security policy, not this edge's listener/plumbing). The result feeds the normal
+    /// this (local) config: the policy sections
+    /// (`auth`/`ratelimit`/`validation`/`headers`/`waf`/`access`/`cors`) come from the pushed TOML;
+    /// `server`/`tls`/`upstreams`/`telemetry`/`control_plane` stay local (the control plane manages
+    /// security policy, not this edge's listener/plumbing/topology). The result feeds the normal
     /// `build_runtime` + hot-swap path, so a malformed policy is rejected like any bad reload.
     pub fn with_policy_from(&self, policy_toml: &str) -> Result<Config> {
         let p: Config =
@@ -539,11 +661,15 @@ impl Config {
             server: self.server.clone(),
             tls: self.tls.clone(),
             control_plane: self.control_plane.clone(),
+            // Upstream topology is edge-local (like `server`), not pushed policy.
+            upstreams: self.upstreams.clone(),
             auth: p.auth,
             ratelimit: p.ratelimit,
             validation: p.validation,
             headers: p.headers,
             waf: p.waf,
+            access: p.access,
+            cors: p.cors,
         })
     }
 
@@ -603,6 +729,33 @@ fn parse_host_port(url: &str) -> Option<(String, u16)> {
         Some(_) => None,
         None => Some((authority.to_string(), default_port)),
     }
+}
+
+/// Resolve a secret from the environment, supporting a `*_FILE` indirection for Docker/K8s
+/// secret mounts (`EDGEGUARD_JWT_SECRET` *or* `EDGEGUARD_JWT_SECRET_FILE` pointing at a file
+/// whose contents are the secret). The direct variable takes precedence when both are set; a
+/// `*_FILE` that can't be read is a hard error (a misconfigured secret mount must fail loudly,
+/// not silently fall back to no secret). A trailing newline (the common `echo`/editor artifact)
+/// is trimmed. Returns `None` when neither is set / both are empty, so the caller keeps the
+/// file/default value.
+fn env_or_file(name: &str) -> Result<Option<String>> {
+    if let Ok(v) = env::var(name) {
+        if !v.is_empty() {
+            return Ok(Some(v));
+        }
+    }
+    let file_var = format!("{name}_FILE");
+    if let Ok(path) = env::var(&file_var) {
+        if !path.is_empty() {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {file_var} ({path})"))?;
+            let trimmed = content.trim_end_matches(['\n', '\r']);
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Parse a human size like "2MiB", "512KB", "1048576" into bytes.
@@ -819,5 +972,35 @@ mod tests {
         assert!(parse_duration("abc").is_err());
         assert!(parse_duration("10x").is_err());
         assert!(parse_duration("s").is_err());
+    }
+
+    #[test]
+    fn env_or_file_reads_file_trims_newline_and_prefers_direct() {
+        // A uniquely-named var so this doesn't collide with any real config key or another test.
+        let name = "EDGEGUARD_TEST_SECRET_QZX";
+        let file_var = format!("{name}_FILE");
+        let path = std::env::temp_dir().join("edgeguard_test_secret_qzx.txt");
+        std::fs::write(&path, "s3cr3t\n").unwrap();
+
+        // No direct var, only *_FILE -> read the file (trailing newline trimmed).
+        std::env::remove_var(name);
+        std::env::set_var(&file_var, &path);
+        assert_eq!(env_or_file(name).unwrap().as_deref(), Some("s3cr3t"));
+
+        // Direct var set -> it wins over the file.
+        std::env::set_var(name, "direct");
+        assert_eq!(env_or_file(name).unwrap().as_deref(), Some("direct"));
+
+        // Neither set -> None (caller keeps the file/default value).
+        std::env::remove_var(name);
+        std::env::remove_var(&file_var);
+        assert_eq!(env_or_file(name).unwrap(), None);
+
+        // A *_FILE pointing at a missing path is a hard error, not a silent fallback.
+        std::env::set_var(&file_var, "/nonexistent/edgeguard/secret");
+        assert!(env_or_file(name).is_err());
+        std::env::remove_var(&file_var);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

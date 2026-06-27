@@ -26,6 +26,7 @@ use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, RateLi
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
@@ -50,6 +51,10 @@ pub struct AppState {
     /// Managed-mode control-plane client (`Some` only when `[control_plane]` is enabled). Used to
     /// forward CSP reports; policy pull + usage reporting run as background tasks in `main`.
     pub cp: Option<Arc<crate::cp::CpClient>>,
+    /// Shared quota verdict, updated by the managed-mode quota poller and read by the
+    /// hard-stop gate below. Lives here (not on the hot-swappable [`Runtime`]) so a policy reload
+    /// never resets enforcement. Inert unless `control_plane.enforce_quota` is set.
+    pub quota: Arc<crate::cp::QuotaState>,
 }
 
 /// A per-route rate-limit override: requests whose path starts with `prefix` use `limiter`.
@@ -62,10 +67,19 @@ pub struct RouteLimiter {
 /// swapped in atomically.
 pub struct Runtime {
     pub cfg: Arc<Config>,
+    /// Default upstream base URL (the single `server.upstream`/`app_port`), used when no
+    /// `[[upstreams]]` prefix matches.
     pub upstream_base: Arc<String>,
+    /// Per-path-prefix upstream overrides as `(prefix, base)`; the longest matching prefix wins.
+    /// Empty unless `[[upstreams]]` is configured.
+    pub upstream_routes: Vec<(String, Arc<String>)>,
     pub auth: AuthEngine,
     /// WAF-lite input screener. Inert (`evaluate` returns `None`) when `waf.mode = "off"`.
     pub waf: WafEngine,
+    /// Compiled CORS policy; `None` when `cors.enabled = false` (the proxy then skips CORS).
+    pub cors: Option<crate::cors::CorsPolicy>,
+    /// Compiled IP allow/deny policy; `None` when both lists are empty (no IP gating).
+    pub access: Option<crate::access::AccessPolicy>,
     /// Shared-store (distributed) limiter, `Some` when `ratelimit.store` is `memory`/`redis`.
     /// When present it replaces the three `governor` limiters below (which are then `None`).
     pub distributed: Option<DistributedLimiter>,
@@ -85,6 +99,42 @@ pub struct Runtime {
     /// Forward `text/event-stream` responses unbuffered (SSE passthrough). See
     /// [`crate::config::ValidationCfg::stream_passthrough`].
     pub stream_passthrough: bool,
+    /// Tunnel WebSocket / `Upgrade` connections to the upstream. See
+    /// [`crate::config::ValidationCfg::websocket_passthrough`].
+    pub websocket_passthrough: bool,
+}
+
+impl Runtime {
+    /// The upstream base URL to forward `path` to: the longest matching `[[upstreams]]` prefix,
+    /// or the default [`Runtime::upstream_base`] when none match.
+    pub fn pick_upstream(&self, path: &str) -> &str {
+        self.upstream_routes
+            .iter()
+            .filter(|(prefix, _)| path_prefix_matches(path, prefix))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, base)| base.as_str())
+            .unwrap_or_else(|| self.upstream_base.as_str())
+    }
+}
+
+/// Whether `prefix` matches `path` on a path-segment boundary. `prefix` is a validated upstream
+/// route prefix (always starts with `/`); `path` is the request path-and-query. A plain
+/// `str::starts_with` would route a sibling like `/apiary` to the `/api` upstream, so the match
+/// only succeeds when the prefix is followed by a real boundary: end of path, a `/`, or the query
+/// separator `?`. A trailing slash on the prefix is itself a boundary.
+fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return true;
+    }
+    match path.strip_prefix(prefix) {
+        Some(rest) => {
+            rest.is_empty()
+                || prefix.ends_with('/')
+                || rest.starts_with('/')
+                || rest.starts_with('?')
+        }
+        None => false,
+    }
 }
 
 /// Hop-by-hop headers that must not be forwarded (RFC 7230 §6.1).
@@ -104,10 +154,34 @@ pub async fn handle(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response<Body> {
+    // One atomic load pins a consistent policy snapshot for the whole request, even if a reload
+    // swaps in a new Runtime mid-flight — routing, auth, *and* the final CORS decoration below all
+    // see the same one (loading again here could decorate with a policy the request never used).
+    let rt = state.runtime.load_full();
+    // Capture the request Origin before the body is consumed, so we can CORS-decorate *every*
+    // response — including EdgeGuard-generated 401/403/429 — not just proxied successes. Without
+    // this, an allowed browser origin sees a generic CORS failure instead of the real status.
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let mut resp = handle_inner(&state, &rt, peer, req).await;
+    if let Some(origin) = &origin {
+        if let Some(cors) = &rt.cors {
+            cors.decorate_origin(origin, &mut resp);
+        }
+    }
+    resp
+}
+
+async fn handle_inner(
+    state: &AppState,
+    rt: &Runtime,
+    peer: SocketAddr,
+    req: Request<Body>,
+) -> Response<Body> {
     let started = Instant::now();
-    // One atomic load pins a consistent policy snapshot for the whole request, even if a
-    // reload swaps in a new Runtime mid-flight.
-    let rt = state.runtime.load();
     let m = &state.metrics;
 
     let method = req.method().clone();
@@ -118,6 +192,9 @@ pub async fn handle(
         .unwrap_or_else(|| req.uri().path().to_string());
 
     let ip = client_ip(req.headers(), peer, rt.cfg.server.trust_forwarded_for);
+    // Request id for correlation: reuse a well-formed inbound one, else generate. Echoed on the
+    // response and the access log by `finish`, and forwarded upstream below.
+    let rid = resolve_request_id(req.headers());
 
     // Reserve the internal namespace: never forward `/__edgeguard/*` upstream. Registered
     // internal routes are matched before this fallback, so anything reaching here under that
@@ -127,6 +204,7 @@ pub async fn handle(
     if req.uri().path().starts_with("/__edgeguard/") {
         return finish(
             m,
+            &rid,
             &method,
             &path,
             ip,
@@ -136,10 +214,29 @@ pub async fn handle(
         );
     }
 
-    // 0) Total request-header-size limit.
+    // 0) IP access control. A coarse network gate (CIDR allow/deny) evaluated before auth and
+    //    rate limiting, so a denied/non-allowlisted client is dropped with `403` before consuming
+    //    any limiter token or auth work. Keys on the same resolved client IP as rate limiting.
+    if let Some(access) = &rt.access {
+        if !access.allowed(ip) {
+            return finish(
+                m,
+                &rid,
+                &method,
+                &path,
+                ip,
+                started,
+                "ip_denied",
+                text(StatusCode::FORBIDDEN, "Forbidden"),
+            );
+        }
+    }
+
+    // 0.1) Total request-header-size limit.
     if rt.max_header_bytes > 0 && header_bytes(req.headers()) > rt.max_header_bytes {
         return finish(
             m,
+            &rid,
             &method,
             &path,
             ip,
@@ -150,6 +247,27 @@ pub async fn handle(
                 "Request Header Fields Too Large",
             ),
         );
+    }
+
+    // 0.5) Quota hard-stop (managed mode, opt-in). When the control plane reports the
+    //      edge over its quota, reject the edge's traffic with `429` and a
+    //      month-scale `Retry-After`, until the next successful poll clears it. Off unless
+    //      `control_plane.enforce_quota` is set; the `/__edgeguard/*` endpoints are excluded above,
+    //      so health/ready/metrics keep serving even while over quota.
+    if rt.cfg.control_plane.enforce_quota && state.quota.blocked() {
+        let mut resp = text(StatusCode::TOO_MANY_REQUESTS, "Quota Exceeded");
+        let reset = state.quota.reset_epoch();
+        if reset > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let retry_after = reset.saturating_sub(now).max(0);
+            if let Ok(v) = HeaderValue::from_str(&retry_after.to_string()) {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+        }
+        return finish(m, &rid, &method, &path, ip, started, "over_quota", resp);
     }
 
     // 1) Rate limit. A matching per-route override replaces the global per-IP limit. A shared
@@ -163,6 +281,7 @@ pub async fn handle(
                     m.record_ratelimit_hit(scope);
                     return finish(
                         m,
+                        &rid,
                         &method,
                         &path,
                         ip,
@@ -174,6 +293,7 @@ pub async fn handle(
                 Admit::Error => {
                     return finish(
                         m,
+                        &rid,
                         &method,
                         &path,
                         ip,
@@ -193,6 +313,7 @@ pub async fn handle(
                     m.record_ratelimit_hit(scope);
                     return finish(
                         m,
+                        &rid,
                         &method,
                         &path,
                         ip,
@@ -201,6 +322,18 @@ pub async fn handle(
                         text(StatusCode::TOO_MANY_REQUESTS, "Too Many Requests"),
                     );
                 }
+            }
+        }
+    }
+
+    // 1.5) CORS preflight. Answer a browser preflight (`OPTIONS` + `Origin` +
+    //      `Access-Control-Request-Method`) here, *before* auth: a preflight carries no
+    //      credentials, so gating it behind the auth check would make every cross-origin call
+    //      fail. Only a real preflight is short-circuited; a plain `OPTIONS` falls through.
+    if method == Method::OPTIONS {
+        if let Some(cors) = &rt.cors {
+            if let Some(resp) = cors.preflight_response(req.headers()) {
+                return finish(m, &rid, &method, &path, ip, started, "cors_preflight", resp);
             }
         }
     }
@@ -220,7 +353,7 @@ pub async fn handle(
                     resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
                 }
             }
-            return finish(m, &method, &path, ip, started, "unauthorized", resp);
+            return finish(m, &rid, &method, &path, ip, started, "unauthorized", resp);
         }
     };
 
@@ -243,6 +376,7 @@ pub async fn handle(
                 m.record_ratelimit_hit(scope);
                 return finish(
                     m,
+                    &rid,
                     &method,
                     &path,
                     ip,
@@ -254,6 +388,7 @@ pub async fn handle(
             Some(Admit::Error) => {
                 return finish(
                     m,
+                    &rid,
                     &method,
                     &path,
                     ip,
@@ -275,6 +410,7 @@ pub async fn handle(
     {
         return finish(
             m,
+            &rid,
             &method,
             &path,
             ip,
@@ -284,6 +420,16 @@ pub async fn handle(
         );
     }
 
+    // 4.5) WebSocket / `Upgrade` passthrough (opt-in). An upgrade request can't go through the
+    //      buffer-and-forward path below — it needs a raw bidirectional tunnel. When enabled, hand
+    //      off to `proxy_upgrade`, which forwards the request *with* its upgrade headers (the
+    //      normal path strips them) and splices the connections on a `101`. The request is already
+    //      authenticated and rate-limited at this point. When disabled (default), fall through and
+    //      the upgrade headers are stripped like any other hop-by-hop header.
+    if rt.websocket_passthrough && is_upgrade_request(req.headers()) {
+        return proxy_upgrade(state, rt, req, &rid, &method, &path, ip, started).await;
+    }
+
     // 5) Buffer the body up to the configured limit.
     let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, rt.max_body).await {
@@ -291,6 +437,7 @@ pub async fn handle(
         Err(_) => {
             return finish(
                 m,
+                &rid,
                 &method,
                 &path,
                 ip,
@@ -321,6 +468,7 @@ pub async fn handle(
                 );
                 return finish(
                     m,
+                    &rid,
                     &method,
                     &path,
                     ip,
@@ -343,8 +491,8 @@ pub async fn handle(
         }
     }
 
-    // 7) Build the upstream request.
-    let uri = format!("{}{}", rt.upstream_base, path);
+    // 7) Build the upstream request (the per-path upstream override, or the default).
+    let uri = format!("{}{}", rt.pick_upstream(&path), path);
     let mut up = Request::builder().method(parts.method.clone()).uri(&uri);
     {
         let headers = up.headers_mut().expect("builder headers");
@@ -366,6 +514,10 @@ pub async fn handle(
             HeaderName::from_static("x-forwarded-proto"),
             HeaderValue::from_static(forwarded_proto(&rt.cfg, &parts.headers)),
         );
+        // Forward the (resolved/generated) request id so the upstream logs the same correlation id.
+        if let Ok(v) = HeaderValue::from_str(&rid) {
+            headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), v);
+        }
     }
 
     let upstream_req = match up.body(Full::new(body_bytes)) {
@@ -374,6 +526,7 @@ pub async fn handle(
             warn!(error = %e, "failed to build upstream request");
             return finish(
                 m,
+                &rid,
                 &method,
                 &path,
                 ip,
@@ -398,6 +551,7 @@ pub async fn handle(
             warn!(error = %e, upstream = %uri, "upstream unreachable");
             return finish(
                 m,
+                &rid,
                 &method,
                 &path,
                 ip,
@@ -409,6 +563,7 @@ pub async fn handle(
         Err(_) => {
             return finish(
                 m,
+                &rid,
                 &method,
                 &path,
                 ip,
@@ -440,7 +595,8 @@ pub async fn handle(
         ));
         let mut response = Response::from_parts(resp_parts, body);
         harden_response(&rt.cfg, &mut response);
-        return finish(m, &method, &path, ip, started, "ok", response);
+        // CORS decoration happens centrally in `handle` (covers this and every error path).
+        return finish(m, &rid, &method, &path, ip, started, "ok", response);
     }
 
     // Buffer the upstream body, optionally capped so a huge response can't OOM the proxy.
@@ -459,6 +615,7 @@ pub async fn handle(
                 );
                 return finish(
                     m,
+                    &rid,
                     &method,
                     &path,
                     ip,
@@ -470,6 +627,7 @@ pub async fn handle(
             Err(_) => {
                 return finish(
                     m,
+                    &rid,
                     &method,
                     &path,
                     ip,
@@ -486,6 +644,7 @@ pub async fn handle(
                 warn!(error = %e, "failed reading upstream body");
                 return finish(
                     m,
+                    &rid,
                     &method,
                     &path,
                     ip,
@@ -497,6 +656,7 @@ pub async fn handle(
             Err(_) => {
                 return finish(
                     m,
+                    &rid,
                     &method,
                     &path,
                     ip,
@@ -522,8 +682,9 @@ pub async fn handle(
 
     let mut response = Response::from_parts(resp_parts, Body::from(resp_bytes));
     harden_response(&rt.cfg, &mut response);
+    // CORS decoration happens centrally in `handle` (covers this and every error path).
 
-    finish(m, &method, &path, ip, started, "ok", response)
+    finish(m, &rid, &method, &path, ip, started, "ok", response)
 }
 
 /// Readiness probe. Returns `200` only if the upstream accepts a TCP connection, so a
@@ -596,6 +757,25 @@ pub async fn csp_report(State(state): State<AppState>, body: Bytes) -> StatusCod
     StatusCode::NO_CONTENT
 }
 
+/// Header EdgeGuard reads an inbound request id from and echoes on every response. A
+/// `&'static str` (rather than a `HeaderName` const, which isn't a const fn) — `HeaderMap`'s
+/// `get`/`insert` accept it directly.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Resolve the request id for log correlation: reuse a well-formed inbound `X-Request-Id` (one a
+/// CDN/LB already set), else mint a UUID v4. The inbound value is trusted only when it's a short,
+/// printable-ASCII token, so a hostile client can't inject newlines/control characters into the
+/// access log or the echoed response header.
+fn resolve_request_id(headers: &HeaderMap) -> String {
+    if let Some(v) = headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()) {
+        let v = v.trim();
+        if !v.is_empty() && v.len() <= 128 && v.bytes().all(|b| b.is_ascii_graphic()) {
+            return v.to_string();
+        }
+    }
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Resolve the client IP. The peer socket address is authoritative; `X-Forwarded-For`
 /// (first hop) is honored only when `trust_forwarded` is set, because a directly
 /// reachable client can otherwise spoof it to forge their identity.
@@ -638,6 +818,216 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
                 .unwrap_or(false)
         })
         .unwrap_or(false)
+}
+
+/// True when the request asks to upgrade the protocol — a `Connection: upgrade` token plus an
+/// `Upgrade` header (e.g. a WebSocket handshake). The signal for [`proxy_upgrade`].
+fn is_upgrade_request(headers: &HeaderMap) -> bool {
+    let conn_has_upgrade = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+    conn_has_upgrade && headers.contains_key(header::UPGRADE)
+}
+
+/// Tunnel a WebSocket / `Upgrade` request to the upstream. Unlike the normal path (which strips
+/// the hop-by-hop `Upgrade`/`Connection` headers), this forwards the handshake intact; on the
+/// upstream's `101 Switching Protocols` it splices the client and upstream connections into a raw
+/// bidirectional byte tunnel for the lifetime of the socket. Any other upstream status is passed
+/// back to the client unchanged, so a rejected handshake surfaces normally.
+// Mirrors the `handle` forward path's parameters (state/runtime/request + the access-log tuple);
+// see the note on `finish`.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_upgrade(
+    state: &AppState,
+    rt: &Runtime,
+    mut req: Request<Body>,
+    request_id: &str,
+    method: &Method,
+    path: &str,
+    ip: IpAddr,
+    started: Instant,
+) -> Response<Body> {
+    let m = &state.metrics;
+
+    // The client-side upgrade future: once we return a `101`, the server completes it and yields
+    // the raw client connection. Take it (removing the extension from `req`) before forwarding.
+    let client_upgrade = hyper::upgrade::on(&mut req);
+
+    // Build the upstream request: copy end-to-end headers AND the upgrade/connection headers
+    // (the handshake needs them), add the forwarding headers, send an empty body.
+    let uri = format!("{}{}", rt.pick_upstream(path), path);
+    let mut up = Request::builder().method(req.method().clone()).uri(&uri);
+    {
+        let headers = up.headers_mut().expect("builder headers");
+        // Strip hop-by-hop headers (the fixed set + any named by `Connection`) before forwarding,
+        // so a client can't smuggle connection-scoped headers upstream — then re-add the handshake
+        // headers the upgrade itself needs (`Connection: upgrade` + the requested `Upgrade`).
+        let upgrade = req.headers().get(header::UPGRADE).cloned();
+        let mut forwarded = req.headers().clone();
+        strip_hop_by_hop(&mut forwarded);
+        for (name, value) in forwarded.iter() {
+            if name == header::HOST {
+                continue;
+            }
+            headers.insert(name.clone(), value.clone());
+        }
+        headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        if let Some(v) = upgrade {
+            headers.insert(header::UPGRADE, v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&ip.to_string()) {
+            headers.insert(HeaderName::from_static("x-forwarded-for"), v);
+        }
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static(forwarded_proto(&rt.cfg, req.headers())),
+        );
+        if let Ok(v) = HeaderValue::from_str(request_id) {
+            headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), v);
+        }
+    }
+    let upstream_req = match up.body(Full::new(Bytes::new())) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "failed to build upstream upgrade request");
+            return finish(
+                m,
+                request_id,
+                method,
+                path,
+                ip,
+                started,
+                "bad_gateway",
+                text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+            );
+        }
+    };
+
+    // Bound the handshake by the same `upstream_timeout` as the buffered path, so a stalled
+    // upstream can't pin this task (a `None` deadline means no timeout).
+    let deadline = rt.upstream_timeout.map(|d| tokio::time::Instant::now() + d);
+    let timed_out = || {
+        warn!(upstream = %uri, "upstream timed out (upgrade)");
+        finish(
+            m,
+            request_id,
+            method,
+            path,
+            ip,
+            started,
+            "upstream_timeout",
+            text(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout"),
+        )
+    };
+
+    let mut up_resp = match within(deadline, state.client.request(upstream_req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            warn!(error = %e, upstream = %uri, "upstream unreachable (upgrade)");
+            return finish(
+                m,
+                request_id,
+                method,
+                path,
+                ip,
+                started,
+                "upstream_error",
+                text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+            );
+        }
+        Err(_) => return timed_out(),
+    };
+
+    // Upstream declined to upgrade: forward its response as-is (the client sees the rejection),
+    // but under the same deadline and `max_response_body` cap as the normal buffered path so a
+    // rejected handshake can't hang or buffer an unbounded body.
+    if up_resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let (mut parts, body) = up_resp.into_parts();
+        // Collect the rejection body, capped by `max_response_body` when set. Both arms normalize
+        // any read/limit error to `()` — the distinction doesn't change the `502` we return.
+        let body_fut = async {
+            if rt.max_response_body > 0 {
+                Limited::new(body, rt.max_response_body)
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes())
+                    .map_err(|_| ())
+            } else {
+                body.collect().await.map(|c| c.to_bytes()).map_err(|_| ())
+            }
+        };
+        let bytes = match within(deadline, body_fut).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(())) => {
+                warn!("upstream upgrade-rejection body failed or exceeded max_response_body");
+                return finish(
+                    m,
+                    request_id,
+                    method,
+                    path,
+                    ip,
+                    started,
+                    "bad_gateway",
+                    text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+                );
+            }
+            Err(_) => return timed_out(),
+        };
+        strip_hop_by_hop(&mut parts.headers);
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let mut response = Response::from_parts(parts, Body::from(bytes));
+        harden_response(&rt.cfg, &mut response);
+        return finish(m, request_id, method, path, ip, started, "ok", response);
+    }
+
+    // `101`: wire up the upstream-side upgrade and splice the two connections once both complete.
+    let upstream_upgrade = hyper::upgrade::on(&mut up_resp);
+    tokio::spawn(async move {
+        match tokio::join!(client_upgrade, upstream_upgrade) {
+            (Ok(client_io), Ok(up_io)) => {
+                let mut client_io = TokioIo::new(client_io);
+                let mut up_io = TokioIo::new(up_io);
+                if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut up_io).await {
+                    debug!(error = %e, "websocket tunnel closed");
+                }
+            }
+            (c, u) => warn!(
+                client_ok = c.is_ok(),
+                upstream_ok = u.is_ok(),
+                "websocket upgrade did not complete"
+            ),
+        }
+    });
+
+    // Return the upstream's `101` — its headers carry `Sec-WebSocket-Accept` etc., and returning a
+    // `101` is what makes the server upgrade the client side (completing `client_upgrade` above).
+    // Strip hop-by-hop headers (the fixed set + any named by `Connection`) so the upstream can't
+    // leak connection-scoped headers downstream, then re-add the handshake headers the upgrade
+    // itself needs (`Connection: upgrade` + the negotiated `Upgrade`).
+    let (mut parts, _body) = up_resp.into_parts();
+    let upgrade = parts.headers.get(header::UPGRADE).cloned();
+    strip_hop_by_hop(&mut parts.headers);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts
+        .headers
+        .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+    if let Some(v) = upgrade {
+        parts.headers.insert(header::UPGRADE, v);
+    }
+    let response = Response::from_parts(parts, Body::empty());
+    finish(
+        m,
+        request_id,
+        method,
+        path,
+        ip,
+        started,
+        "ws_upgrade",
+        response,
+    )
 }
 
 /// Wraps a streaming upstream body to tally egress bytes (response headers + each data frame)
@@ -889,18 +1279,29 @@ fn text(status: StatusCode, msg: &str) -> Response<Body> {
     resp
 }
 
-/// Emit a structured access-log line, record metrics, and return the response.
+/// Emit a structured access-log line, record metrics, stamp the response with `X-Request-Id`,
+/// and return it.
+// All args are part of the access-log/identity tuple for one request; bundling them in a struct
+// would just move the same fields behind another name at every (already terse) call site.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     metrics: &Metrics,
+    request_id: &str,
     method: &Method,
     path: &str,
     ip: IpAddr,
     started: Instant,
     outcome: &str,
-    resp: Response<Body>,
+    mut resp: Response<Body>,
 ) -> Response<Body> {
+    // Echo the request id on every response (including error responses) so a client / upstream /
+    // log can be correlated. `resolve_request_id` guarantees it's a valid header value.
+    if let Ok(v) = HeaderValue::from_str(request_id) {
+        resp.headers_mut().insert(REQUEST_ID_HEADER, v);
+    }
     let elapsed = started.elapsed();
     info!(
+        request_id,
         %method,
         path = %path,
         client_ip = %ip,
@@ -925,6 +1326,21 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(name, HeaderValue::from_str(value).unwrap());
         h
+    }
+
+    #[test]
+    fn path_prefix_matches_on_segment_boundary_only() {
+        // Exact, sub-path, and query-boundary matches.
+        assert!(path_prefix_matches("/api", "/api"));
+        assert!(path_prefix_matches("/api/users", "/api"));
+        assert!(path_prefix_matches("/api?x=1", "/api"));
+        // A trailing-slash prefix matches its sub-paths.
+        assert!(path_prefix_matches("/api/users", "/api/"));
+        // Sibling paths sharing a textual prefix must NOT match.
+        assert!(!path_prefix_matches("/apiary", "/api"));
+        assert!(!path_prefix_matches("/apiary/honey", "/api"));
+        // `/` matches everything.
+        assert!(path_prefix_matches("/anything", "/"));
     }
 
     #[test]
@@ -1032,6 +1448,20 @@ mod tests {
             Some("/api/")
         );
         assert!(longest_route(&routes, "/public").is_none());
+    }
+
+    #[test]
+    fn path_prefix_matches_on_segment_boundaries() {
+        // A prefix without a trailing slash must not match a sibling path.
+        assert!(path_prefix_matches("/api", "/api")); // exact
+        assert!(path_prefix_matches("/api/users", "/api")); // segment boundary
+        assert!(path_prefix_matches("/api?q=1", "/api")); // query boundary
+        assert!(!path_prefix_matches("/apiary", "/api")); // sibling — must NOT match
+                                                          // A trailing-slash prefix is a clean boundary by construction.
+        assert!(path_prefix_matches("/api/users", "/api/"));
+        assert!(!path_prefix_matches("/apiary", "/api/"));
+        // "/" matches everything.
+        assert!(path_prefix_matches("/anything", "/"));
     }
 
     #[test]

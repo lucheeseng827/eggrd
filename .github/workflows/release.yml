@@ -1,0 +1,119 @@
+# Release automation for the PUBLIC eggrd repo. Lives ONLY here (the monorepo sync
+# never touches .github). Triggered by the `vX` GitHub Release the monorepo's
+# `sync-eggrd-oss.yml` stamps on this repo after a successful `eggrd-oss-vX` sync.
+#
+# Two independent jobs:
+#   • crates — publish edgeguard-ner FIRST, then eggrd. eggrd's manifest carries an
+#     optional `edgeguard-ner` dep with a registry `version`, so cargo cannot publish
+#     eggrd until edgeguard-ner exists (and is indexed) on crates.io. Both steps are
+#     idempotent (an already-published version is treated as success).
+#   • image  — build + push the multi-arch (amd64+arm64) `mancube/eggrd` image from
+#     the Dockerfile, tagged with the release version and `latest`.
+#
+# Required secrets on the `cicd` environment of this repo:
+#   CRATESIO_TOKEN   crates.io API token (publish scope for edgeguard-ner + eggrd)
+#   DOCKER_USERNAME  Docker Hub user (write on mancube/eggrd)
+#   DOCKER_PASSWORD  Docker Hub access token
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)run, e.g. v0.2.1"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+    environment: cicd
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish edgeguard-ner, then eggrd
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATESIO_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::CRATESIO_TOKEN secret is empty — add a crates.io API token as a cicd-environment secret named CRATESIO_TOKEN."
+            exit 1
+          fi
+
+          tag="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          want="${tag#v}"
+          have=$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n1)
+          if [ "$want" != "$have" ]; then
+            echo "::error::Release tag '$tag' (version $want) != eggrd Cargo.toml version '$have'."
+            exit 1
+          fi
+
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/eggrd-publish"
+
+          # 1) edgeguard-ner first (idempotent).
+          echo "== publishing edgeguard-ner =="
+          out=$(cargo publish --manifest-path edgeguard-ner/Cargo.toml 2>&1); rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            if echo "$out" | grep -qiE "already (exists|uploaded)|is already uploaded"; then
+              echo "edgeguard-ner already on crates.io — continuing."
+            else
+              echo "::error::edgeguard-ner publish failed."; exit "$rc"
+            fi
+          fi
+
+          # 2) eggrd — retry so the just-published edgeguard-ner has time to hit the index.
+          echo "== publishing eggrd =="
+          for i in $(seq 1 12); do
+            out=$(cargo publish 2>&1); rc=$?
+            echo "$out"
+            if [ "$rc" -eq 0 ]; then
+              echo "Published eggrd $have to crates.io."; exit 0
+            fi
+            if echo "$out" | grep -qiE "already (exists|uploaded)|is already uploaded"; then
+              echo "eggrd $have already on crates.io — treating as success."; exit 0
+            fi
+            if echo "$out" | grep -qiE "no matching package named .?edgeguard-ner|failed to select a version for .?edgeguard-ner"; then
+              echo "edgeguard-ner not indexed yet (attempt $i/12); waiting 20s…"; sleep 20; continue
+            fi
+            echo "::error::eggrd publish failed for a non-index reason."; exit "$rc"
+          done
+          echo "::error::edgeguard-ner did not appear on the index in time."; exit 1
+
+  image:
+    runs-on: ubuntu-latest
+    environment: cicd
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      - name: Derive version
+        id: v
+        run: |
+          tag="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build + push mancube/eggrd (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            mancube/eggrd:${{ steps.v.outputs.version }}
+            mancube/eggrd:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

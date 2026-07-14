@@ -1,0 +1,35 @@
+# CI for the PUBLIC eggrd repo. This file lives ONLY here — the monorepo sync
+# deliberately never touches .github (its token has no Workflows permission), so
+# edit it directly on this repo. Proves a fresh clone of the mirror builds, lints,
+# and tests against the committed Cargo.lock, exactly as a cloner would.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (locked)
+        run: cargo build --locked
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      # The optional ONNX NER path is heavy (tract + tokenizers) and off by default.
+      # Prove it still compiles without running the full ML test surface.
+      - name: NER feature compiles
+        run: cargo build --locked --features ner

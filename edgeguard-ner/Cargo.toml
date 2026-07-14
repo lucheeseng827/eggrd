@@ -1,0 +1,38 @@
+[package]
+name = "edgeguard-ner"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Optional pure-Rust ONNX NER layer for EdgeGuard edge DLP (tract runtime)."
+repository = "https://github.com/lucheeseng827/eggrd"
+keywords = ["pii", "ner", "onnx", "redaction", "dlp"]
+categories = ["text-processing"]
+# Publishable so the parent `eggrd` crate (which references it as an optional `ner`-feature dep with a
+# registry `version`) is itself publishable — Cargo rejects a published crate that depends on an
+# unpublished one. Release order: publish edgeguard-ner first, then eggrd.
+
+[dependencies]
+anyhow = "1"
+
+# --- ONNX runtime stack, gated behind the `onnx` feature ---------------------------------------
+# Everything below is OPTIONAL and only compiled with `--features onnx` (which EdgeGuard's `ner`
+# feature turns on). A default build of this crate — and therefore a default build of the whole
+# workspace — pulls NONE of it, so EdgeGuard's single-static-binary / distroless / static-musl
+# promise is preserved unless you opt into the ML path.
+#
+# `tract-onnx` is a PURE-RUST ONNX inference engine: no libonnxruntime.so, no C++ — unlike the `ort`
+# crate, which links a shared object and would break the distroless/static image.
+tract-onnx = { version = "0.21", optional = true }
+# `ndarray` for assembling the input tensors.
+ndarray = { version = "0.16", optional = true }
+# HuggingFace tokenizers. default-features disabled so we do NOT pull `onig` (C Oniguruma) or
+# `esaxx_fast` (C++). The `unstable_wasm` feature is (despite its name) the documented way to select
+# the pure-Rust `fancy-regex` split backend instead of the C `onig` one — it is what keeps the `onnx`
+# build C-free and static-musl clean, on any target (its extra `getrandom/js` is inert off-wasm).
+tokenizers = { version = "0.20", default-features = false, features = ["unstable_wasm"], optional = true }
+
+[features]
+default = []
+# Turn on the real ONNX NER backend. Without it, `NerEngine` is an uninhabited type and `load`
+# returns an error — so the crate always compiles, but ML only exists when explicitly built in.
+onnx = ["dep:tract-onnx", "dep:ndarray", "dep:tokenizers"]

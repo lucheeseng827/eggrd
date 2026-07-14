@@ -14,7 +14,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use axum::{
@@ -102,6 +102,21 @@ pub struct Runtime {
     /// Tunnel WebSocket / `Upgrade` connections to the upstream. See
     /// [`crate::config::ValidationCfg::websocket_passthrough`].
     pub websocket_passthrough: bool,
+    /// Compiled LLM token-metering runtime (price book + on/off). Inert when `[llm]` is disabled.
+    pub llm: Arc<crate::llm::LlmRuntime>,
+    /// Compiled LLM hard-budget engine (gateway L1). `None` when no `[[llm.budgets]]` are configured.
+    pub budgets: Option<Arc<crate::budget::BudgetEngine>>,
+    /// Compiled BYO-key vault (gateway L2). `None` when no `[[llm.keys]]` are configured; when set,
+    /// every proxied request must present a known virtual key.
+    pub keyvault: Option<Arc<crate::keyvault::KeyVault>>,
+    /// Compiled edge-DLP engine (gateway L3). `None` when `[llm.dlp].mode = "off"`.
+    pub dlp: Option<Arc<crate::dlp::DlpEngine>>,
+    /// Compiled OTLP span emitter (gateway L4). Inert when `[llm.telemetry].enabled = false` or no
+    /// endpoint is set; emits one OpenInference span per metered LLM request, fire-and-forget.
+    pub telemetry: Arc<crate::telemetry::TelemetryRuntime>,
+    /// Compiled outbound alerter (gateway L4). Inert when `[alerts].enabled = false` or no webhook is
+    /// set; fires a Slack-compatible alert when a hard budget crosses its threshold, fire-and-forget.
+    pub alerts: Arc<crate::alert::AlertRuntime>,
 }
 
 impl Runtime {
@@ -427,12 +442,92 @@ async fn handle_inner(
     //      authenticated and rate-limited at this point. When disabled (default), fall through and
     //      the upgrade headers are stripped like any other hop-by-hop header.
     if rt.websocket_passthrough && is_upgrade_request(req.headers()) {
+        // Vault check for upgrade connections: validate the virtual key and swap it for the
+        // provider key before tunnelling. WebSocket frames don't carry a parseable JSON body, so
+        // model egress can't be enforced; any key with a non-empty allowlist is denied
+        // (fail-closed — the tunnel could reach any model on the upstream).
+        let mut req = req;
+        if let Some(vault) = rt.keyvault.as_ref() {
+            let presented = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .map(str::trim);
+            match presented.and_then(|k| vault.lookup(k)) {
+                Some(entry) => {
+                    if !entry.model_allowed(None) {
+                        m.record_keyvault("denied_model");
+                        warn!(key = %entry.label(), client_ip = %ip, "WebSocket upgrade denied: key has a model allowlist (model cannot be verified on upgrade connections)");
+                        return finish(
+                            m,
+                            &rid,
+                            &method,
+                            &path,
+                            ip,
+                            started,
+                            "forbidden",
+                            text(StatusCode::FORBIDDEN, "Forbidden"),
+                        );
+                    }
+                    match HeaderValue::from_str(&format!("Bearer {}", entry.provider_key())) {
+                        Ok(v) => {
+                            m.record_keyvault("swapped");
+                            req.headers_mut().insert(header::AUTHORIZATION, v);
+                        }
+                        Err(e) => {
+                            warn!(key = %entry.label(), error = %e, "provider key is not a valid Authorization header value");
+                            return finish(
+                                m,
+                                &rid,
+                                &method,
+                                &path,
+                                ip,
+                                started,
+                                "bad_gateway",
+                                text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+                            );
+                        }
+                    }
+                }
+                None => {
+                    m.record_keyvault("denied_key");
+                    return finish(
+                        m,
+                        &rid,
+                        &method,
+                        &path,
+                        ip,
+                        started,
+                        "unauthorized",
+                        text(StatusCode::UNAUTHORIZED, "Unauthorized"),
+                    );
+                }
+            }
+        }
         return proxy_upgrade(state, rt, req, &rid, &method, &path, ip, started).await;
     }
 
     // 5) Buffer the body up to the configured limit.
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, rt.max_body).await {
+    // Capture an inbound W3C `traceparent` (if any) so an emitted LLM span stitches under the
+    // caller's trace. Cheap header read; only used when `[llm.telemetry]` is enabled.
+    let traceparent = parts
+        .headers
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // Team/tag for per-team token/cost metrics (chargeback/showback), from `[llm].team_header`
+    // (default `x-edgeguard-team`; absent → the shared `_none` bucket). Owned so the streamed-path
+    // meter can carry it past the request borrow. Matches the per-team budget scope's keying.
+    let llm_team: Option<String> = parts
+        .headers
+        .get(rt.cfg.llm.team_header.as_str())
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let mut body_bytes = match axum::body::to_bytes(body, rt.max_body).await {
         Ok(b) => b,
         Err(_) => {
             return finish(
@@ -491,6 +586,267 @@ async fn handle_inner(
         }
     }
 
+    // Reversible mask map (gateway L3): populated when inbound redaction runs in reversible mode, so
+    // the response can be unmasked back to the caller's own values (see the response paths below).
+    // Empty unless reversible masking actually replaces a span.
+    let mut mask_map = crate::dlp::MaskMap::default();
+
+    // LLM edge DLP (gateway L3) — inbound prompt. Scan the request body for PII/secrets and apply
+    // the configured mode before forwarding: `block` rejects 403 (the secret never leaves), `redact`
+    // rewrites the forwarded body, `report` logs + counts and passes through unchanged.
+    if let Some(dlp) = rt.dlp.as_ref() {
+        if dlp.scan_request() {
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            let findings = dlp.scan(&body_text);
+            if !findings.is_empty() {
+                for f in &findings {
+                    m.record_dlp_finding(f.category);
+                }
+                match dlp.mode() {
+                    crate::dlp::DlpMode::Block => {
+                        m.record_dlp_blocked();
+                        warn!(findings = findings.len(), client_ip = %ip, "LLM request blocked by DLP (inbound PII/secret)");
+                        return finish(
+                            m,
+                            &rid,
+                            &method,
+                            &path,
+                            ip,
+                            started,
+                            "forbidden",
+                            text(StatusCode::FORBIDDEN, "Forbidden"),
+                        );
+                    }
+                    crate::dlp::DlpMode::Redact => {
+                        // Reversible mode masks to placeholders (recorded in `mask_map`) so the
+                        // response can restore them; plain redact rewrites irreversibly.
+                        let redacted = if dlp.reversible() {
+                            dlp.redact_reversible(&body_text, &findings, &mut mask_map)
+                        } else {
+                            dlp.redact(&body_text, &findings)
+                        };
+                        warn!(
+                            findings = findings.len(),
+                            reversible = dlp.reversible(),
+                            "DLP redacted inbound request"
+                        );
+                        body_bytes = Bytes::from(redacted);
+                    }
+                    crate::dlp::DlpMode::Report => {
+                        warn!(
+                            findings = findings.len(),
+                            "DLP findings in inbound request (report-only)"
+                        )
+                    }
+                    crate::dlp::DlpMode::Off => {}
+                }
+            }
+        }
+    }
+
+    // LLM token metering (gateway L0): if enabled, note the request's `model` *before* the body is
+    // forwarded (it's moved into the upstream request below). `None` for non-JSON / non-LLM bodies,
+    // in which case the request is simply not metered as LLM traffic. Metering is observe-only.
+    // Also parse when the vault is active: the model is needed for egress-allowlist enforcement and
+    // a missing model must be treated as denied for any key that has a non-empty allowlist.
+    let llm_model = if rt.llm.enabled || rt.keyvault.is_some() || rt.budgets.is_some() {
+        crate::llm::parse_request_model(&body_bytes)
+    } else {
+        None
+    };
+
+    // LLM key vault + egress governance (gateway L2): when configured, every proxied request must
+    // present a known virtual key. We resolve it to the mapped provider key (injected upstream
+    // below, so the provider secret never reaches the client) and enforce the key's model egress
+    // allowlist. Runs before the budget reserve so an unknown key / disallowed model never consumes
+    // budget. `upstream_auth`, when set, replaces the outbound `Authorization` header.
+    let mut upstream_auth: Option<HeaderValue> = None;
+    if let Some(vault) = rt.keyvault.as_ref() {
+        let presented = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::trim);
+        match presented.and_then(|k| vault.lookup(k)) {
+            Some(entry) => {
+                // Fail closed: a request whose model is absent or unparseable is denied when the
+                // key has a non-empty allowlist — same as an explicitly off-list model.
+                if !entry.model_allowed(llm_model.as_deref()) {
+                    let model = llm_model.as_deref().unwrap_or("<missing>");
+                    m.record_keyvault("denied_model");
+                    warn!(key = %entry.label(), model = %model, client_ip = %ip, "LLM request denied: model off the key's egress allowlist");
+                    return finish(
+                        m,
+                        &rid,
+                        &method,
+                        &path,
+                        ip,
+                        started,
+                        "forbidden",
+                        text(StatusCode::FORBIDDEN, "Forbidden"),
+                    );
+                }
+                // Convert to a HeaderValue now so a malformed provider key is caught here and
+                // fails with 502 rather than silently leaving the client's virtual key in place.
+                match HeaderValue::from_str(&format!("Bearer {}", entry.provider_key())) {
+                    Ok(v) => {
+                        m.record_keyvault("swapped");
+                        upstream_auth = Some(v);
+                    }
+                    Err(e) => {
+                        warn!(key = %entry.label(), error = %e, "provider key is not a valid Authorization header value");
+                        return finish(
+                            m,
+                            &rid,
+                            &method,
+                            &path,
+                            ip,
+                            started,
+                            "bad_gateway",
+                            text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
+                        );
+                    }
+                }
+            }
+            None => {
+                m.record_keyvault("denied_key");
+                return finish(
+                    m,
+                    &rid,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "unauthorized",
+                    text(StatusCode::UNAUTHORIZED, "Unauthorized"),
+                );
+            }
+        }
+    }
+
+    // LLM unpriced-model policy (gateway L0): when `on_unpriced_model = "block"` and a price book is
+    // configured, a request for a model absent from that book is rejected `402` *before* it reaches
+    // the upstream — an unpriced model is never served at a silent $0 (the LiteLLM `#24770` failure,
+    // designed out). Metering-only deployments (empty `[llm.models]`) never trip this. Runs after the
+    // vault (an unknown key is still `401` first) and before the budget reserve (no budget consumed).
+    if let Some(model) = llm_model.as_ref() {
+        if rt.llm.reject_unpriced(model) {
+            warn!(model = %model, client_ip = %ip, "LLM request denied: model not in price book (on_unpriced_model=block)");
+            return finish(
+                m,
+                &rid,
+                &method,
+                &path,
+                ip,
+                started,
+                "unpriced_model",
+                text(
+                    StatusCode::PAYMENT_REQUIRED,
+                    "Payment Required: model not in price book",
+                ),
+            );
+        }
+    }
+
+    // LLM hard budgets (gateway L1): reserve an estimate against every applicable budget *before*
+    // forwarding, so an over-budget request is denied 429 and never reaches the upstream. The
+    // returned guard reconciles to actual usage on success and auto-releases on any early return
+    // (upstream error / timeout) via its Drop. Only runs when budgets are configured and this is an
+    // LLM request with a known model.
+    let mut budget_guard: Option<ReservationGuard> = None;
+    if let (Some(engine), Some(model)) = (rt.budgets.as_ref(), llm_model.as_ref()) {
+        let est_prompt = crate::llm::estimate_prompt_tokens(body_bytes.len());
+        let est_completion = crate::llm::parse_request_max_tokens(&body_bytes)
+            .unwrap_or(rt.cfg.llm.default_max_tokens);
+        let estimate = crate::budget::Spend {
+            tokens: est_prompt.saturating_add(est_completion),
+            cost_micros: rt
+                .llm
+                .cost_micros(
+                    model,
+                    &crate::llm::Usage {
+                        prompt_tokens: est_prompt,
+                        completion_tokens: est_completion,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or(0),
+        };
+        // Team/tag for the per-team scope + chargeback, from the configured header (default
+        // `x-edgeguard-team`). Absent → the shared `_none` bucket.
+        let team = parts
+            .headers
+            .get(rt.cfg.llm.team_header.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let dims = crate::budget::Dims {
+            principal: principal.as_deref(),
+            // Normalize a provider-prefixed model ("openai/gpt-4o") to the bare name for budget
+            // attribution, so a prefixed request can't silently escape a bare-named per-model budget.
+            model: crate::llm::canonical_model(model),
+            team,
+        };
+        match engine.reserve(dims, estimate).await {
+            crate::budget::Reserved::Ok(reservation) => {
+                // Feed the near-limit gauge with each admitted budget's post-reserve consumption,
+                // and fire an alert (edge-triggered, fire-and-forget) when one crosses the threshold.
+                for obs in reservation.observations() {
+                    m.record_budget_consumed(&obs.name, obs.consumed_ratio);
+                    rt.alerts.fire_budget_alert(&obs.name, obs.consumed_ratio);
+                }
+                // Only non-zero on the fail-open path: a store error rolled back an earlier partial
+                // reservation before admitting anyway. Same drift signal as a failed reconcile/release.
+                m.record_budget_reconcile_failures(reservation.rollback_failures());
+                budget_guard = Some(ReservationGuard {
+                    engine: Arc::clone(engine),
+                    reservation: Some(reservation),
+                    metrics: Arc::clone(m),
+                });
+            }
+            crate::budget::Reserved::Denied(denial) => {
+                m.record_budget_blocked(denial.scope.label());
+                m.record_budget_reconcile_failures(denial.rollback_failures);
+                warn!(budget = %denial.name, scope = %denial.scope.label(), model = %model, client_ip = %ip, "LLM request denied: budget exhausted");
+                // A cost cap answers 402 (Payment Required — the spend, not the rate, is the limit);
+                // a token cap answers 429 (Too Many Requests). Both carry the `over_budget` outcome.
+                let (status, body) = match denial.unit {
+                    crate::budget::BudgetUnit::UsdMicros => (
+                        StatusCode::PAYMENT_REQUIRED,
+                        "Payment Required: budget exhausted",
+                    ),
+                    crate::budget::BudgetUnit::Tokens => {
+                        (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests")
+                    }
+                };
+                return finish(
+                    m,
+                    &rid,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "over_budget",
+                    text(status, body),
+                );
+            }
+            crate::budget::Reserved::Error { rollback_failures } => {
+                m.record_budget_reconcile_failures(rollback_failures);
+                return finish(
+                    m,
+                    &rid,
+                    &method,
+                    &path,
+                    ip,
+                    started,
+                    "limiter_error",
+                    text(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable"),
+                );
+            }
+        }
+    }
+
     // 7) Build the upstream request (the per-path upstream override, or the default).
     let uri = format!("{}{}", rt.pick_upstream(&path), path);
     let mut up = Request::builder().method(parts.method.clone()).uri(&uri);
@@ -500,6 +856,10 @@ async fn handle_inner(
         // forwarding, so they don't leak across the proxy boundary.
         let mut forwarded = parts.headers.clone();
         strip_hop_by_hop(&mut forwarded);
+        // The body is re-sent from a sized `Full`, so the client's Content-Length may be stale (it
+        // is once DLP redaction rewrote the body). Drop it and let the upstream client recompute the
+        // correct length from the body, rather than forwarding a mismatched header.
+        forwarded.remove(header::CONTENT_LENGTH);
         for (name, value) in forwarded.iter() {
             if name == header::HOST {
                 continue; // let the client set Host for the upstream
@@ -518,7 +878,21 @@ async fn handle_inner(
         if let Ok(v) = HeaderValue::from_str(&rid) {
             headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), v);
         }
+        // L2 key vault: replace the client's `Authorization` (which carried the virtual key) with the
+        // mapped provider key. The provider secret only ever travels edge→upstream — never back to
+        // the client — and the client's virtual key never reaches the upstream. The value was
+        // already validated as a legal HeaderValue when upstream_auth was set above.
+        if let Some(v) = upstream_auth {
+            headers.insert(header::AUTHORIZATION, v);
+        }
     }
+
+    // Content capture (gateway L4): grab the request body for the emitted span *before* it is
+    // forwarded and consumed. `body_bytes` is already the DLP-redacted/masked form at this point;
+    // `capture_for_span` additionally scans+redacts so capture is safe under any DLP mode. Only when
+    // telemetry + content capture are both on; `None` otherwise (no cost when off).
+    let telem_input: Option<String> = (rt.telemetry.enabled && rt.telemetry.capture_content)
+        .then(|| capture_for_span(rt.dlp.as_ref(), &body_bytes, rt.telemetry.max_content_bytes));
 
     let upstream_req = match up.body(Full::new(body_bytes)) {
         Ok(r) => r,
@@ -583,15 +957,89 @@ async fn handle_inner(
     //     body-read deadline don't apply — the connect/first-byte `upstream_timeout` already
     //     bounded time-to-headers — and egress bytes are tallied by `CountingBody` as frames flow.
     //     Response hardening is headers-only, so it stays correct on a streaming body.
-    if rt.stream_passthrough && is_event_stream(&resp_parts.headers) {
+    //
+    //     Carve-out: when outbound DLP is in `block` mode, streaming can't fail closed — frames would
+    //     reach the client before the body could be judged, and a stream can't be un-sent. So skip
+    //     passthrough and fall through to the buffered path (bounded by `max_response_body`), which
+    //     applies the same block enforcement to `text/event-stream` bodies as to any other response.
+    //     Block-mode operators trade incremental delivery for the fail-closed contract they configured;
+    //     `report`/`redact` still stream (redaction rewrites frames inline as they flow).
+    let dlp_blocks_response = rt
+        .dlp
+        .as_ref()
+        .is_some_and(|d| d.scan_response() && matches!(d.mode(), crate::dlp::DlpMode::Block));
+    if rt.stream_passthrough && is_event_stream(&resp_parts.headers) && !dlp_blocks_response {
         strip_hop_by_hop(&mut resp_parts.headers);
         resp_parts.headers.remove(header::CONTENT_LENGTH);
         let header_egress = header_bytes(&resp_parts.headers);
+        // LLM metering on the streamed path: capture the stream tail so the terminal `usage` frame
+        // can be parsed when the body finishes (see `CountingBody`'s `Drop`). The L1 budget
+        // reservation rides along — moved out of the guard so the guard's Drop won't release it; the
+        // body's Drop reconciles it to the streamed usage (or releases on no usage) instead.
+        let llm_meter = llm_model.as_ref().map(|model| {
+            let (engine, reservation) = match budget_guard.take() {
+                Some(mut g) => (Some(g.engine.clone()), g.reservation.take()),
+                None => (None, None),
+            };
+            // Telemetry span context: built only when emission is on (avoids a per-request UUID
+            // otherwise). Carries an inbound `traceparent` so the gateway span stitches under the app.
+            let (telemetry, ctx) = if rt.telemetry.enabled {
+                (
+                    Some(Arc::clone(&rt.telemetry)),
+                    crate::telemetry::TraceContext::from_traceparent(traceparent.as_deref()),
+                )
+            } else {
+                (None, crate::telemetry::TraceContext::from_traceparent(None))
+            };
+            LlmStreamMeter {
+                model: model.clone(),
+                llm: Arc::clone(&rt.llm),
+                tail: Vec::new(),
+                engine,
+                reservation,
+                started,
+                first_at: None,
+                last_at: None,
+                telemetry,
+                ctx,
+                input: telem_input.clone(),
+                team: llm_team.clone(),
+                key: principal.clone(),
+            }
+        });
+        // Reversible unmasking (gateway L3): when active, the stream is *unmasked* back to the caller's
+        // own values from the inbound mask map — the provider only ever saw placeholders. This
+        // replaces the outbound DLP scan on the streamed path (restore, not re-detect).
+        let reversible_stream = rt.dlp.as_ref().is_some_and(|d| d.reversible());
+        // Edge-DLP scan over the streamed response. Counts findings (report); additionally rewrites
+        // frames when `redact` + `stream_redact` are on (deterministic spans only, NER stays off the
+        // stream). Built when DLP is on and response scanning is enabled — but not in reversible mode,
+        // where the unmasker below takes over the stream.
+        let dlp_scanner = if reversible_stream {
+            None
+        } else {
+            rt.dlp
+                .as_ref()
+                .filter(|d| d.scan_response())
+                .map(|d| DlpStreamScanner {
+                    engine: Arc::clone(d),
+                    metrics: Arc::clone(m),
+                    redact: d.stream_redact(),
+                    carry: Vec::new(),
+                })
+        };
+        let unmasker = reversible_stream.then(|| UnmaskStreamState {
+            map: std::mem::take(&mut mask_map),
+            carry: Vec::new(),
+        });
         let body = Body::new(CountingBody::new(
             resp_body,
             Arc::clone(m),
             ingress_bytes,
             header_egress,
+            llm_meter,
+            dlp_scanner,
+            unmasker,
         ));
         let mut response = Response::from_parts(resp_parts, body);
         harden_response(&rt.cfg, &mut response);
@@ -600,7 +1048,7 @@ async fn handle_inner(
     }
 
     // Buffer the upstream body, optionally capped so a huge response can't OOM the proxy.
-    let resp_bytes = if rt.max_response_body > 0 {
+    let mut resp_bytes = if rt.max_response_body > 0 {
         match within(
             deadline,
             Limited::new(resp_body, rt.max_response_body).collect(),
@@ -679,6 +1127,134 @@ async fn handle_inner(
         ingress_bytes,
         header_bytes(&resp_parts.headers).saturating_add(resp_bytes.len()),
     );
+
+    // LLM token metering on the buffered (non-streaming) path: read the upstream's own `usage`
+    // object. Priced model -> tokens + cost; unmapped model -> tokens only; no usage -> just count
+    // the request. Best-effort and observe-only — never affects the response.
+    if let Some(model) = &llm_model {
+        let usage = if is_event_stream(&resp_parts.headers) {
+            crate::llm::parse_sse_usage(&resp_bytes)
+        } else {
+            crate::llm::parse_response_usage(&resp_bytes)
+        };
+        let actual = match usage {
+            Some(usage) => {
+                let cost = rt.llm.cost_micros(model, &usage);
+                let sample = crate::metrics::LlmSample {
+                    tokens_in: usage.prompt_tokens,
+                    tokens_out: usage.completion_tokens,
+                    cached_tokens: usage.cached_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
+                    cost_micros: cost,
+                };
+                m.record_llm_usage(model, sample);
+                m.record_llm_team_usage(llm_team.as_deref().unwrap_or("_none"), &sample);
+                m.record_llm_key_usage(principal.as_deref().unwrap_or("_anon"), &sample);
+                // Emit an OpenInference span for this (buffered) request — gateway L4,
+                // fire-and-forget. No TTFT/TPOT on the non-streaming path. When content capture is on,
+                // attach the redacted request (captured pre-forward) + redacted response body. At this
+                // point `resp_bytes` is pre-unmask/pre-outbound-redaction, so `capture_for_span` does
+                // the redaction so no PII/secret is stored regardless of DLP mode.
+                if rt.telemetry.enabled {
+                    let (start_nanos, end_nanos) = wall_clock_span(started);
+                    let output = rt.telemetry.capture_content.then(|| {
+                        capture_for_span(
+                            rt.dlp.as_ref(),
+                            &resp_bytes,
+                            rt.telemetry.max_content_bytes,
+                        )
+                    });
+                    rt.telemetry.emit(crate::telemetry::SpanRecord {
+                        ctx: crate::telemetry::TraceContext::from_traceparent(
+                            traceparent.as_deref(),
+                        ),
+                        name: "llm.chat".into(),
+                        model: model.clone(),
+                        provider: None,
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        cached_tokens: usage.cached_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        cost_micros: cost,
+                        start_unix_nano: start_nanos,
+                        end_unix_nano: end_nanos,
+                        ttft: None,
+                        tpot: None,
+                        status_ok: resp_parts.status.is_success(),
+                        input: telem_input.clone(),
+                        output,
+                        session_id: None,
+                    });
+                }
+                crate::budget::Spend {
+                    tokens: usage.total_tokens(),
+                    cost_micros: cost.unwrap_or(0),
+                }
+            }
+            None => {
+                m.record_llm_no_usage();
+                crate::budget::Spend::default()
+            }
+        };
+        // Reconcile the L1 budget reservation to actual spend (releases the over-estimate, or charges
+        // a low one). `commit` consumes the guard so its Drop won't also release.
+        if let Some(guard) = budget_guard.take() {
+            guard.commit(actual).await;
+        }
+    }
+
+    // Reversible unmasking (gateway L3): when reversible masking is active, the response is *restored*
+    // to the caller's own values from the inbound mask map — the provider only ever saw placeholders.
+    // This replaces the outbound scan/redact (the goal is restoration, not re-detection), so it runs
+    // instead of the block below.
+    let reversible_active = rt.dlp.as_ref().is_some_and(|d| d.reversible());
+    if reversible_active {
+        if !mask_map.is_empty() {
+            let restored = mask_map.unmask(&String::from_utf8_lossy(&resp_bytes));
+            resp_bytes = Bytes::from(restored);
+        }
+    } else if let Some(dlp) = rt.dlp.as_ref() {
+        // LLM edge DLP (gateway L3) — outbound completion (buffered path only; the streamed path scans
+        // frame-by-frame in `CountingBody`). `block` withholds the body, `redact` rewrites it, `report`
+        // logs + counts. Runs after usage metering so token accounting reads the original `usage`.
+        if dlp.scan_response() {
+            let body_text = String::from_utf8_lossy(&resp_bytes);
+            let findings = dlp.scan(&body_text);
+            if !findings.is_empty() {
+                for f in &findings {
+                    m.record_dlp_finding(f.category);
+                }
+                match dlp.mode() {
+                    crate::dlp::DlpMode::Block => {
+                        m.record_dlp_blocked();
+                        warn!(
+                            findings = findings.len(),
+                            "DLP withheld response body (outbound PII/secret)"
+                        );
+                        resp_parts.status = StatusCode::FORBIDDEN;
+                        resp_bytes =
+                            Bytes::from_static(b"{\"error\":\"response withheld by DLP policy\"}");
+                        resp_parts.headers.remove(header::CONTENT_TYPE);
+                        resp_parts.headers.insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
+                    }
+                    crate::dlp::DlpMode::Redact => {
+                        warn!(findings = findings.len(), "DLP redacted response body");
+                        resp_bytes = Bytes::from(dlp.redact(&body_text, &findings));
+                    }
+                    crate::dlp::DlpMode::Report => {
+                        warn!(
+                            findings = findings.len(),
+                            "DLP findings in response (report-only)"
+                        )
+                    }
+                    crate::dlp::DlpMode::Off => {}
+                }
+            }
+        }
+    }
 
     let mut response = Response::from_parts(resp_parts, Body::from(resp_bytes));
     harden_response(&rt.cfg, &mut response);
@@ -1041,15 +1617,217 @@ struct CountingBody<B> {
     ingress: usize,
     /// Running egress total: response header bytes, then each data frame as it passes.
     egress: usize,
+    /// LLM token metering for a streamed response, when `[llm]` is on and this is an LLM request.
+    llm: Option<LlmStreamMeter>,
+    /// Edge-DLP scanner for the streamed response (gateway L3): counts findings, and in
+    /// `redact` + `stream_redact` mode rewrites the emitted bytes (deterministic spans only).
+    dlp: Option<DlpStreamScanner>,
+    /// Reversible unmask over the streamed response (gateway L3): restores placeholders to the
+    /// caller's own values, carrying a boundary tail so a placeholder split across frames unmasks
+    /// whole. Present only when reversible masking is active; mutually exclusive with `dlp` redaction.
+    unmask: Option<UnmaskStreamState>,
+    /// A non-data (trailers) frame held back so the redaction flush is emitted *before* it, then
+    /// returned on the next poll. Keeps trailers last even when a buffered redaction tail remains.
+    pending: Option<Frame<Bytes>>,
+}
+
+/// Streaming reversible-unmask state: the per-request mask map + the held-back boundary tail.
+struct UnmaskStreamState {
+    map: crate::dlp::MaskMap,
+    carry: Vec<u8>,
+}
+
+/// Carry-buffer size for streaming DLP: the last bytes of each frame are kept and prepended to the
+/// next, so a secret/PII token split across two SSE frames is still detected. Sized above the
+/// longest signature (private-key header, provider keys).
+const DLP_STREAM_CARRY: usize = 256;
+
+/// Scans a streamed response frame-by-frame for DLP findings, carrying a tail across frame
+/// boundaries so a split token is still caught. Uses the engine's **deterministic** scan only
+/// (`scan_stream`): the ML NER family never runs on the stream. In `report` mode it counts findings;
+/// in `redact` mode (when `[llm.dlp].stream_redact` is on) it rewrites the emitted bytes, holding back
+/// the boundary tail so a span straddling a frame is redacted whole on the next frame / final flush.
+struct DlpStreamScanner {
+    engine: Arc<crate::dlp::DlpEngine>,
+    metrics: Arc<Metrics>,
+    /// True when the stream should be rewritten (redact mode + stream_redact), not merely counted.
+    redact: bool,
+    /// Report mode: trailing bytes of the previous frame, prepended to the next scan (split-token
+    /// detection). Redact mode: the un-emitted tail held back so a boundary-straddling span waits.
+    carry: Vec<u8>,
+}
+
+impl DlpStreamScanner {
+    /// Report mode: scan one frame (prepended with the carry), counting only findings that touch the
+    /// new data (so a span already counted from the carry isn't double-counted), then refresh the carry.
+    fn record_only(&mut self, data: &[u8]) {
+        let carry_len = self.carry.len();
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend_from_slice(data);
+        let text = String::from_utf8_lossy(&buf);
+        for f in self.engine.scan_stream(&text) {
+            // Count a finding once, when its span reaches into the newly-arrived bytes.
+            if f.end > carry_len {
+                self.metrics.record_dlp_finding(f.category);
+            }
+        }
+        // Keep the last DLP_STREAM_CARRY bytes for the next frame's boundary check.
+        let keep = buf.len().min(DLP_STREAM_CARRY);
+        self.carry = buf.split_off(buf.len() - keep);
+    }
+
+    /// Redact mode: append `data` to the held-back carry, redact every deterministic span that ends
+    /// before the boundary tail, and return the bytes to emit now (the rest waits in `carry`). A span
+    /// straddling the boundary pulls the emit point back to its start so it is never split.
+    fn redact_frame(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.carry);
+        buf.extend_from_slice(data);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let findings = self.engine.scan_stream(&text);
+        // Hold back the last DLP_STREAM_CARRY bytes; never emit past a span that crosses the boundary.
+        let mut emit_to = text.len().saturating_sub(DLP_STREAM_CARRY);
+        for f in &findings {
+            if f.start < emit_to && f.end > emit_to {
+                emit_to = f.start;
+            }
+        }
+        while emit_to > 0 && !text.is_char_boundary(emit_to) {
+            emit_to -= 1;
+        }
+        let emit: Vec<crate::dlp::Finding> =
+            findings.into_iter().filter(|f| f.end <= emit_to).collect();
+        for f in &emit {
+            self.metrics.record_dlp_finding(f.category);
+        }
+        let out = self.engine.redact(&text[..emit_to], &emit).into_bytes();
+        self.carry = text.as_bytes()[emit_to..].to_vec();
+        out
+    }
+
+    /// Redact mode: at end-of-stream, redact and return whatever remains in the held-back tail.
+    fn flush(&mut self) -> Vec<u8> {
+        if self.carry.is_empty() {
+            return Vec::new();
+        }
+        let buf = std::mem::take(&mut self.carry);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let findings = self.engine.scan_stream(&text);
+        for f in &findings {
+            self.metrics.record_dlp_finding(f.category);
+        }
+        self.engine.redact(&text, &findings).into_bytes()
+    }
+}
+
+/// Cap on the rolling tail buffer kept for SSE token metering. The OpenAI terminal `usage` frame is
+/// small and arrives just before `[DONE]`, so the last 16 KiB always contains it; bounding the
+/// buffer keeps streaming memory flat regardless of stream length.
+const LLM_SSE_TAIL_CAP: usize = 16 * 1024;
+
+/// Accumulates the tail of an SSE stream so the terminal `usage` frame can be parsed when the body
+/// finishes. Holds the model + price book; records to metrics and reconciles the L1 budget on drop.
+struct LlmStreamMeter {
+    model: String,
+    llm: Arc<crate::llm::LlmRuntime>,
+    tail: Vec<u8>,
+    /// L1 budget engine + the held reservation, when budgets are configured. Reconciled to the
+    /// streamed usage on drop (or released on no usage).
+    engine: Option<Arc<crate::budget::BudgetEngine>>,
+    reservation: Option<crate::budget::Reservation>,
+    /// Request-receipt instant, the TTFT clock's zero. TTFT = first streamed frame − `started`.
+    started: Instant,
+    /// When the first / most-recent data frame was emitted to the client. TPOT is derived from the
+    /// span between them and the terminal `usage` output-token count. `None` until the first frame.
+    first_at: Option<Instant>,
+    last_at: Option<Instant>,
+    /// OTLP span emission for the streamed request (gateway L4), when `[llm.telemetry]` is on. On
+    /// drop, the finalized usage + TTFT/TPOT are emitted as one OpenInference span. `None` when off.
+    telemetry: Option<Arc<crate::telemetry::TelemetryRuntime>>,
+    /// The trace context for the emitted span (carries an inbound `traceparent` when present).
+    ctx: crate::telemetry::TraceContext,
+    /// Captured (DLP-redacted) request body for the span's `input.value`, when content capture is on.
+    /// The streamed *output* isn't buffered (SSE is forwarded frame-by-frame), so only input is set.
+    input: Option<String>,
+    /// Team/tag for the per-team token/cost metric on drop (absent → `_none`).
+    team: Option<String>,
+    /// Authenticated principal for the per-key token/cost metric on drop (absent → `_anon`).
+    key: Option<String>,
+}
+
+/// Holds an LLM budget reservation for the buffered/non-streaming path. `commit` reconciles it to
+/// the actual spend; if the guard is dropped without committing (any early return on an upstream
+/// error / timeout), its `Drop` releases the reservation in full, so a failed request never
+/// permanently consumes budget.
+struct ReservationGuard {
+    engine: Arc<crate::budget::BudgetEngine>,
+    reservation: Option<crate::budget::Reservation>,
+    /// For recording reconcile/release failures (counter drift) to Prometheus.
+    metrics: Arc<Metrics>,
+}
+
+impl ReservationGuard {
+    /// Reconcile the held reservation to `actual` spend (consuming the guard so `Drop` is a no-op).
+    async fn commit(mut self, actual: crate::budget::Spend) {
+        if let Some(reservation) = self.reservation.take() {
+            let failed = self.engine.reconcile(&reservation, actual).await;
+            self.metrics.record_budget_reconcile_failures(failed);
+        }
+    }
+}
+
+impl Drop for ReservationGuard {
+    fn drop(&mut self) {
+        // Not committed (an error path bailed before reconcile): release the whole hold. `release`
+        // is async, so spawn it onto the current runtime (we're always inside the request task).
+        if let Some(reservation) = self.reservation.take() {
+            let engine = Arc::clone(&self.engine);
+            let metrics = Arc::clone(&self.metrics);
+            tokio::spawn(async move {
+                let failed = engine.release(&reservation).await;
+                metrics.record_budget_reconcile_failures(failed);
+            });
+        }
+    }
 }
 
 impl<B> CountingBody<B> {
-    fn new(inner: B, metrics: Arc<Metrics>, ingress: usize, header_egress: usize) -> Self {
+    fn new(
+        inner: B,
+        metrics: Arc<Metrics>,
+        ingress: usize,
+        header_egress: usize,
+        llm: Option<LlmStreamMeter>,
+        dlp: Option<DlpStreamScanner>,
+        unmask: Option<UnmaskStreamState>,
+    ) -> Self {
         Self {
             inner,
             metrics,
             ingress,
             egress: header_egress,
+            llm,
+            dlp,
+            unmask,
+            pending: None,
+        }
+    }
+
+    /// Append the bytes the client will actually receive to the bounded LLM tail buffer (keeping only
+    /// the last [`LLM_SSE_TAIL_CAP`] bytes), so the terminal `usage` frame is available to parse on drop.
+    fn push_meter_tail(&mut self, data: &[u8]) {
+        if let Some(meter) = self.llm.as_mut() {
+            // Stamp first/last emitted-frame time for TTFT/TPOT (this runs on the bytes the client
+            // actually receives, so it measures server-side time-to-first-token with no client clock).
+            if !data.is_empty() {
+                let now = Instant::now();
+                meter.first_at.get_or_insert(now);
+                meter.last_at = Some(now);
+            }
+            meter.tail.extend_from_slice(data);
+            if meter.tail.len() > LLM_SSE_TAIL_CAP {
+                let drop_n = meter.tail.len() - LLM_SSE_TAIL_CAP;
+                meter.tail.drain(..drop_n);
+            }
         }
     }
 }
@@ -1066,16 +1844,114 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.as_mut().get_mut();
-        let polled = Pin::new(&mut this.inner).poll_frame(cx);
-        if let Poll::Ready(Some(Ok(frame))) = &polled {
-            if let Some(data) = frame.data_ref() {
-                this.egress = this.egress.saturating_add(data.len());
-            }
+        // A trailers frame held back during a redaction flush is emitted now, before anything else.
+        if let Some(frame) = this.pending.take() {
+            return Poll::Ready(Some(Ok(frame)));
         }
-        polled
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                // Only data frames are scanned/redacted; trailers and the like pass through — but in
+                // redact mode any buffered tail must be flushed *before* the trailers go out.
+                let data = match frame.into_data() {
+                    Ok(data) => data,
+                    Err(non_data) => {
+                        if let Some(scanner) = this.dlp.as_mut() {
+                            if scanner.redact {
+                                let out = scanner.flush();
+                                if !out.is_empty() {
+                                    let out = Bytes::from(out);
+                                    this.egress = this.egress.saturating_add(out.len());
+                                    this.push_meter_tail(&out);
+                                    this.pending = Some(non_data); // emit trailers on the next poll
+                                    return Poll::Ready(Some(Ok(Frame::data(out))));
+                                }
+                            }
+                        }
+                        // Reversible unmask: flush the held-back tail before the trailers go out.
+                        if let Some(u) = this.unmask.as_mut() {
+                            let out = u.map.flush_unmask(&mut u.carry);
+                            if !out.is_empty() {
+                                let out = Bytes::from(out);
+                                this.egress = this.egress.saturating_add(out.len());
+                                this.push_meter_tail(&out);
+                                this.pending = Some(non_data);
+                                return Poll::Ready(Some(Ok(Frame::data(out))));
+                            }
+                        }
+                        return Poll::Ready(Some(Ok(non_data)));
+                    }
+                };
+                // Reversible unmask (gateway L3): restore placeholders to the caller's own values,
+                // holding a boundary tail so a placeholder split across frames unmasks whole.
+                if let Some(u) = this.unmask.as_mut() {
+                    let out = Bytes::from(u.map.unmask_stream(&mut u.carry, &data));
+                    this.egress = this.egress.saturating_add(out.len());
+                    this.push_meter_tail(&out);
+                    return Poll::Ready(Some(Ok(Frame::data(out))));
+                }
+                if this.dlp.as_ref().is_some_and(|s| s.redact) {
+                    // Redact mode: rewrite the emitted bytes (deterministic spans only). The emitted
+                    // length may differ from the input frame; account for the bytes the client gets.
+                    let out = Bytes::from(this.dlp.as_mut().unwrap().redact_frame(&data));
+                    this.egress = this.egress.saturating_add(out.len());
+                    this.push_meter_tail(&out);
+                    Poll::Ready(Some(Ok(Frame::data(out))))
+                } else {
+                    this.egress = this.egress.saturating_add(data.len());
+                    this.push_meter_tail(&data);
+                    // Report mode (or no redaction): count findings, pass the frame through unchanged.
+                    if let Some(scanner) = this.dlp.as_mut() {
+                        scanner.record_only(&data);
+                    }
+                    Poll::Ready(Some(Ok(Frame::data(data))))
+                }
+            }
+            Poll::Ready(None) => {
+                // Upstream ended. In redact mode, flush the held-back tail as one final data frame
+                // (the next poll sees inner-end again and returns None).
+                if let Some(scanner) = this.dlp.as_mut() {
+                    if scanner.redact {
+                        let out = scanner.flush();
+                        if !out.is_empty() {
+                            let out = Bytes::from(out);
+                            this.egress = this.egress.saturating_add(out.len());
+                            this.push_meter_tail(&out);
+                            return Poll::Ready(Some(Ok(Frame::data(out))));
+                        }
+                    }
+                }
+                // Reversible unmask: flush the held-back tail as one final data frame.
+                if let Some(u) = this.unmask.as_mut() {
+                    let out = u.map.flush_unmask(&mut u.carry);
+                    if !out.is_empty() {
+                        let out = Bytes::from(out);
+                        this.egress = this.egress.saturating_add(out.len());
+                        this.push_meter_tail(&out);
+                        return Poll::Ready(Some(Ok(Frame::data(out))));
+                    }
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn is_end_stream(&self) -> bool {
+        // Not done while a held-back trailers frame, or a buffered redaction tail, still has to flow.
+        if self.pending.is_some() {
+            return false;
+        }
+        if let Some(scanner) = self.dlp.as_ref() {
+            if scanner.redact && !scanner.carry.is_empty() {
+                return false;
+            }
+        }
+        if let Some(u) = self.unmask.as_ref() {
+            if !u.carry.is_empty() {
+                return false;
+            }
+        }
         self.inner.is_end_stream()
     }
 
@@ -1087,7 +1963,124 @@ where
 impl<B> Drop for CountingBody<B> {
     fn drop(&mut self) {
         self.metrics.add_usage_bytes(self.ingress, self.egress);
+        // LLM metering for the streamed body: parse the terminal `usage` frame from the tail. The
+        // client gets usage only if it sent `stream_options.include_usage`; otherwise `no_usage`.
+        if let Some(meter) = self.llm.as_mut() {
+            let actual = match crate::llm::parse_sse_usage(&meter.tail) {
+                Some(usage) => {
+                    let cost = meter.llm.cost_micros(&meter.model, &usage);
+                    let sample = crate::metrics::LlmSample {
+                        tokens_in: usage.prompt_tokens,
+                        tokens_out: usage.completion_tokens,
+                        cached_tokens: usage.cached_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        cost_micros: cost,
+                    };
+                    self.metrics.record_llm_usage(&meter.model, sample);
+                    self.metrics
+                        .record_llm_team_usage(meter.team.as_deref().unwrap_or("_none"), &sample);
+                    self.metrics
+                        .record_llm_key_usage(meter.key.as_deref().unwrap_or("_anon"), &sample);
+                    // Server-side TTFT/TPOT from the emitted-frame timestamps. TPOT (inter-token
+                    // latency) is only defined for >1 output token; a single-token response records
+                    // TTFT alone; an empty stream records neither.
+                    let (ttft, tpot) = match meter.first_at {
+                        Some(first) => {
+                            let ttft = first.saturating_duration_since(meter.started);
+                            let tpot = match meter.last_at {
+                                Some(last) if usage.completion_tokens > 1 => {
+                                    let denom =
+                                        (usage.completion_tokens - 1).min(u32::MAX as u64) as u32;
+                                    Some(last.saturating_duration_since(first) / denom)
+                                }
+                                _ => None,
+                            };
+                            (Some(ttft), tpot)
+                        }
+                        None => (None, None),
+                    };
+                    if let Some(ttft) = ttft {
+                        self.metrics.record_llm_latency(ttft, tpot);
+                    }
+                    // Emit an OpenInference span for the streamed request (gateway L4, fire-and-forget).
+                    if let Some(telemetry) = meter.telemetry.as_ref() {
+                        let (start_nanos, end_nanos) = wall_clock_span(meter.started);
+                        telemetry.emit(crate::telemetry::SpanRecord {
+                            ctx: meter.ctx,
+                            name: "llm.chat".into(),
+                            model: meter.model.clone(),
+                            provider: None,
+                            prompt_tokens: usage.prompt_tokens,
+                            completion_tokens: usage.completion_tokens,
+                            cached_tokens: usage.cached_tokens,
+                            reasoning_tokens: usage.reasoning_tokens,
+                            cost_micros: cost,
+                            start_unix_nano: start_nanos,
+                            end_unix_nano: end_nanos,
+                            ttft,
+                            tpot,
+                            status_ok: true, // a streamed body means the upstream 2xx already began
+                            input: meter.input.take(),
+                            output: None, // streamed output isn't buffered (forwarded frame-by-frame)
+                            session_id: None,
+                        });
+                    }
+                    crate::budget::Spend {
+                        tokens: usage.total_tokens(),
+                        cost_micros: cost.unwrap_or(0),
+                    }
+                }
+                None => {
+                    self.metrics.record_llm_no_usage();
+                    crate::budget::Spend::default()
+                }
+            };
+            // Reconcile the L1 budget reservation to the streamed actual spend. Async, so spawn it
+            // (we're inside the request task's runtime when the body is dropped). Record any settle
+            // failure as counter drift.
+            if let (Some(engine), Some(reservation)) =
+                (meter.engine.take(), meter.reservation.take())
+            {
+                let metrics = Arc::clone(&self.metrics);
+                tokio::spawn(async move {
+                    let failed = engine.reconcile(&reservation, actual).await;
+                    metrics.record_budget_reconcile_failures(failed);
+                });
+            }
+        }
     }
+}
+
+/// Prepare captured LLM content (`input.value` / `output.value`) for a telemetry span: truncate to
+/// the cap, and when a DLP engine is configured, scan+redact so PII/secrets never leave the box —
+/// **regardless of the DLP `mode`**, so content capture is safe even under `report`/`block` (which
+/// don't rewrite the body). Without a DLP engine the content is captured as-is (an explicit
+/// `capture_content` opt-in). Returns `None` only when capture is off (handled by the caller).
+fn capture_for_span(dlp: Option<&Arc<crate::dlp::DlpEngine>>, bytes: &[u8], max: usize) -> String {
+    let text = crate::telemetry::prepare_content(bytes, max);
+    match dlp {
+        Some(dlp) => {
+            let findings = dlp.scan(&text);
+            if findings.is_empty() {
+                text
+            } else {
+                dlp.redact(&text, &findings)
+            }
+        }
+        None => text,
+    }
+}
+
+/// Derive wall-clock (unix-nanos) span bounds from a monotonic request-start `Instant`. An `Instant`
+/// can't be converted to a unix time directly, so we anchor the end at `SystemTime::now()` and
+/// subtract the measured elapsed duration for the start. Used to timestamp emitted OTLP spans.
+fn wall_clock_span(started: Instant) -> (u64, u64) {
+    let end = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let start = end.saturating_sub(started.elapsed().as_nanos() as u64);
+    (start, end)
 }
 
 /// Remove hop-by-hop headers so they don't leak across the proxy boundary (RFC 7230 §6.1):
@@ -1221,7 +2214,11 @@ fn harden_response(cfg: &Config, resp: &mut Response<Body>) {
             h.remove(header::SET_COOKIE);
             for c in cookies {
                 if let Ok(s) = c.to_str() {
-                    let hardened = harden_cookie(s);
+                    // HttpOnly is added unless globally disabled or this cookie's name is
+                    // exempt — the latter keeps a double-submit CSRF cookie JS-readable.
+                    let add_httponly = cfg.headers.httponly_cookies
+                        && !cookie_name_exempt(s, &cfg.headers.httponly_cookie_exempt);
+                    let hardened = harden_cookie(s, add_httponly);
                     if let Ok(v) = HeaderValue::from_str(&hardened) {
                         h.append(header::SET_COOKIE, v);
                     }
@@ -1233,7 +2230,28 @@ fn harden_response(cfg: &Config, resp: &mut Response<Body>) {
     }
 }
 
-fn harden_cookie(cookie: &str) -> String {
+/// The cookie's NAME — the token before the first `=` of the `name=value` pair. Cookies are
+/// case-sensitive, so this is returned as-is (trimmed) for an exact exemption match.
+fn cookie_name(cookie: &str) -> &str {
+    cookie
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .split('=')
+        .next()
+        .unwrap_or("")
+        .trim()
+}
+
+/// True when this cookie's name is on the `httponly_cookie_exempt` allowlist.
+fn cookie_name_exempt(cookie: &str, exempt: &[String]) -> bool {
+    let name = cookie_name(cookie);
+    exempt.iter().any(|e| e == name)
+}
+
+/// Harden one `Set-Cookie` value: ensure `Secure` and a `SameSite` default, and add
+/// `HttpOnly` when `add_httponly` is set (the caller clears it for exempt cookies).
+fn harden_cookie(cookie: &str, add_httponly: bool) -> String {
     // Inspect attribute *names* (the tokens after the first `name=value` pair), not the
     // whole string — otherwise a value like `session=securetoken` would look like it
     // already carries `Secure` and we'd skip hardening it.
@@ -1248,7 +2266,7 @@ fn harden_cookie(cookie: &str) -> String {
     if !attrs.contains("secure") {
         out.push_str("; Secure");
     }
-    if !attrs.contains("httponly") {
+    if add_httponly && !attrs.contains("httponly") {
         out.push_str("; HttpOnly");
     }
     if !attrs.contains("samesite") {
@@ -1312,9 +2330,10 @@ fn finish(
     );
     metrics.record_request(outcome);
     metrics.observe_latency(elapsed);
-    // Managed mode: count every finished request (proxied or rejected) toward the usage delta.
-    // Cheap (two relaxed atomic adds) and inert unless a control plane drains it for reporting.
-    metrics.add_usage_request();
+    // Managed mode: count every finished request (proxied or rejected) toward the usage delta, and
+    // — when the edge denied it — the drainable `blocked` figure. Cheap (relaxed atomic adds) and
+    // inert unless a control plane drains it for reporting.
+    metrics.add_usage_request(outcome);
     resp
 }
 
@@ -1326,6 +2345,79 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(name, HeaderValue::from_str(value).unwrap());
         h
+    }
+
+    #[test]
+    fn capture_for_span_redacts_content_when_dlp_is_configured() {
+        // With a DLP engine, captured content is redacted before it can be emitted — even in
+        // `report` mode, which does not rewrite the forwarded body. This is the safety guarantee for
+        // gateway content capture (top-20 #14): PII/secrets never leave the box via a span.
+        let dlp = crate::dlp::DlpEngine::build(&crate::config::DlpCfg {
+            mode: "report".into(),
+            detect_email: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .map(Arc::new);
+        assert!(dlp.is_some(), "report mode should build a DLP engine");
+        let body = b"please email alice@example.com about the invoice";
+
+        let redacted = capture_for_span(dlp.as_ref(), body, 4096);
+        assert!(
+            !redacted.contains("alice@example.com"),
+            "email must be redacted before capture: {redacted}"
+        );
+
+        // Without a DLP engine, capture is verbatim (an explicit `capture_content` opt-in).
+        let raw = capture_for_span(None, body, 4096);
+        assert!(raw.contains("alice@example.com"));
+
+        // The size cap still applies to the captured content.
+        assert!(capture_for_span(None, body, 8).len() < body.len());
+    }
+
+    /// Drive a sequence of byte frames through a redact-mode `DlpStreamScanner` and return the
+    /// concatenated emitted output (frames + final flush) as a string.
+    fn run_stream_redact(frames: &[&[u8]]) -> String {
+        let engine = crate::dlp::DlpEngine::build(&crate::config::DlpCfg {
+            mode: "redact".into(),
+            stream_redact: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        let mut scanner = DlpStreamScanner {
+            engine: Arc::new(engine),
+            metrics: Arc::new(Metrics::new()),
+            redact: true,
+            carry: Vec::new(),
+        };
+        let mut out = Vec::new();
+        for f in frames {
+            out.extend_from_slice(&scanner.redact_frame(f));
+        }
+        out.extend_from_slice(&scanner.flush());
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn stream_redaction_redacts_pii_split_across_frames() {
+        // An email split across two SSE frames is still redacted whole (carry holds the boundary).
+        let out = run_stream_redact(&[b"hello jane.d", b"oe@example.com bye"]);
+        assert_eq!(out, "hello [REDACTED:email] bye");
+    }
+
+    #[test]
+    fn stream_redaction_passes_clean_text_unchanged() {
+        let out = run_stream_redact(&[b"the quick brown ", b"fox jumps over the lazy dog"]);
+        assert_eq!(out, "the quick brown fox jumps over the lazy dog");
+    }
+
+    #[test]
+    fn stream_redaction_handles_pii_at_end_via_flush() {
+        // PII entirely within the final held-back tail is redacted by the end-of-stream flush.
+        let out = run_stream_redact(&[b"ssn 123-45-6789"]);
+        assert_eq!(out, "ssn [REDACTED:ssn]");
     }
 
     #[test]
@@ -1466,7 +2558,7 @@ mod tests {
 
     #[test]
     fn harden_cookie_adds_missing_flags() {
-        let out = harden_cookie("sid=abc");
+        let out = harden_cookie("sid=abc", true);
         assert!(out.contains("; Secure"), "{out}");
         assert!(out.contains("; HttpOnly"), "{out}");
         assert!(out.contains("; SameSite=Lax"), "{out}");
@@ -1474,7 +2566,7 @@ mod tests {
 
     #[test]
     fn harden_cookie_preserves_existing_attributes() {
-        let out = harden_cookie("sid=abc; HttpOnly; SameSite=Strict");
+        let out = harden_cookie("sid=abc; HttpOnly; SameSite=Strict", true);
         assert!(out.contains("; Secure"), "{out}");
         assert!(out.contains("SameSite=Strict"), "{out}");
         // existing SameSite isn't overridden, HttpOnly isn't duplicated
@@ -1486,8 +2578,33 @@ mod tests {
     fn harden_cookie_value_resembling_an_attr_is_not_skipped() {
         // The value contains the substring "secure" but there is no Secure *attribute*;
         // it must still be added (regression guard for the token-vs-substring fix).
-        let out = harden_cookie("session=securetoken");
+        let out = harden_cookie("session=securetoken", true);
         assert!(out.contains("; Secure"), "{out}");
+    }
+
+    #[test]
+    fn harden_cookie_skips_httponly_when_disabled() {
+        // add_httponly=false → Secure + SameSite still added, but NOT HttpOnly. This is the
+        // path for a JS-readable double-submit CSRF cookie (e.g. doneyet_csrf).
+        let out = harden_cookie("doneyet_csrf=tok", false);
+        assert!(out.contains("; Secure"), "{out}");
+        assert!(out.contains("; SameSite=Lax"), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("httponly"), "{out}");
+    }
+
+    #[test]
+    fn cookie_name_exempt_matches_by_name_only() {
+        let exempt = vec!["doneyet_csrf".to_string()];
+        assert!(cookie_name_exempt(
+            "doneyet_csrf=abc; Path=/; Secure",
+            &exempt
+        ));
+        // a different cookie is not exempt; the value never triggers a match
+        assert!(!cookie_name_exempt(
+            "doneyet_auth=doneyet_csrf; Path=/",
+            &exempt
+        ));
+        assert!(!cookie_name_exempt("sid=x", &exempt));
     }
 
     #[test]

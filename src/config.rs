@@ -32,6 +32,347 @@ pub struct Config {
     /// Optional "managed mode": pull policy from / report metrics to a remote control plane. Off
     /// by default; the edge is a standalone proxy unless this is configured.
     pub control_plane: ControlPlaneCfg,
+    /// Optional LLM token metering (gateway L0). Off by default; when enabled, OpenAI-compatible
+    /// traffic is parsed to meter tokens + cost (metering only — never blocks). See [`LlmCfg`].
+    pub llm: LlmCfg,
+    /// Optional outbound alerting (gateway L4). Off by default; when enabled with a webhook, the
+    /// gateway fires a Slack-compatible alert when a hard budget nears its limit. See [`AlertsCfg`].
+    pub alerts: AlertsCfg,
+}
+
+/// Outbound alerting (`[alerts]`). When `enabled` with a `webhook_url`, EdgeGuard POSTs a
+/// Slack-compatible alert (`{ "text": … }`) when a hard-budget's consumed ratio (`used/limit`)
+/// crosses `budget_consumed_threshold` — cost-regression alerting entirely in your own VPC (no SaaS
+/// alerting plane; the confirmed Phoenix gap of gating alerting behind a paid cloud). Fire-and-forget
+/// and **edge-triggered** (one alert per crossing into the alert zone, not one per request). Off by
+/// default. A first cut on budget breaches; latency-percentile / error-rate / eval-drift rules follow.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AlertsCfg {
+    /// Master switch. Default false.
+    pub enabled: bool,
+    /// Slack incoming-webhook URL (or any endpoint accepting `{ "text": … }`). Required when enabled.
+    pub webhook_url: String,
+    /// Fire when a budget's consumed ratio (`used/limit`) reaches this (`0.0`–`1.0+`). Default `0.9`.
+    pub budget_consumed_threshold: f64,
+    /// Per-emit timeout for the background POST, in milliseconds. Default 2000.
+    pub timeout_ms: u64,
+}
+
+impl Default for AlertsCfg {
+    fn default() -> Self {
+        AlertsCfg {
+            enabled: false,
+            webhook_url: String::new(),
+            budget_consumed_threshold: 0.9,
+            timeout_ms: 2000,
+        }
+    }
+}
+
+/// LLM token-metering settings (`[llm]`). When `enabled`, the proxy parses OpenAI-compatible
+/// request/response bodies to count tokens (from the upstream's `usage` object) and, for any model
+/// listed in `[llm.models]`, the cost. Metering is observe-only: it never blocks or alters traffic.
+/// An unmapped model still has its tokens counted (cost is simply omitted).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LlmCfg {
+    pub enabled: bool,
+    /// Wire format. Only `"openai"` is understood today (the default).
+    pub api_style: String,
+    /// Per-model price book, keyed by the `model` string clients send. Prices are USD per
+    /// 1,000,000 tokens. Example:
+    /// `[llm.models."gpt-4o"]` `input_per_1m = 2.5` / `output_per_1m = 10.0`.
+    pub models: BTreeMap<String, ModelPrice>,
+    /// What to do with a request whose `model` is **not** in `[llm.models]`: `"count"` (default —
+    /// meter tokens, omit cost, forward the request) or `"block"` (reject `402` before it reaches the
+    /// upstream, so an unpriced model is never served at a silent `$0`). `"block"` only bites when a
+    /// price book is configured — a metering-only deployment (empty `[llm.models]`) never rejects.
+    pub on_unpriced_model: String,
+    /// Hard token/cost budgets (gateway L1). Empty by default (no enforcement — L0 metering only).
+    /// Each `[[llm.budgets]]` is a ceiling enforced fail-closed via reserve→reconcile. See [`BudgetCfg`].
+    pub budgets: Vec<BudgetCfg>,
+    /// Budget store backend: `"memory"` (single replica / default) or `"redis"` (shared across
+    /// replicas — required for a true fleet-wide cap). `"local"` is treated as `"memory"`.
+    pub store: String,
+    /// Redis URL when `store = "redis"`, e.g. `redis://127.0.0.1:6379`. Note: `EDGEGUARD_REDIS_URL`
+    /// only overrides `ratelimit.redis_url`, not this key — set it here (or via pushed policy).
+    pub redis_url: String,
+    /// Key prefix for budget keys in Redis (namespacing a shared server). Defaults to `edgeguard`.
+    pub redis_prefix: String,
+    /// On a budget-store error, allow the request (`true`) or reject it `503` (`false`, the default
+    /// — fail-closed, so an outage can't silently uncap spend).
+    pub fail_open: bool,
+    /// Completion tokens to assume when a request omits `max_tokens`, used only for the *reserve*
+    /// estimate (the reservation is reconciled to actual usage afterward). Default 1024.
+    pub default_max_tokens: u64,
+    /// Request header carrying the **team / tag** a request is attributed to, for the per-team budget
+    /// scope and team chargeback. Case-insensitive; default `x-edgeguard-team`. A request without it
+    /// falls into the shared `_none` team bucket.
+    pub team_header: String,
+    /// BYO-key vault + egress governance (gateway L2). Empty by default (no vault). Each
+    /// `[[llm.keys]]` maps a client-facing **virtual key** to a real **provider key** (injected
+    /// upstream, never returned to the client) plus an optional per-key model egress allowlist.
+    /// When any key is configured, every proxied request must present a known virtual key. See
+    /// [`KeyEntryCfg`].
+    pub keys: Vec<KeyEntryCfg>,
+    /// Edge DLP — PII / secret detection + redaction (gateway L3). Off by default. See [`DlpCfg`].
+    pub dlp: DlpCfg,
+    /// OTLP span emission (gateway L4) — SDK-free tracing to an OTel-native store. Off by default.
+    /// See [`TelemetryCfg`].
+    pub telemetry: TelemetryCfg,
+}
+
+/// OTLP span emission (`[llm.telemetry]`). When `enabled`, the gateway emits one OpenInference/OTLP
+/// span per metered LLM request to `endpoint` (an OTLP/HTTP `/v1/traces` receiver — e.g. evald),
+/// carrying the model, per-tier tokens, computed cost, and server-side TTFT/TPOT/latency already
+/// attached. Because the proxy sits in the request path, this needs **no** client SDK and is immune
+/// to the import-order / per-framework instrumentor drift that plagues in-process instrumentation.
+/// Emission is fire-and-forget — it never blocks or fails the client response. Off by default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TelemetryCfg {
+    /// Master switch. Default false.
+    pub enabled: bool,
+    /// OTLP/HTTP traces endpoint, e.g. `http://127.0.0.1:4318/v1/traces`. Required when `enabled`.
+    pub endpoint: String,
+    /// Fraction of LLM requests to emit a span for, `0.0`–`1.0` (deterministic per-trace sampling —
+    /// the same trace always gets the same verdict). Default `1.0` (all).
+    pub sample_rate: f64,
+    /// `service.name` resource attribute on emitted spans. Default `edgeguard`.
+    pub service_name: String,
+    /// Capture the (DLP-redacted) prompt/response as `input.value`/`output.value` on the span. Off by
+    /// default — content leaves the gateway only when this is explicitly enabled, and when an
+    /// `[llm.dlp]` engine is configured the captured content is redacted before it is emitted.
+    pub capture_content: bool,
+    /// Cap on each captured content field in bytes (truncated past this). Default 8192.
+    pub max_content_bytes: usize,
+    /// Per-emit timeout for the background POST, in milliseconds. Default 2000.
+    pub timeout_ms: u64,
+}
+
+impl Default for TelemetryCfg {
+    fn default() -> Self {
+        TelemetryCfg {
+            enabled: false,
+            endpoint: String::new(),
+            sample_rate: 1.0,
+            service_name: "edgeguard".into(),
+            capture_content: false,
+            max_content_bytes: 8192,
+            timeout_ms: 2000,
+        }
+    }
+}
+
+/// Edge-DLP settings (`[llm.dlp]`). When `mode` is not `off`, request and/or response bodies are
+/// scanned for PII and secrets; the `mode` decides what happens on a finding (report / block /
+/// redact). See [`crate::dlp`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DlpCfg {
+    /// `off` | `report` | `block` | `redact`. Default `off`.
+    pub mode: String,
+    /// How a span is rewritten in `redact` mode: `full` (`[REDACTED:<cat>]`, default) | `mask`
+    /// (keep last 4) | `hash` (stable opaque token). See [`crate::dlp::RedactStyle`].
+    pub redact_style: String,
+    /// Scan the inbound request body (the prompt). Default true.
+    pub scan_request: bool,
+    /// Scan the (buffered) response body and, in report mode, streamed frames. Default true.
+    pub scan_response: bool,
+    /// In `redact` mode, also rewrite *streamed* SSE frames (not just buffered bodies). Deterministic
+    /// detectors only — NER never runs on the stream. Off by default: streaming redaction can only
+    /// rewrite spans the carry buffer fully contains, so enable it deliberately. See [`crate::dlp`].
+    pub stream_redact: bool,
+    /// **Reversible masking** (`redact` mode only). When on, an inbound finding is replaced with a
+    /// stable placeholder token (`<edgeguard-<cat>-<n>>`) instead of an irreversible `[REDACTED]`
+    /// tag, and the placeholder→original map is kept for the request so the **response is unmasked**
+    /// (buffered *and* streamed) back to the original value. The provider never sees the PII; the
+    /// client gets its own data back — the round-trip `litellm#22821` gets wrong. Off by default.
+    /// When on, the response is unmasked rather than re-scanned/redacted (restore, not detect).
+    pub reversible: bool,
+    /// Built-in detectors.
+    pub detect_email: bool,
+    pub detect_credit_card: bool,
+    /// Require the Luhn checksum before flagging a digit run as a card (cuts false positives).
+    /// Default true.
+    pub luhn_validate_credit_card: bool,
+    /// AWS keys, provider-style `xx-…` keys, and private-key blocks.
+    pub detect_secrets: bool,
+    /// US SSN (`NNN-NN-NNNN`). Default true.
+    pub detect_ssn: bool,
+    /// Phone numbers. Off by default — false-positives on ordinary numeric runs.
+    pub detect_phone: bool,
+    /// IBAN account numbers. Off by default — false-positives on uppercase+digit tokens.
+    pub detect_iban: bool,
+    /// High-entropy token sweep (catch-all). Off by default — can false-positive.
+    pub detect_high_entropy: bool,
+    /// Prompt-injection / jailbreak heuristics for agent traffic (a small, high-precision built-in
+    /// deny set — "ignore previous instructions", "reveal your system prompt", etc.), reported under
+    /// the `prompt_injection` category. Off by default (opt-in, report-first) since instructions to a
+    /// model are legitimate traffic; enable and watch the counter before moving to `block`.
+    pub detect_prompt_injection: bool,
+    /// Minimum token length the entropy sweep considers.
+    pub entropy_min_len: usize,
+    /// Per-character Shannon-entropy threshold (bits) for the entropy sweep.
+    pub entropy_threshold: f64,
+    /// Dictionary deny-list: literal terms matched case-insensitively (Aho-Corasick), reported under
+    /// the `gazetteer` category. The fast, many-term path for known names / codenames / identifiers.
+    pub gazetteer_terms: Vec<String>,
+    /// Extra regexes (linear-time `regex` syntax), all reported under the `custom` category.
+    pub custom_patterns: Vec<String>,
+    /// Optional ML NER family (`[llm.dlp.ner]`). Requires the `ner` cargo feature; catches
+    /// person/address/org spans regex can't. See [`NerCfg`].
+    pub ner: NerCfg,
+}
+
+impl Default for DlpCfg {
+    fn default() -> Self {
+        DlpCfg {
+            mode: "off".into(),
+            redact_style: "full".into(),
+            scan_request: true,
+            scan_response: true,
+            stream_redact: false,
+            reversible: false,
+            detect_email: true,
+            detect_credit_card: true,
+            luhn_validate_credit_card: true,
+            detect_secrets: true,
+            detect_ssn: true,
+            detect_phone: false,
+            detect_iban: false,
+            detect_high_entropy: false,
+            detect_prompt_injection: false,
+            entropy_min_len: 24,
+            entropy_threshold: 4.0,
+            gazetteer_terms: Vec::new(),
+            custom_patterns: Vec::new(),
+            ner: NerCfg::default(),
+        }
+    }
+}
+
+/// ML NER settings (`[llm.dlp.ner]`). Off by default. When `enabled`, the proxy must be built with
+/// `--features ner`; otherwise startup fails with a clear error rather than running regex-only while
+/// the operator believes ML coverage is active. The model is an ONNX token-classification (BIO) NER
+/// network run through the pure-Rust [`edgeguard_ner`] crate.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NerCfg {
+    /// Turn the NER family on. Requires the `ner` feature.
+    pub enabled: bool,
+    /// Path to the ONNX model file.
+    pub model_path: String,
+    /// Path to the HuggingFace `tokenizer.json`.
+    pub tokenizer_path: String,
+    /// Per-class label list in model id order (e.g. `["O","B-PER","I-PER","B-LOC", …]`). Used to map
+    /// argmax class ids back to entity labels.
+    pub labels: Vec<String>,
+    /// Confidence floor in `[0.0, 1.0]`; spans below it are dropped. Default 0.5.
+    pub threshold: f32,
+    /// Max tokens fed to the model per scan (longer inputs are truncated). Default 256.
+    pub max_seq_len: usize,
+}
+
+impl Default for NerCfg {
+    fn default() -> Self {
+        NerCfg {
+            enabled: false,
+            model_path: String::new(),
+            tokenizer_path: String::new(),
+            labels: Vec::new(),
+            threshold: 0.5,
+            max_seq_len: 256,
+        }
+    }
+}
+
+impl Default for LlmCfg {
+    fn default() -> Self {
+        LlmCfg {
+            enabled: false,
+            api_style: "openai".into(),
+            models: BTreeMap::new(),
+            on_unpriced_model: "count".into(),
+            budgets: Vec::new(),
+            store: "memory".into(),
+            redis_url: String::new(),
+            redis_prefix: "edgeguard".into(),
+            fail_open: false,
+            default_max_tokens: 1024,
+            team_header: "x-edgeguard-team".into(),
+            keys: Vec::new(),
+            dlp: DlpCfg::default(),
+            telemetry: TelemetryCfg::default(),
+        }
+    }
+}
+
+/// One vault entry (`[[llm.keys]]`): a client-facing virtual key mapped to a real provider key and
+/// an optional model egress allowlist. The provider key is injected into the upstream `Authorization`
+/// and is **never** sent back to the client; the client only ever holds the virtual key.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct KeyEntryCfg {
+    /// The secret the client presents (`Authorization: Bearer <virtual_key>`). Required.
+    pub virtual_key: String,
+    /// The real upstream provider secret injected on the way out. Required. Prefer sourcing this
+    /// from a pushed control-plane policy / secret store rather than committing it.
+    pub provider_key: String,
+    /// Allowed model names for this key (egress allowlist). Empty = unrestricted; non-empty = only
+    /// these models may be requested (others get `403`).
+    pub allowed_models: Vec<String>,
+    /// Optional label for logs/metrics/audit (never the secret). Defaults to a positional id.
+    pub label: String,
+}
+
+/// One hard budget (`[[llm.budgets]]`): a ceiling of `limit` (in `unit`) over `window`, keyed by
+/// `scope`. Enforced fail-closed before the request reaches the upstream.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BudgetCfg {
+    /// Identifier (also the metric/log label and part of the store key). Required, non-empty.
+    pub name: String,
+    /// Keying dimension: `"global"`, `"key"` (per authenticated principal), or `"model"`.
+    pub scope: String,
+    /// `"tokens"` (prompt + completion) or `"usd"` (cost via the price book).
+    pub unit: String,
+    /// The ceiling, in `unit`: a token count, or — for `unit = "usd"` — dollars (e.g. `25.0`).
+    pub limit: f64,
+    /// Reset window, e.g. `"1h"`, `"24h"`, `"30d"`. The budget resets at each window boundary.
+    pub window: String,
+}
+
+impl Default for BudgetCfg {
+    fn default() -> Self {
+        BudgetCfg {
+            name: String::new(),
+            scope: "global".into(),
+            unit: "tokens".into(),
+            limit: 0.0,
+            window: "24h".into(),
+        }
+    }
+}
+
+/// One model's price, in USD per 1,000,000 tokens (input and output billed separately, matching
+/// provider pricing). Compiled to integer micro-dollars at load (see [`crate::llm`]).
+///
+/// `cached_per_1m` prices the cached-prompt subset (`prompt_tokens_details.cached_tokens`, usually a
+/// steep discount) and `reasoning_per_1m` the reasoning subset (`completion_tokens_details.
+/// reasoning_tokens`). Both default to `0.0`, which means **inherit the base input/output rate** —
+/// so an existing book prices exactly as before; set them only to apply a provider's separate
+/// cached/reasoning rate.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+pub struct ModelPrice {
+    pub input_per_1m: f64,
+    pub output_per_1m: f64,
+    /// USD per 1M cached prompt tokens. `0.0` = inherit `input_per_1m`.
+    pub cached_per_1m: f64,
+    /// USD per 1M reasoning tokens. `0.0` = inherit `output_per_1m`.
+    pub reasoning_per_1m: f64,
 }
 
 /// Managed-mode settings: when `enabled`, the edge pulls its policy from a remote control plane
@@ -291,6 +632,14 @@ pub struct HeadersCfg {
     pub permissions_policy: String,
     pub frame_options: String,
     pub force_secure_cookies: bool,
+    /// Add `HttpOnly` to `Set-Cookie` responses that lack it. On by default. Turn off (or use
+    /// `httponly_cookie_exempt`) for apps that intentionally expose a cookie to JavaScript —
+    /// e.g. a double-submit CSRF token the frontend must read from `document.cookie`.
+    pub httponly_cookies: bool,
+    /// Cookie NAMES that must never get `HttpOnly`, even when `httponly_cookies` is on. The
+    /// surgical exemption for a readable double-submit CSRF cookie, e.g. `["doneyet_csrf"]`.
+    /// Names match exactly (cookies are case-sensitive).
+    pub httponly_cookie_exempt: Vec<String>,
     /// Response headers to strip (case-insensitive), e.g. ["Server", "X-Powered-By"].
     pub strip: Vec<String>,
 }
@@ -378,6 +727,8 @@ impl Default for HeadersCfg {
             permissions_policy: "geolocation=(), microphone=(), camera=()".into(),
             frame_options: "DENY".into(),
             force_secure_cookies: true,
+            httponly_cookies: true,
+            httponly_cookie_exempt: Vec::new(),
             strip: vec!["Server".into(), "X-Powered-By".into()],
         }
     }
@@ -400,7 +751,9 @@ pub struct TlsCfg {
 
 /// Automatic certificate management (ACME / Let's Encrypt) via the HTTP-01 challenge. The
 /// obtained certificate is written to `TlsCfg::cert_path`/`key_path` and served by the TLS
-/// listener; a background task renews it before expiry.
+/// listener. Issuance runs at startup only when no certificate exists at `cert_path`;
+/// there is **no automatic renewal yet** (see docs/ROADMAP.md) — delete the cert/key files
+/// and restart to re-issue.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AcmeCfg {
@@ -670,6 +1023,17 @@ impl Config {
             waf: p.waf,
             access: p.access,
             cors: p.cors,
+            // LLM metering is a policy section (the control plane can push a fleet-wide price
+            // book) — except `telemetry`, which (like `alerts` below) is edge-local operational
+            // config, not fleet-pushed policy: preserve it from the edge rather than letting a
+            // pushed policy silently repoint `endpoint`/`capture_content`/`sample_rate`.
+            llm: LlmCfg {
+                telemetry: self.llm.telemetry.clone(),
+                ..p.llm
+            },
+            // Alerting is edge-local operational config (its webhook is a local secret/endpoint), not
+            // fleet-pushed policy — carry it from the edge, like `server`/`tls`.
+            alerts: self.alerts.clone(),
         })
     }
 
@@ -830,6 +1194,24 @@ pub fn parse_duration(s: &str) -> Result<Duration> {
             .checked_mul(60)
             .with_context(|| format!("duration too large: {s}"))?;
         Ok(Duration::from_secs(secs))
+    } else if let Some(n) = s.strip_suffix('h') {
+        let hours: u64 = n
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid duration: {s}"))?;
+        let secs = hours
+            .checked_mul(3_600)
+            .with_context(|| format!("duration too large: {s}"))?;
+        Ok(Duration::from_secs(secs))
+    } else if let Some(n) = s.strip_suffix('d') {
+        let days: u64 = n
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid duration: {s}"))?;
+        let secs = days
+            .checked_mul(86_400)
+            .with_context(|| format!("duration too large: {s}"))?;
+        Ok(Duration::from_secs(secs))
     } else {
         let secs: u64 = s
             .parse()
@@ -936,6 +1318,8 @@ mod tests {
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("3h").unwrap(), Duration::from_secs(10_800));
+        assert_eq!(parse_duration("2d").unwrap(), Duration::from_secs(172_800));
         assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
         // "0" disables (zero duration); callers map it to "no timeout"
         assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
@@ -958,6 +1342,29 @@ mod tests {
         // ...while the policy sections are taken from the pushed document.
         assert_eq!(merged.auth.mode, "apikey");
         assert!(!merged.ratelimit.enabled);
+    }
+
+    #[test]
+    fn with_policy_from_keeps_llm_telemetry_edge_local() {
+        // Regression: `llm: p.llm` used to take the pushed policy's `llm.telemetry` wholesale,
+        // silently repointing `endpoint`/`capture_content`/`sample_rate` even though telemetry
+        // is documented as edge-local operational config (like `alerts`), not fleet-pushed
+        // policy — a pushed policy could redirect span data to an attacker-controlled endpoint.
+        let mut local = Config::default();
+        local.llm.telemetry.enabled = true;
+        local.llm.telemetry.endpoint = "http://local-collector:4318/v1/traces".into();
+        local.llm.telemetry.capture_content = false;
+        // A pushed policy that tries to repoint telemetry AND legitimately updates the price book.
+        let policy = "[llm]\non_unpriced_model = \"block\"\n\n[llm.telemetry]\nenabled = true\nendpoint = \"http://evil:4318/v1/traces\"\ncapture_content = true\n";
+        let merged = local.with_policy_from(policy).unwrap();
+        // Telemetry stayed exactly as configured at the edge...
+        assert_eq!(
+            merged.llm.telemetry.endpoint,
+            "http://local-collector:4318/v1/traces"
+        );
+        assert!(!merged.llm.telemetry.capture_content);
+        // ...while the rest of `llm` still took the pushed policy.
+        assert_eq!(merged.llm.on_unpriced_model, "block");
     }
 
     #[test]

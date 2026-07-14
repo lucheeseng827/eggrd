@@ -7,18 +7,24 @@
 
 pub mod access;
 pub mod acme;
+pub mod alert;
 pub mod auth;
+pub mod budget;
 pub mod config;
 pub mod cors;
 pub mod cp;
+pub mod dlp;
 pub mod doctor;
 pub mod generate;
+pub mod keyvault;
 pub mod limiter;
+pub mod llm;
 pub mod metrics;
 pub mod proxy;
 pub mod reload;
 pub mod scaffold;
 pub mod supervisor;
+pub mod telemetry;
 pub mod tls;
 pub mod waf;
 
@@ -169,6 +175,19 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
         upstream_timeout,
         stream_passthrough: cfg.validation.stream_passthrough,
         websocket_passthrough: cfg.validation.websocket_passthrough,
+        llm: {
+            // Validate the unpriced-model policy up front so a typo fails at load/reload rather than
+            // silently falling back to `count` inside the infallible runtime builder.
+            crate::llm::UnpricedPolicy::parse(&cfg.llm.on_unpriced_model)?;
+            Arc::new(crate::llm::LlmRuntime::build(&cfg.llm))
+        },
+        budgets: crate::budget::BudgetEngine::build(&cfg.llm)?.map(Arc::new),
+        keyvault: crate::keyvault::KeyVault::build(&cfg.llm)?.map(Arc::new),
+        dlp: crate::dlp::DlpEngine::build(&cfg.llm.dlp)?.map(Arc::new),
+        telemetry: Arc::new(crate::telemetry::TelemetryRuntime::build(
+            &cfg.llm.telemetry,
+        )),
+        alerts: Arc::new(crate::alert::AlertRuntime::build(&cfg.alerts)),
         cfg,
     })
 }

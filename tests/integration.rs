@@ -23,8 +23,9 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use edgeguard::config::{
-    AuthCfg, Config, CorsCfg, HeadersCfg, JwtCfg, PerKeyRateLimit, RateLimitCfg, RouteRateLimit,
-    ServerCfg, UpstreamRoute, WafCfg, WafRule,
+    AuthCfg, BudgetCfg, Config, CorsCfg, HeadersCfg, JwtCfg, KeyEntryCfg, LlmCfg, ModelPrice,
+    PerKeyRateLimit, RateLimitCfg, RouteRateLimit, ServerCfg, UpstreamRoute, ValidationCfg, WafCfg,
+    WafRule,
 };
 use edgeguard::{build_admin_router, build_public_router, build_router, build_state};
 
@@ -1611,4 +1612,1009 @@ async fn gzip_compression_when_enabled() {
             .and_then(|v| v.to_str().ok()),
         Some("gzip")
     );
+}
+
+// ---- LLM token metering (gateway L0) -----------------------------------------------------
+
+/// Config with `[llm]` metering on and a one-model price book (gpt-4o: $2.50/$10.00 per 1M).
+/// Auth off so the test posts without credentials; `stream` toggles SSE passthrough.
+fn llm_cfg(upstream: String, stream: bool) -> Config {
+    let mut models = BTreeMap::new();
+    models.insert(
+        "gpt-4o".to_string(),
+        ModelPrice {
+            input_per_1m: 2.5,
+            output_per_1m: 10.0,
+            ..Default::default()
+        },
+    );
+    Config {
+        server: ServerCfg {
+            upstream,
+            ..Default::default()
+        },
+        auth: AuthCfg {
+            mode: "none".into(),
+            ..Default::default()
+        },
+        ratelimit: RateLimitCfg {
+            enabled: false,
+            ..Default::default()
+        },
+        validation: ValidationCfg {
+            stream_passthrough: stream,
+            ..Default::default()
+        },
+        llm: LlmCfg {
+            enabled: true,
+            api_style: "openai".into(),
+            models,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Stub OpenAI-compatible upstream: a non-streaming chat completion carrying a `usage` object.
+async fn spawn_llm_upstream() -> SocketAddr {
+    async fn handler() -> Response<Body> {
+        let body = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33}
+        })
+        .to_string();
+        let mut resp = Response::new(Body::from(body));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        resp
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// Stub OpenAI-compatible upstream: an SSE stream whose terminal frame carries `usage`.
+async fn spawn_llm_sse_upstream() -> SocketAddr {
+    async fn handler() -> Response<Body> {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":null}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":5,\"total_tokens\":12}}\n\n\
+                   data: [DONE]\n\n";
+        let mut resp = Response::new(Body::from(sse));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        resp
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// Scrape `/__edgeguard/metrics`, retrying briefly until `needle` appears — for the streamed path,
+/// where metering completes when the response body is dropped (just after the client reads it).
+async fn scrape_until(proxy: SocketAddr, needle: &str) -> String {
+    for _ in 0..40 {
+        let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+        if m.body.contains(needle) {
+            return m.body;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new())
+        .await
+        .body
+}
+
+#[tokio::test]
+async fn llm_meters_non_streaming_tokens_and_cost() {
+    let up = spawn_llm_upstream().await;
+    let proxy = spawn_proxy(llm_cfg(format!("http://{up}"), false)).await;
+
+    let body =
+        Bytes::from_static(br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_llm_tokens_total{direction=\"input\"} 11"),
+        "{}",
+        m.body
+    );
+    assert!(
+        m.body
+            .contains("edgeguard_llm_tokens_total{direction=\"output\"} 22"),
+        "{}",
+        m.body
+    );
+    assert!(
+        m.body
+            .contains("edgeguard_llm_requests_total{result=\"metered\"} 1"),
+        "{}",
+        m.body
+    );
+    // 11 in @ $2.50/M = 27 micro; 22 out @ $10/M = 220 micro; total 247.
+    assert!(
+        m.body.contains("edgeguard_llm_cost_microdollars_total 247"),
+        "{}",
+        m.body
+    );
+}
+
+#[tokio::test]
+async fn llm_meters_unpriced_model_tokens_without_cost() {
+    let up = spawn_llm_upstream().await;
+    let proxy = spawn_proxy(llm_cfg(format!("http://{up}"), false)).await;
+
+    // A model absent from the price book: tokens still counted, no cost, bucketed `unpriced`.
+    let body = Bytes::from_static(br#"{"model":"some-unlisted-model","messages":[]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_llm_requests_total{result=\"unpriced\"} 1"),
+        "{}",
+        m.body
+    );
+    assert!(
+        m.body
+            .contains("edgeguard_llm_tokens_total{direction=\"input\"} 11"),
+        "{}",
+        m.body
+    );
+    // No model priced → cost stays 0.
+    assert!(
+        m.body.contains("edgeguard_llm_cost_microdollars_total 0"),
+        "{}",
+        m.body
+    );
+}
+
+#[tokio::test]
+async fn llm_meters_streaming_terminal_usage() {
+    let up = spawn_llm_sse_upstream().await;
+    let proxy = spawn_proxy(llm_cfg(format!("http://{up}"), true)).await;
+
+    let body = Bytes::from_static(br#"{"model":"gpt-4o","stream":true,"messages":[]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    // Metering finishes on body drop (just after the client reads the stream), so poll.
+    let body = scrape_until(proxy, "edgeguard_llm_tokens_total{direction=\"input\"} 7").await;
+    assert!(
+        body.contains("edgeguard_llm_tokens_total{direction=\"output\"} 5"),
+        "{}",
+        body
+    );
+    assert!(
+        body.contains("edgeguard_llm_requests_total{result=\"metered\"} 1"),
+        "{}",
+        body
+    );
+    // 7 in @ $2.50/M = 17 micro; 5 out @ $10/M = 50 micro; total 67.
+    assert!(
+        body.contains("edgeguard_llm_cost_microdollars_total 67"),
+        "{}",
+        body
+    );
+}
+
+// ---- LLM hard budgets (gateway L1) -------------------------------------------------------
+
+#[tokio::test]
+async fn llm_budget_denies_when_reserve_exceeds_limit() {
+    let up = spawn_llm_upstream().await;
+    let mut cfg = llm_cfg(format!("http://{up}"), false);
+    // A 5-token global budget. The reserve estimate (prompt + max_tokens=50) far exceeds it, so the
+    // very first request is denied 429 and never reaches the upstream.
+    cfg.llm.budgets = vec![BudgetCfg {
+        name: "tight".into(),
+        scope: "global".into(),
+        unit: "tokens".into(),
+        limit: 5.0,
+        window: "1h".into(),
+    }];
+    let proxy = spawn_proxy(cfg).await;
+
+    let body = Bytes::from_static(br#"{"model":"gpt-4o","max_tokens":50,"messages":[]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_requests_total{outcome=\"over_budget\"} 1"),
+        "{}",
+        m.body
+    );
+}
+
+#[tokio::test]
+async fn llm_budget_allows_within_limit_and_still_meters() {
+    let up = spawn_llm_upstream().await;
+    let mut cfg = llm_cfg(format!("http://{up}"), false);
+    // A generous budget admits the request; metering still records the actual usage.
+    cfg.llm.budgets = vec![BudgetCfg {
+        name: "generous".into(),
+        scope: "global".into(),
+        unit: "tokens".into(),
+        limit: 1_000_000.0,
+        window: "1h".into(),
+    }];
+    let proxy = spawn_proxy(cfg).await;
+
+    let body = Bytes::from_static(br#"{"model":"gpt-4o","max_tokens":10,"messages":[]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_requests_total{outcome=\"over_budget\"} 0"),
+        "{}",
+        m.body
+    );
+    assert!(
+        m.body
+            .contains("edgeguard_llm_requests_total{result=\"metered\"} 1"),
+        "{}",
+        m.body
+    );
+}
+
+// ---- LLM key vault + egress governance (gateway L2) --------------------------------------
+
+/// Stub OpenAI-compatible upstream that echoes the `Authorization` it received in the JSON body, so
+/// a test can assert which key actually reached the upstream.
+async fn spawn_llm_echo_auth_upstream() -> SocketAddr {
+    async fn handler(headers: axum::http::HeaderMap) -> Response<Body> {
+        let seen = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<none>")
+            .to_string();
+        let body = json!({
+            "seen_authorization": seen,
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string();
+        let mut resp = Response::new(Body::from(body));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        resp
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// LLM config with the vault enabled (auth off — the vault is the credential gate) and one virtual
+/// key mapped to a provider key, restricted to `allowed_models`.
+fn vault_cfg(upstream: String, allowed_models: Vec<String>) -> Config {
+    let mut cfg = llm_cfg(upstream, false);
+    cfg.auth.mode = "none".into();
+    cfg.llm.keys = vec![KeyEntryCfg {
+        virtual_key: "sk-virt-team-a".into(),
+        provider_key: "sk-real-PROVIDER".into(),
+        allowed_models,
+        label: "team-a".into(),
+    }];
+    cfg
+}
+
+#[tokio::test]
+async fn vault_swaps_virtual_key_for_provider_key_upstream() {
+    let up = spawn_llm_echo_auth_upstream().await;
+    let proxy = spawn_proxy(vault_cfg(format!("http://{up}"), vec![])).await;
+
+    let r = send(
+        proxy,
+        "POST",
+        "/v1/chat/completions",
+        Some("Bearer sk-virt-team-a"),
+        Bytes::from_static(br#"{"model":"gpt-4o","messages":[]}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    // The upstream saw the *provider* key, never the client's virtual key.
+    assert!(r.body.contains("sk-real-PROVIDER"), "{}", r.body);
+    assert!(!r.body.contains("sk-virt-team-a"), "{}", r.body);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_llm_keyvault_total{result=\"swapped\"} 1"),
+        "{}",
+        m.body
+    );
+}
+
+#[tokio::test]
+async fn vault_rejects_unknown_virtual_key() {
+    let up = spawn_llm_echo_auth_upstream().await;
+    let proxy = spawn_proxy(vault_cfg(format!("http://{up}"), vec![])).await;
+
+    let r = send(
+        proxy,
+        "POST",
+        "/v1/chat/completions",
+        Some("Bearer sk-not-in-vault"),
+        Bytes::from_static(br#"{"model":"gpt-4o","messages":[]}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_llm_keyvault_total{result=\"denied_key\"} 1"),
+        "{}",
+        m.body
+    );
+}
+
+#[tokio::test]
+async fn vault_enforces_model_egress_allowlist() {
+    let up = spawn_llm_echo_auth_upstream().await;
+    // Key may only reach gpt-4o-mini.
+    let proxy = spawn_proxy(vault_cfg(
+        format!("http://{up}"),
+        vec!["gpt-4o-mini".into()],
+    ))
+    .await;
+
+    // Requesting a model off the allowlist is denied 403 and never reaches the upstream.
+    let r = send(
+        proxy,
+        "POST",
+        "/v1/chat/completions",
+        Some("Bearer sk-virt-team-a"),
+        Bytes::from_static(br#"{"model":"gpt-4o","messages":[]}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    // An allowed model goes through (and is key-swapped).
+    let r = send(
+        proxy,
+        "POST",
+        "/v1/chat/completions",
+        Some("Bearer sk-virt-team-a"),
+        Bytes::from_static(br#"{"model":"gpt-4o-mini","messages":[]}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("sk-real-PROVIDER"), "{}", r.body);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_llm_keyvault_total{result=\"denied_model\"} 1"),
+        "{}",
+        m.body
+    );
+}
+// ---- LLM edge DLP (gateway L3) -----------------------------------------------------------
+
+/// Stub upstream that echoes the request body it received (so a test can assert inbound redaction),
+/// and otherwise returns it verbatim with a usage object.
+async fn spawn_echo_body_upstream() -> SocketAddr {
+    async fn handler(body: Bytes) -> Response<Body> {
+        let mut resp = Response::new(Body::from(body));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        resp
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// Stub upstream that returns a fixed body containing an email (to exercise response DLP).
+async fn spawn_leaky_upstream() -> SocketAddr {
+    async fn handler() -> Response<Body> {
+        let mut resp = Response::new(Body::from(
+            r#"{"choices":[{"message":{"content":"reach me at leak@secret.com"}}]}"#,
+        ));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        resp
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// LLM config with DLP in `mode`, default detectors.
+fn dlp_cfg(upstream: String, mode: &str) -> Config {
+    let mut cfg = llm_cfg(upstream, false);
+    cfg.auth.mode = "none".into();
+    cfg.llm.dlp.mode = mode.into();
+    cfg
+}
+
+#[tokio::test]
+async fn dlp_blocks_inbound_request_with_secret() {
+    let up = spawn_echo_body_upstream().await;
+    let proxy = spawn_proxy(dlp_cfg(format!("http://{up}"), "block")).await;
+
+    // A prompt carrying an email is blocked 403 before it reaches the upstream.
+    let body = Bytes::from_static(
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"my email is alice@example.com"}]}"#,
+    );
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_llm_dlp_findings_total{category=\"email\"} 1"),
+        "{}",
+        m.body
+    );
+    assert!(
+        m.body.contains("edgeguard_llm_dlp_blocked_total 1"),
+        "{}",
+        m.body
+    );
+}
+
+#[tokio::test]
+async fn dlp_redacts_inbound_request_before_upstream() {
+    let up = spawn_echo_body_upstream().await;
+    let proxy = spawn_proxy(dlp_cfg(format!("http://{up}"), "redact")).await;
+
+    let body = Bytes::from_static(
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"email alice@example.com"}]}"#,
+    );
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::OK);
+    // The upstream (echoed back) saw the redacted prompt — the real email never left the edge.
+    assert!(r.body.contains("[REDACTED:email]"), "{}", r.body);
+    assert!(!r.body.contains("alice@example.com"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn dlp_redacts_outbound_response() {
+    let up = spawn_leaky_upstream().await;
+    let proxy = spawn_proxy(dlp_cfg(format!("http://{up}"), "redact")).await;
+
+    let body = Bytes::from_static(br#"{"model":"gpt-4o","messages":[]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::OK);
+    // The model leaked an email; DLP redacts it before the client sees the response.
+    assert!(r.body.contains("[REDACTED:email]"), "{}", r.body);
+    assert!(!r.body.contains("leak@secret.com"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn dlp_report_mode_passes_through_and_counts() {
+    let up = spawn_echo_body_upstream().await;
+    let proxy = spawn_proxy(dlp_cfg(format!("http://{up}"), "report")).await;
+
+    let body = Bytes::from_static(
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"email alice@example.com"}]}"#,
+    );
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    // Report mode never alters traffic: the email passes through unchanged…
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("alice@example.com"), "{}", r.body);
+
+    // …but the finding is counted.
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body.contains("edgeguard_llm_dlp_blocked_total 0"),
+        "{}",
+        m.body
+    );
+    assert!(
+        m.body
+            .contains("edgeguard_llm_dlp_findings_total{category=\"email\"}"),
+        "{}",
+        m.body
+    );
+}
+
+/// Spy upstream: records the request body it received into `seen`, and returns a fixed completion
+/// that references the first mask placeholder (`<edgeguard-email-0>`) so reversible unmask restores it.
+async fn spawn_spy_upstream(seen: Arc<std::sync::Mutex<Vec<u8>>>) -> SocketAddr {
+    let app = Router::new().fallback(any(move |body: Bytes| {
+        let seen = seen.clone();
+        async move {
+            *seen.lock().unwrap() = body.to_vec();
+            let mut resp = Response::new(Body::from(
+                r#"{"choices":[{"message":{"content":"I emailed <edgeguard-email-0> for you"}}],"usage":{"prompt_tokens":5,"completion_tokens":6}}"#,
+            ));
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            resp
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// SSE upstream that emits a mask placeholder **split across two frames**, to exercise the streaming
+/// unmasker's carry buffer (a placeholder straddling a frame boundary must still be restored whole).
+async fn spawn_sse_placeholder_upstream() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn write_chunk(sock: &mut tokio::net::TcpStream, data: &[u8]) {
+        sock.write_all(format!("{:x}\r\n", data.len()).as_bytes())
+            .await
+            .unwrap();
+        sock.write_all(data).await.unwrap();
+        sock.write_all(b"\r\n").await.unwrap();
+        sock.flush().await.unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                // Split "<edgeguard-email-0>" across the two frames, mid-token.
+                write_chunk(&mut sock, b"data: contact <edgeguard-em").await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                write_chunk(&mut sock, b"ail-0> today\n\n").await;
+                sock.write_all(b"0\r\n\r\n").await.unwrap();
+                sock.flush().await.unwrap();
+            });
+        }
+    });
+    addr
+}
+
+/// SSE upstream that emits a mask placeholder followed by a multibyte UTF-8 character (an emoji)
+/// whose own byte sequence is split mid-character across two frames — exercises the streaming
+/// unmasker's UTF-8 boundary guard separately from the placeholder-boundary guard.
+async fn spawn_sse_placeholder_then_multibyte_split_upstream() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn write_chunk(sock: &mut tokio::net::TcpStream, data: &[u8]) {
+        sock.write_all(format!("{:x}\r\n", data.len()).as_bytes())
+            .await
+            .unwrap();
+        sock.write_all(data).await.unwrap();
+        sock.write_all(b"\r\n").await.unwrap();
+        sock.flush().await.unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                sock.write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                // "🎉" is U+1F389, 4 UTF-8 bytes: F0 9F 8E 89. Split it mid-character: the first
+                // frame ends with the placeholder plus the first 2 bytes of the emoji (not valid
+                // UTF-8 on its own); the second frame carries the remaining 2 bytes.
+                let mut frame1: Vec<u8> = b"data: contact <edgeguard-email-0> party ".to_vec();
+                frame1.extend_from_slice(&[0xF0, 0x9F]);
+                let mut frame2: Vec<u8> = vec![0x8E, 0x89];
+                frame2.extend_from_slice(b" today\n\n");
+                write_chunk(&mut sock, &frame1).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                write_chunk(&mut sock, &frame2).await;
+                sock.write_all(b"0\r\n\r\n").await.unwrap();
+                sock.flush().await.unwrap();
+            });
+        }
+    });
+    addr
+}
+
+/// Reversible masking (gateway L3, litellm#22821): the provider only ever sees a placeholder, and the
+/// client gets its own value restored on the response — the round-trip an irreversible tag can't do.
+#[tokio::test]
+async fn dlp_reversible_masks_at_provider_and_unmasks_to_client() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let up = spawn_spy_upstream(seen.clone()).await;
+    let mut cfg = dlp_cfg(format!("http://{up}"), "redact");
+    cfg.llm.dlp.reversible = true;
+    let proxy = spawn_proxy(cfg).await;
+
+    let body = Bytes::from_static(
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"email alice@example.com please"}]}"#,
+    );
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    // The provider saw only the placeholder — never the real email.
+    let seen_body = String::from_utf8(seen.lock().unwrap().clone()).unwrap();
+    assert!(
+        seen_body.contains("<edgeguard-email-0>"),
+        "provider should see the placeholder, saw: {seen_body}"
+    );
+    assert!(
+        !seen_body.contains("alice@example.com"),
+        "provider must not see PII, saw: {seen_body}"
+    );
+
+    // The client got its own value back (the response referenced the placeholder), not a tag.
+    assert!(
+        r.body.contains("alice@example.com"),
+        "client should get its email restored: {}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("<edgeguard-"),
+        "placeholder leaked: {}",
+        r.body
+    );
+    assert!(
+        !r.body.contains("[REDACTED"),
+        "irreversible tag: {}",
+        r.body
+    );
+}
+
+/// Reversible unmasking works on the **streamed** path too, reassembling a placeholder split across
+/// SSE frames before restoring the caller's value.
+#[tokio::test]
+async fn dlp_reversible_unmasks_streamed_response_split_across_frames() {
+    let up = spawn_sse_placeholder_upstream().await;
+    let mut cfg = dlp_cfg(format!("http://{up}"), "redact");
+    cfg.llm.dlp.reversible = true;
+    cfg.validation.stream_passthrough = true;
+    let proxy = spawn_proxy(cfg).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://{proxy}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from_static(
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"email alice@example.com"}]}"#,
+        )))
+        .unwrap();
+    let start = std::time::Instant::now();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (text, _first, _last) = read_streamed(resp, start).await;
+
+    // The placeholder — split across two frames — is reassembled and unmasked to the caller's email.
+    assert!(text.contains("alice@example.com"), "got: {text:?}");
+    assert!(
+        !text.contains("<edgeguard-"),
+        "placeholder leaked in stream: {text:?}"
+    );
+}
+
+/// A multibyte UTF-8 character (an emoji) split mid-byte-sequence across two SSE frames must not be
+/// corrupted into U+FFFD replacement characters by the streaming unmasker.
+#[tokio::test]
+async fn dlp_reversible_unmask_stream_preserves_multibyte_char_split_across_frames() {
+    let up = spawn_sse_placeholder_then_multibyte_split_upstream().await;
+    let mut cfg = dlp_cfg(format!("http://{up}"), "redact");
+    cfg.llm.dlp.reversible = true;
+    cfg.validation.stream_passthrough = true;
+    let proxy = spawn_proxy(cfg).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://{proxy}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from_static(
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"email alice@example.com"}]}"#,
+        )))
+        .unwrap();
+    let start = std::time::Instant::now();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (text, _first, _last) = read_streamed(resp, start).await;
+
+    assert!(text.contains("alice@example.com"), "got: {text:?}");
+    assert!(
+        text.contains('🎉'),
+        "emoji split across frames corrupted, got: {text:?}"
+    );
+    assert!(
+        !text.contains('\u{FFFD}'),
+        "replacement char leaked, got: {text:?}"
+    );
+    assert!(
+        !text.contains("<edgeguard-"),
+        "placeholder leaked, got: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn vault_fails_closed_on_missing_model_when_allowlist_set() {
+    let up = spawn_llm_echo_auth_upstream().await;
+    // Key is restricted to gpt-4o-mini; a body without a "model" field must be denied.
+    let proxy = spawn_proxy(vault_cfg(
+        format!("http://{up}"),
+        vec!["gpt-4o-mini".into()],
+    ))
+    .await;
+
+    // Body has no "model" field — the vault can't verify the model, so it must fail closed.
+    let r = send(
+        proxy,
+        "POST",
+        "/v1/chat/completions",
+        Some("Bearer sk-virt-team-a"),
+        Bytes::from_static(br#"{"messages":[]}"#),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body
+            .contains("edgeguard_llm_keyvault_total{result=\"denied_model\"} 1"),
+        "{}",
+        m.body
+    );
+}
+
+// --- L4 telemetry: gateway → OTLP receiver span emission (top-20 #13/#14) ------------------
+//
+// End-to-end proof that the gateway emits a correct OpenInference/OTLP-JSON span: the REAL proxy
+// pipeline meters an OpenAI-shaped upstream response and POSTs a span to a stub OTLP receiver that
+// stands in for evald's `/v1/traces`. We assert the exact attribute keys evald's normalizer reads,
+// so the two products' bridge is verified over a real HTTP round-trip (evald's own ingest tests
+// prove the same OTLP-JSON shape parses back into spans).
+
+/// Stub OpenAI upstream: returns a chat-completion JSON with a `usage` object so the gateway meters
+/// tokens + cost on the buffered path.
+async fn spawn_openai_upstream() -> SocketAddr {
+    async fn handler() -> Response<Body> {
+        let body = json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi there" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 5, "total_tokens": 16 }
+        })
+        .to_string();
+        let mut resp = Response::new(Body::from(body));
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        resp
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// Stub OTLP/HTTP receiver (stands in for evald): captures every `POST /v1/traces` JSON body.
+async fn spawn_otlp_receiver() -> (SocketAddr, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+    let captured: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let app = Router::new().route(
+        "/v1/traces",
+        axum::routing::post(move |body: Bytes| {
+            let sink = sink.clone();
+            async move {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    sink.lock().unwrap().push(v);
+                }
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, captured)
+}
+
+/// Poll the receiver until a span export lands (emission is fire-and-forget), or time out.
+async fn poll_for_export(
+    captured: &Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(first) = captured.lock().unwrap().first() {
+            return Some(first.clone());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn llm_span_is_emitted_to_the_otlp_endpoint_with_tokens_cost_and_content() {
+    let upstream = spawn_openai_upstream().await;
+    let (receiver, captured) = spawn_otlp_receiver().await;
+
+    let mut cfg = base_cfg(format!("http://{upstream}"));
+    cfg.llm = LlmCfg {
+        enabled: true,
+        models: BTreeMap::from([(
+            "gpt-4o".to_string(),
+            ModelPrice {
+                input_per_1m: 2.5,
+                output_per_1m: 10.0,
+                ..Default::default()
+            },
+        )]),
+        telemetry: edgeguard::config::TelemetryCfg {
+            enabled: true,
+            endpoint: format!("http://{receiver}/v1/traces"),
+            capture_content: true,
+            service_name: "checkout".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let proxy = spawn_proxy(cfg).await;
+
+    // Send an OpenAI chat request through the gateway, carrying an inbound W3C traceparent so we can
+    // assert the emitted span stitches under it.
+    let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let req_body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hello?" }]
+    })
+    .to_string();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://{proxy}/v1/chat/completions"))
+        .header(header::AUTHORIZATION, basic("admin", "secret"))
+        .header("traceparent", traceparent)
+        .body(Full::new(Bytes::from(req_body)))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&out).contains("hi there"));
+
+    // The emit is fire-and-forget — poll the receiver for the span export.
+    let export = poll_for_export(&captured, Duration::from_secs(5))
+        .await
+        .expect("gateway should emit an OTLP span to the endpoint");
+
+    // Resource: service.name we configured. Look it up by key rather than assuming index 0, since
+    // resource attribute ordering isn't a contract the exporter owes us.
+    let resource_attrs = export["resourceSpans"][0]["resource"]["attributes"]
+        .as_array()
+        .unwrap();
+    let service_name = resource_attrs
+        .iter()
+        .find(|a| a["key"] == "service.name")
+        .map(|a| a["value"]["stringValue"].clone())
+        .expect("service.name resource attribute");
+    assert_eq!(service_name, "checkout");
+    let span = &export["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+    // Trace-context stitched under the inbound traceparent.
+    assert_eq!(span["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert_eq!(span["parentSpanId"], "00f067aa0ba902b7");
+    assert_ne!(span["spanId"], "00f067aa0ba902b7"); // a fresh child span id was minted
+
+    let attrs = span["attributes"].as_array().unwrap();
+    let attr = |key: &str| {
+        attrs
+            .iter()
+            .find(|a| a["key"] == key)
+            .map(|a| a["value"].clone())
+    };
+    // The OpenInference keys evald normalizes — model, tokens, cost.
+    assert_eq!(
+        attr("openinference.span.kind").unwrap()["stringValue"],
+        "LLM"
+    );
+    assert_eq!(attr("llm.model_name").unwrap()["stringValue"], "gpt-4o");
+    assert_eq!(attr("llm.token_count.prompt").unwrap()["intValue"], "11");
+    assert_eq!(attr("llm.token_count.completion").unwrap()["intValue"], "5");
+    assert_eq!(attr("llm.token_count.total").unwrap()["intValue"], "16");
+    // 11 in @ $2.5/M + 5 out @ $10/M = 27.5 + 50 = 77.5 micro-USD, which the gateway meters in
+    // *integer* micro-dollars (truncated to 77) → $0.000077. Correct-by-construction integer cost.
+    let cost = attr("llm.cost.total").unwrap()["doubleValue"]
+        .as_f64()
+        .unwrap();
+    assert!((cost - 0.000077).abs() < 1e-9, "cost was {cost}");
+    // Content capture (redaction path is a no-op here — no DLP configured — so the bodies pass through).
+    assert!(attr("input.value").unwrap()["stringValue"]
+        .as_str()
+        .unwrap()
+        .contains("hello?"));
+    assert!(attr("output.value").unwrap()["stringValue"]
+        .as_str()
+        .unwrap()
+        .contains("hi there"));
+}
+
+// --- L4 alerting: budget-breach → Slack/webhook (top-20 #17) --------------------------------
+
+#[tokio::test]
+async fn budget_alert_posts_a_slack_message_once_per_crossing() {
+    // Reuse the generic JSON capture receiver as the webhook endpoint.
+    let (webhook, captured) = spawn_otlp_receiver().await;
+    let alerts = edgeguard::alert::AlertRuntime::build(&edgeguard::config::AlertsCfg {
+        enabled: true,
+        webhook_url: format!("http://{webhook}/v1/traces"),
+        budget_consumed_threshold: 0.9,
+        ..Default::default()
+    });
+
+    // First crossing into the alert zone fires; staying over does not re-fire (no spam).
+    alerts.fire_budget_alert("monthly", 0.95);
+    alerts.fire_budget_alert("monthly", 0.97);
+
+    let msg = poll_for_export(&captured, Duration::from_secs(5))
+        .await
+        .expect("a budget crossing should POST a webhook alert");
+    let text = msg["text"].as_str().unwrap();
+    assert!(text.contains("monthly"), "{text}");
+    assert!(text.contains("95%"), "{text}");
+    // Edge-triggered: exactly one delivery despite two over-threshold observations. Give a
+    // hypothetical duplicate POST from the second (non-edge) crossing a real chance to land
+    // before asserting, rather than checking immediately after the first delivery arrives.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(captured.lock().unwrap().len(), 1);
 }

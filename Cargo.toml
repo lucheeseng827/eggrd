@@ -4,7 +4,7 @@
 # the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
 # crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
 name = "eggrd"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ categories = ["web-programming::http-server", "network-programming", "command-li
 # rig, the detached wasm worker, docs, or deploy examples.
 # `ee/` is the PRIVATE control plane (its own workspace) — it must never be packaged into the
 # public `eggrd` crate. Keep it first; the rest just trims the published tarball.
-exclude = ["ee/", "loadtest/", "worker/", "docs/", "examples/", "tests/", ".github/", ".ossync.yaml"]
+exclude = ["ee/", "edgeguard-ner/", "loadtest/", "worker/", "docs/", "examples/", "tests/", ".github/", ".ossync.yaml"]
 
 # Package id is `eggrd`, but the compiled artifacts stay `edgeguard` so nothing downstream renames.
 [lib]
@@ -44,6 +44,10 @@ toml = "0.8"
 # and rejects backreferences/lookaround, so a user-supplied pattern can't trigger catastrophic
 # backtracking (ReDoS) — a safety property we rely on for the configurable rules.
 regex = "1"
+# Edge-DLP gazetteer: a single linear-time Aho-Corasick automaton over the operator's deny-list
+# terms (known names / codenames / identifiers). Pulled in directly (the `regex` crate already
+# depends on it transitively, so this adds no new leaf to the tree) — see src/dlp.rs.
+aho-corasick = "1"
 # JWT verification (HS*/RS*/ES*/PS*/EdDSA) and JWKS parsing.
 jsonwebtoken = "9"
 # JWKS fetch over HTTPS. `rustls-tls` avoids a system OpenSSL dependency; default features
@@ -81,6 +85,21 @@ anyhow = "1"
 # `std` pulls in `password-hash`'s getrandom-backed `OsRng` for the `--hash` helper's
 # salt generation (verification works without it; salting a fresh hash needs an RNG).
 argon2 = { version = "0.5", features = ["std"] }
+# Optional ML NER layer for edge DLP (gateway L3): the pure-Rust `edgeguard-ner` crate (tract-onnx +
+# tokenizers). It is an OPTIONAL dependency gated behind the `ner` feature below, and its own heavy
+# ONNX dep graph is gated behind `edgeguard-ner/onnx`, so the DEFAULT build pulls neither — the
+# single-static-binary / distroless / static-musl promise is unchanged unless you build `--features ner`.
+# A `version` is required alongside `path` so the published `eggrd` manifest is valid (Cargo rejects
+# a path-only dep when packaging). The default build never pulls it (optional, off by default), so
+# `cargo package`/`publish` of eggrd succeeds; the `ner` feature is a build-from-source opt-in.
+edgeguard-ner = { path = "edgeguard-ner", version = "0.1.0", optional = true }
+
+[features]
+# Default build is the deterministic-only edge DLP (regex + gazetteer + entropy): no ML, no ONNX,
+# byte-for-byte the lean proxy. `ner` adds the ONNX NER family (person/address/org) by turning on the
+# optional crate AND its `onnx` feature (tract + tokenizers). Keep `default` empty.
+default = []
+ner = ["dep:edgeguard-ner", "edgeguard-ner/onnx"]
 
 # Process-group signaling in the supervisor is Unix-only.
 [target.'cfg(unix)'.dependencies]

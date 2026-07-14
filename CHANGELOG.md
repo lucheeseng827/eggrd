@@ -6,6 +6,21 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-07-15
+
+### Fixed
+- **Cookie hardening no longer forces `HttpOnly` on cookies that must stay JS-readable.**
+  EdgeGuard's `[headers]` hardening added `HttpOnly` to every `Set-Cookie` unconditionally,
+  which silently broke apps behind the proxy that use a **double-submit CSRF cookie** the
+  frontend reads from `document.cookie` (the cookie became unreadable → the app saw no
+  session). Two new `[headers]` keys make it configurable:
+  - `httponly_cookies` (bool, default `true`) — global toggle for adding `HttpOnly`.
+  - `httponly_cookie_exempt` (string list, default `[]`) — cookie **names** to never add
+    `HttpOnly` to, e.g. `["doneyet_csrf"]`. The surgical fix.
+
+  `Secure` and the `SameSite=Lax` default are unchanged. Existing configs keep the previous
+  behaviour (HttpOnly on by default); opt out only for cookies you intend JS to read.
+
 ## [0.2.0] — 2026-06-28
 
 ### Hardened (pre-release review follow-ups)

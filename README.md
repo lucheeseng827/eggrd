@@ -142,6 +142,13 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
   rollout mode. A match is logged and counted (`edgeguard_waf_hits_total`); in `block` mode it
   returns `403`. Screens the URL path/query by default (also percent-decoded); headers and body
   are opt-in.
+- **Edge DLP — PII / secret redaction** (`[llm.dlp]`, **off by default**): an inline guardrail on the
+  LLM proxy that scans the **prompt** sent to the model and the **completion** sent back for PII and
+  secrets — emails, cards (Luhn-gated), SSN/phone/IBAN, API keys & private-key blocks, an
+  Aho-Corasick **gazetteer** deny-list, an **entropy** catch-all, plus optional ONNX **NER** for
+  names/addresses/orgs (`--features ner`). A **report / block / redact** ladder like the WAF;
+  redaction is `full` / `mask` / process-keyed `hash` and also runs on streamed SSE frame-by-frame.
+  See [Edge DLP](#edge-dlp-pii--secret-redaction).
 - **CORS** (`[cors]`, **off by default**): answer browser **preflight** `OPTIONS` requests (before
   auth — preflights carry no credentials) and decorate responses with the matching
   `Access-Control-*` headers, so a separate-origin frontend can call the app. A credentialed
@@ -149,7 +156,7 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
 - **TLS termination** via `rustls`, with optional **ACME / Let's Encrypt** (HTTP-01)
   automatic certificates.
 - **Prometheus metrics** at `/__edgeguard/metrics` (request rate by outcome, rate-limit
-  hits, WAF hits, latency histogram, CSP reports).
+  hits, WAF hits, DLP findings by category + blocks, latency histogram, CSP reports).
 - **Public/private split** (optional): serve the internal `/__edgeguard/*` ops endpoints
   (health, readiness, metrics) on a separate **private listener** so they aren't exposed on the
   public port.
@@ -200,9 +207,22 @@ cargo build --release
 PORT=8080 APP_PORT=3000 ./target/release/edgeguard \
   --config edgeguard.toml \
   --wrap "node server.js"
+```
 
-# now hit it (set the user/pass you configured in edgeguard.toml)
-curl -u "$EDGEGUARD_USER:$EDGEGUARD_PASS" http://localhost:8080/
+On a successful start you get JSON log lines ending in (fields elided):
+
+```json
+{"level":"INFO","fields":{"message":"upstream is ready","port":3000},...}
+{"level":"INFO","fields":{"message":"EdgeGuard listening","listen":"0.0.0.0:8080","upstream":"http://127.0.0.1:3000","auth":"basic","rate_limit":true},...}
+```
+
+Then hit it with the credential you configured (a request without one gets `401`):
+
+```console
+$ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/
+401
+$ curl -u admin:your-password http://localhost:8080/
+<your app's normal response, now with CSP/HSTS/X-Frame-Options headers injected>
 ```
 
 > ⚠️ The shipped config requires you to set a credential before it will authenticate —
@@ -333,6 +353,9 @@ EdgeGuard is running hot-reloads the policy in place (see [Configuration](#confi
 │   ├── generate.rs       # static-host / edge config generator (`edgeguard generate`)
 │   └── supervisor.rs     # co-process supervisor (Unix signals / Windows fallback)
 ├── docs/
+│   ├── CONFIG.md         # complete configuration reference (every flag/env/TOML key)
+│   ├── API.md            # endpoints, proxy-added headers/status codes, metrics
+│   ├── OPERATIONS.md     # ops runbook: deploy, state, monitoring, troubleshooting
 │   ├── REQUIREMENTS.md   # product requirements & scope
 │   ├── DEPLOYMENT.md     # deployment & integration strategy
 │   └── ROADMAP.md        # phased dev plan → OSS launch → product roadmap
@@ -348,8 +371,11 @@ EdgeGuard is running hot-reloads the policy in place (see [Configuration](#confi
 
 ## Configuration
 
-All config is optional; EdgeGuard ships secure defaults. See
-[`edgeguard.toml`](./edgeguard.toml) for the annotated reference. Environment overrides:
+All config is optional; EdgeGuard ships secure defaults. **The complete reference —
+every CLI flag, env var, and TOML key (including the whole `[llm]` overlay), with types,
+defaults, and hot-reload rules — is [docs/CONFIG.md](docs/CONFIG.md).** The shipped
+[`edgeguard.toml`](./edgeguard.toml) is the annotated starter for the front-proxy
+sections. Environment overrides:
 
 | Env | Meaning | Default |
 |---|---|---|
@@ -374,11 +400,12 @@ the config file or a `ps`-visible environment. The direct variable wins when bot
 `*_FILE` that can't be read is a hard startup error (a misconfigured mount fails loudly rather
 than silently running with no secret). A trailing newline is trimmed.
 
-Auth, rate limits, TLS/ACME, CSP reporting, the header/size limits, CORS, and IP access are
-configured in the TOML file — see the annotated [`edgeguard.toml`](./edgeguard.toml). Editing that
-file while EdgeGuard is running **hot-reloads** the policy in place (auth, limits, headers,
-validation except `compress_responses`, CORS, access); changing compression, the listen port, or
-TLS settings still needs a restart.
+Auth, rate limits, TLS/ACME, CSP reporting, the header/size limits, CORS, IP access, WAF, and
+the LLM overlay are configured in the TOML file — see [docs/CONFIG.md](docs/CONFIG.md) (complete)
+and the annotated [`edgeguard.toml`](./edgeguard.toml) (starter). Editing that file while
+EdgeGuard is running **hot-reloads** the policy in place (auth, limits, validation except
+`compress_responses`, headers, WAF, access, CORS, per-path upstreams, LLM policy); changing
+compression, the listen/admin ports, or TLS settings still needs a restart.
 
 **Hashing a password** (do this before any real deployment — the shipped placeholder will
 not authenticate). EdgeGuard ships a built-in helper so you don't need an external tool:
@@ -415,8 +442,10 @@ front of your app):
   [`examples/docker-compose.yml`](./examples/docker-compose.yml) with EdgeGuard as the front
   container and the app only reachable through it.
 
-The full strategy (interface patterns, platform matrix, rollout order) is in
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+The hands-on runbook — upgrade/rollback, what state to back up, monitoring/alerting, and
+symptom-first troubleshooting for every status code EdgeGuard can generate — is
+[docs/OPERATIONS.md](docs/OPERATIONS.md). The full strategy (interface patterns, platform
+matrix, rollout order) is in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 > Static/edge hosts (Vercel, Netlify, Cloudflare Pages) can't run a long-lived proxy
 > process — see [Static & edge hosts](#static--edge-hosts) for the `edgeguard generate` config
@@ -424,22 +453,119 @@ The full strategy (interface patterns, platform matrix, rollout order) is in
 
 ## Architecture
 
+### High-level view
+
+EdgeGuard is **one static binary** (`edgeguard`; crates.io package `eggrd`) with no
+required external services. Every request reads a single hot-swapped **`Runtime`
+policy snapshot** (`Arc<ArcSwap<Runtime>>` — one `load_full()` per request), rebuilt
+from `edgeguard.toml` by the `notify` file watcher; a config that fails to parse or
+validate keeps the previous policy. The only optional externals are **Redis** (only
+when `ratelimit.store = "redis"`), a **control plane** (managed mode: the `cp.rs`
+pull/report loops against the private `ee/` workspace), and the ACME CA at
+certificate issuance.
+
+```mermaid
+flowchart TD
+    client["Clients — browsers · API callers · LLM apps"]
+
+    subgraph bin["edgeguard — single static binary (package: eggrd)"]
+      direction TB
+      listener["listener :PORT<br/>optional rustls TLS + ACME HTTP-01 (binds port 80)"]
+      pipeline["request pipeline — proxy.rs::handle_inner<br/>IP access → header cap → managed-quota stop → rate limit →<br/>CORS preflight → auth (basic / apikey / JWT+JWKS) → per-key limit →<br/>method allowlist → WS tunnel → body cap → WAF → DLP inbound"]
+      llmov["LLM overlay — body has a top-level model field<br/>keyvault virtual→provider key + model allowlist ·<br/>unpriced-model policy 402 · budget reserve (tokens / USD)"]
+      respp["response pipeline<br/>usage metering + budget commit → DLP outbound (buffered or SSE frames) →<br/>security headers → strip leaky headers → harden cookies →<br/>X-Request-Id → CORS → gzip (never SSE)"]
+      rt["Runtime snapshot — arc-swap<br/>hot reload of edgeguard.toml (notify)<br/>bad reload keeps the old policy"]
+      adminr["admin router — optional server.admin_port split<br/>/__edgeguard/health · /ready · /metrics"]
+      cspr["/__edgeguard/csp-report — public sink, 64 KiB cap"]
+      sup["supervisor — only with --wrap<br/>spawns the app on APP_PORT, restarts with backoff"]
+    end
+
+    upstream["upstream — wrapped child :APP_PORT or UPSTREAM URL<br/>per-path overrides via [[upstreams]]"]
+    redis[("Redis — GCRA Lua script<br/>only when ratelimit.store = redis")]
+    cp["control plane — private ee/ workspace (edgeguard-cp)<br/>policy pull (ETag) · usage report · quota state · CSP forward"]
+    prom["Prometheus / Grafana — monitoring/"]
+
+    client --> listener --> pipeline --> llmov -->|"forward, bounded by upstream_timeout"| upstream
+    upstream --> respp --> client
+    rt -.->|"per-request snapshot"| pipeline
+    pipeline <-->|"distributed limiter"| redis
+    bin <-.->|"managed mode only (cp.rs loops)"| cp
+    prom -.->|"scrape"| adminr
+    sup --- upstream
+```
+
+Two sibling crates cover surfaces the binary can't reach: **[`worker/`](worker/README.md)**
+(Rust→WASM Cloudflare Worker — response hardening + Basic/API-key edge auth only; no rate
+limit, WAF, DLP, or TLS) and **`edgeguard-ner/`** (optional ONNX NER detector family for
+edge DLP, compiled in only with `--features ner`).
+
+### Request / response pipeline
+
 **Request:** client-IP resolution (honors `X-Forwarded-For` only when
 `server.trust_forwarded_for = true`; disabled by default so clients cannot spoof
 their IP) → IP access control (`[access]`, allow-all by default) → header-size limit →
-rate-limit (per-IP / per-route) → CORS preflight
+pooled-quota hard-stop (managed mode only, when `control_plane.enforce_quota` is on —
+`429` + `Retry-After`) → rate-limit (per-IP / per-route) → CORS preflight
 (answered before auth, when `[cors]` is on) → auth → per-key
 rate-limit → method allowlist → WebSocket/`Upgrade` tunnel (when
 `websocket_passthrough` is on) → body-size limit → WAF input inspection (off by default) →
+**edge DLP inbound scan** (gateway L3, `[llm.dlp]`, off by default — scans the prompt body and,
+per `mode`, `report`s / `block`s `403` / `redact`s it before it leaves) → LLM token metering →
 forward to upstream (bounded by `validation.upstream_timeout`, default 30s — a stalled
 upstream returns `504` instead of pinning the request).
-**Response:** security-header injection (CSP/CSP-Report-Only) → cookie hardening → strip
-leaky headers → CORS response headers (when `[cors]` is on) → `X-Request-Id` stamped on every
-response → optional gzip (when `compress_responses` is on, never for SSE).
+**Response:** **edge DLP outbound scan** (when `scan_response` is on — a buffered completion is
+`report`ed / `block`ed (`403`, body withheld) / `redact`-rewritten; a streamed
+`text/event-stream` body is redacted frame-by-frame with a cross-frame carry buffer, and `block`
+falls back to buffering the whole stream so it can still fail closed) → security-header injection
+(CSP/CSP-Report-Only) → strip leaky headers → cookie hardening → `X-Request-Id` stamped on every
+response → CORS response headers (when `[cors]` is on) →
+optional gzip (when `compress_responses` is on, never for SSE).
+
+See [Edge DLP](#edge-dlp-pii--secret-redaction) for the detector families and the detect →
+merge → enforce call flow.
 
 Built on `axum` + `hyper` (server), `hyper-util` (upstream client), `governor` + `redis` (rate
 limit), `argon2` + `jsonwebtoken` (auth), `rustls` + `instant-acme` (TLS/ACME), `arc-swap`
-+ `notify` (hot-reload), `regex` (WAF), `tracing` (logs).
++ `notify` (hot-reload), `regex` (WAF + DLP signatures), `aho-corasick` (DLP gazetteer), `tracing`
+(logs); plus `tract-onnx` + `tokenizers` for the optional `ner` feature (build-time opt-in only).
+
+### Event / call flow
+
+One proxied request end to end, as `proxy.rs` implements it. Every stage reads the
+same pinned `Runtime` snapshot, so a hot-reload mid-request can't mix policies. The
+LLM stages only engage when the JSON body carries a top-level `"model"` field (and
+`[llm]` / keyvault / budgets are configured) — everything else is plain front-proxy
+traffic through the same pipeline:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant EG as edgeguard :PORT
+    participant RT as Runtime (arc-swap)
+    participant U as Upstream (APP_PORT / UPSTREAM)
+
+    C->>EG: request
+    EG->>RT: load_full() — pin one policy snapshot
+    EG->>EG: client IP (trust_forwarded_for) + resolve X-Request-Id
+    EG->>EG: IP access (403) → header cap (431) → managed-quota stop (429) → per-IP/route rate limit (429)
+    alt OPTIONS preflight, [cors] on
+        EG-->>C: preflight response (answered before auth)
+    else
+        EG->>EG: auth basic/apikey/JWT (401) → per-key rate limit → method allowlist (405)
+        EG->>EG: buffer body (413) → WAF report/block (403) → DLP inbound report/block (403)/redact
+        opt body has top-level "model" (LLM traffic)
+            EG->>EG: keyvault virtual→provider key + model allowlist (401/403/502)
+            EG->>EG: unpriced-model policy (402) → budget reserve (402 cost / 429 tokens)
+        end
+        EG->>U: forward — strip hop-by-hop, add X-Forwarded-For/Proto + X-Request-Id, inject provider key
+        Note over EG,U: bounded by validation.upstream_timeout (default 30s) — stall → 504
+        U-->>EG: response (buffered, or SSE passthrough frame-by-frame)
+        EG->>EG: LLM usage metering (upstream usage object) + budget commit
+        EG->>EG: DLP outbound → security headers → strip leaky → harden cookies
+        EG-->>C: stamp X-Request-Id → CORS headers → gzip (never SSE)
+    end
+```
 
 Internal endpoints (dedicated routes, exempt from auth/limits — restrict access to
 `/__edgeguard/*` at the network layer, or move them to a private listener with
@@ -452,6 +578,11 @@ namespace is reserved — it is never forwarded upstream:
 | `/__edgeguard/ready` | **readiness** — `200` only when the upstream accepts a connection, else `503` |
 | `/__edgeguard/metrics` | Prometheus metrics (text exposition v0.0.4) |
 | `/__edgeguard/csp-report` | CSP violation report sink (`POST`, logs + counts, returns `204`) |
+
+The full API reference — these endpoints with examples, the headers the proxy adds in each
+direction, every status code EdgeGuard itself can generate (with its access-log `outcome`
+label), the metric/label catalogue, and the managed-mode wire calls — is
+[docs/API.md](docs/API.md).
 
 For a turnkey way to validate and visualize the `edgeguard_*` metrics, the
 [`monitoring/`](monitoring/) directory ships a self-contained **Prometheus + Grafana** stack
@@ -534,6 +665,169 @@ inspect_body = false    # screen the (size-capped) request body (opt in)
   noisy. The path is matched both raw and percent-decoded, so `%2e%2e%2f` is caught as `../`.
 - **Where it runs.** After auth and the size/method checks, just before the request is
   forwarded — so the internal `/__edgeguard/*` endpoints are never inspected.
+
+## Edge DLP (PII / secret redaction)
+
+Edge DLP is the **LLM-traffic guardrail**: it scans the prompt going **to** the model and the
+completion coming **back**, and detects/redacts PII and secrets inline on the proxy hot path — the
+fast, local, single-binary answer to "don't let card numbers / API keys / customer names leave the
+VPC" without a Python + spaCy (Presidio) sidecar. It is **off by default** and configured in
+`[llm.dlp]` (it rides the `[llm]` proxy):
+
+```toml
+[llm.dlp]
+mode = "off"                  # "off" (default) | "report" | "block" | "redact"
+redact_style = "full"         # "full" → [REDACTED:<cat>] | "mask" → keep last 4 | "hash" → stable token
+scan_request = true           # scan the inbound prompt
+scan_response = true          # scan the (buffered) completion, and stream frames
+stream_redact = false         # also rewrite *streamed* SSE frames in redact mode (deterministic spans)
+
+# Deterministic detectors (regex + dictionary + entropy) — the always-on, microsecond fast path:
+detect_email = true
+detect_credit_card = true
+luhn_validate_credit_card = true   # require the Luhn checksum (cuts false positives)
+detect_secrets = true              # AWS keys, provider sk-/pk- keys, PRIVATE KEY blocks
+detect_ssn = true                  # US SSN (NNN-NN-NNNN)
+detect_phone = false               # opt-in (false-positives on ordinary numeric runs)
+detect_iban = false                # opt-in
+detect_high_entropy = false        # catch-all entropy sweep (opt-in)
+gazetteer_terms = ["Project Apollo", "Acme Corp"]   # dictionary deny-list (Aho-Corasick, case-insensitive)
+# custom_patterns = ["INTERNAL-\\d{4}"]             # extra ReDoS-safe regexes → `custom` category
+
+# Optional ML NER family — requires a build with `--features ner` (see below):
+# [llm.dlp.ner]
+# enabled = false
+# model_path = "/models/ner.onnx"
+# tokenizer_path = "/models/tokenizer.json"
+# labels = ["O", "B-PER", "I-PER", "B-LOC", "I-LOC", "B-ORG", "I-ORG"]
+# threshold = 0.5
+```
+
+- **Three deterministic families, fastest-first.** Linear-time `regex` **signatures** (emails, cards,
+  AWS/provider keys, private-key blocks, SSN, phone, IBAN; cards gated by a **Luhn** checksum), a
+  many-term **gazetteer** (Aho-Corasick over your deny-list), and an **entropy** catch-all. All are
+  ReDoS-safe (RE2, no backtracking) and run in microseconds, so they enforce on every request and on
+  every streamed frame.
+- **Report-first ladder, like the WAF.** `report` counts findings
+  (`edgeguard_llm_dlp_findings_total{category=…}`) and passes through; `block` returns **`403`**
+  inbound / withholds the response (`edgeguard_llm_dlp_blocked_total`); `redact` rewrites each span.
+- **Redaction styles.** `full` removes the span (`[REDACTED:email]`); `mask` keeps the last four
+  characters (`***********1111`); `hash` emits a **process-keyed**, non-reversible token over the
+  canonicalized value (formatting like `123-45-6789` vs `123 45 6789` collapses to one token) so the
+  same value redacts identically for the life of the process — correlatable without exposing it, and
+  the SipHash key never leaves the box, so the token can't be brute-forced back to low-entropy PII.
+- **Streaming.** Streamed completions are scanned frame-by-frame with a 256-byte carry buffer so a
+  secret split across two SSE frames is still caught. With `stream_redact = true` (redact mode), the
+  stream is also **rewritten** — deterministic spans only; the ML NER family never runs on the stream.
+  In `block` mode a `text/event-stream` response can't fail closed frame-by-frame (a stream can't be
+  un-sent), so it is **buffered and judged whole** like any other response — block trades streaming for
+  the fail-closed guarantee, while `report`/`redact` keep streaming.
+- **Bad config fails closed at startup / hot-reload.** A bad custom regex, an unknown `mode` /
+  `redact_style`, or `[llm.dlp.ner].enabled` on a binary built without `--features ner` is rejected;
+  on a bad hot-reload the previous policy is kept.
+
+### Architecture & call flow
+
+DLP is **gateway L3** — it runs on the proxy hot path inside `proxy.rs`, at two points in the
+[request/response pipeline](#architecture):
+
+- **Inbound** — after WAF input inspection and before the request is forwarded upstream. Gated by
+  `scan_request`. The matched `mode` decides whether the prompt is reported, blocked (`403`, nothing
+  leaves), or redacted before it reaches the model.
+- **Outbound** — on the model's completion, gated by `scan_response`. A **buffered** body is scanned
+  whole; a **streamed** `text/event-stream` body is scanned frame-by-frame as it flows (with `block`
+  falling back to buffering so it can still fail closed).
+
+The engine itself (`DlpEngine` in `src/dlp.rs`) is pure — no I/O on the deterministic path — so the
+same `scan` / `redact` calls serve both directions. Two entry points exist: **`scan`** (buffered;
+runs every detector family including ML NER when built) and **`scan_stream`** (streaming;
+deterministic families only — NER never runs on partial mid-token frames). Both return findings
+**sorted by offset with overlaps merged** by `merge_findings`, which keeps the higher-confidence
+finding's `category` and `score` as a unit. The optional NER family lives in the sibling
+`edgeguard-ner` crate and is composed in behind `#[cfg(feature = "ner")]`.
+
+**Buffered call flow** (inbound prompt, or buffered completion):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Proxy as Proxy hot path (proxy.rs)
+    participant Engine as DlpEngine (dlp.rs)
+    participant Det as Detector families
+    participant NER as NerEngine (edgeguard-ner)
+
+    Proxy->>Engine: scan(text)
+    Engine->>Det: regex signatures · Luhn · Aho-Corasick gazetteer · entropy
+    Det-->>Engine: raw findings (+ per-finding score)
+    opt built with --features ner
+        Engine->>NER: scan(text)
+        NER-->>Engine: person / address / org spans
+    end
+    Engine->>Engine: merge_findings() — sort, overlap-merge, strongest category+score
+    Engine-->>Proxy: Vec<Finding>
+    alt mode = block
+        Proxy->>Proxy: 403 — drop prompt / withhold response, record_dlp_blocked()
+    else mode = redact
+        Proxy->>Engine: redact(text, findings) → render_redaction() per span
+        Engine-->>Proxy: rewritten body (full / mask / process-keyed hash)
+    else mode = report
+        Proxy->>Proxy: log + record_dlp_finding(category), forward unchanged
+    end
+```
+
+**Streaming call flow** (outbound SSE, `redact` mode with `stream_redact = true`). `CountingBody::poll_frame`
+drives a `DlpStreamScanner` per frame; a boundary tail is held in a 256-byte carry so a span split
+across frames is rewritten whole, and `flush` empties that carry before trailers / end-of-stream:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Body as CountingBody::poll_frame
+    participant Scan as DlpStreamScanner
+    participant Engine as DlpEngine::scan_stream
+
+    loop each SSE data frame
+        Note right of Scan: report-only mode calls record_only(bytes) — counts, no rewrite
+        Body->>Scan: redact_frame(bytes)
+        Scan->>Engine: scan_stream(carry + frame) — deterministic only, no NER
+        Engine-->>Scan: Vec<Finding>
+        Scan->>Scan: rewrite spans, hold boundary tail in carry
+        Scan-->>Body: emit redacted bytes
+        Body-->>Client: forward frame
+    end
+    Body->>Scan: flush() — before any trailers / at end-of-stream
+    Scan-->>Body: final redacted tail
+    Body-->>Client: forward tail, then trailers
+```
+
+**Metrics** (Prometheus, via `/__edgeguard/metrics`): every finding increments
+`edgeguard_llm_dlp_findings_total{category="…"}` (bounded label set) and every `block` decision
+increments `edgeguard_llm_dlp_blocked_total`.
+
+### Optional ML NER (`--features ner`)
+
+The deterministic path can't catch free-form **names, addresses, and organizations**. Build with the
+`ner` feature to add a small **ONNX token-classification NER model** (DeBERTa / BERT-NER class; a
+GLiNER export works too) run through the **pure-Rust [`tract`](https://github.com/sonos/tract)**
+engine — **no `libonnxruntime`, no Python, no C++**, so the air-gap / static story holds:
+
+```bash
+cargo build -p eggrd --release --features ner
+```
+
+The model + `tokenizer.json` are loaded from the paths in `[llm.dlp.ner]`; spans below `threshold`
+are dropped, and the NER engine **degrades to the deterministic path** on any model fault (it never
+fails a request). The default build pulls **none** of the ONNX dependency graph — `--features ner`
+is the only way to opt into it, so the standard `cargo install eggrd` and the distroless image stay
+byte-for-byte the lean proxy. The NER layer lives in the sibling `edgeguard-ner` crate.
+
+> **Compliance tier (paid).** The OSS data plane above does detection + report/block/redact. The
+> paid `ee/` control plane is where a tamper-evident **redaction audit ledger** (entity, category,
+> detector, confidence, action, timestamp), **GDPR/HIPAA rule packs**, and an **EU AI Act Art. 12**
+> compliance export land — wired to the already-reserved `llm-dlp` / `audit-export` Enterprise
+> feature flags (`ee/src/features.rs`). Detection stays OSS/in-path; only the ledger + export are
+> license-gated, preserving the "OSS data plane, paid control plane" boundary.
 
 ## CORS
 

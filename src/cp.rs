@@ -26,11 +26,25 @@ use crate::metrics::Metrics;
 use crate::proxy::Runtime;
 
 /// A usage delta reported to the control plane (matches its `/v3/edge/{id}/usage` wire shape).
+/// The LLM token fields (gateway L4) are only sent when the gateway is active; the control plane
+/// treats them as `#[serde(default)]`, so an older control plane simply ignores them.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct UsageDelta {
     pub requests: u64,
     pub ingress_bytes: u64,
     pub egress_bytes: u64,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_micros: u64,
+    /// Requests the edge denied since the last report (a subset of `requests`). Serialized only; an
+    /// older control plane treats it as `#[serde(default)]` and ignores it.
+    pub blocked: u64,
+    /// WAF matches by rule class since the last report. Serialized only; an older control plane
+    /// treats them as `#[serde(default)]` and ignores them.
+    pub waf_sqli: u64,
+    pub waf_xss: u64,
+    pub waf_path_traversal: u64,
+    pub waf_custom: u64,
 }
 
 /// The subset of the control plane's `PolicyDocument` the edge needs.
@@ -262,36 +276,44 @@ pub async fn report_loop(
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;
         }
-        let (requests, ingress_bytes, egress_bytes) = metrics.drain_usage();
-        if requests == 0 && ingress_bytes == 0 && egress_bytes == 0 {
+        let drained = metrics.drain_usage();
+        if drained.is_empty() {
             continue;
         }
-        let delta = UsageDelta {
-            requests,
-            ingress_bytes,
-            egress_bytes,
-        };
-        if let Err(e) = client.report_usage(&delta).await {
+        if let Err(e) = client.report_usage(&UsageDelta::from(drained)).await {
             warn!(
                 error = format!("{e:#}"),
                 "usage report failed; will retry next period"
             );
-            metrics.restore_usage(requests, ingress_bytes, egress_bytes);
+            metrics.restore_usage(&drained);
         }
     }
     // Best-effort final flush on graceful shutdown so billable usage isn't lost.
-    let (requests, ingress_bytes, egress_bytes) = metrics.drain_usage();
-    if requests > 0 || ingress_bytes > 0 || egress_bytes > 0 {
-        let delta = UsageDelta {
-            requests,
-            ingress_bytes,
-            egress_bytes,
-        };
-        if let Err(e) = client.report_usage(&delta).await {
+    let drained = metrics.drain_usage();
+    if !drained.is_empty() {
+        if let Err(e) = client.report_usage(&UsageDelta::from(drained)).await {
             warn!(
                 error = format!("{e:#}"),
                 "final usage report on shutdown failed"
             );
+        }
+    }
+}
+
+impl From<crate::metrics::DrainedUsage> for UsageDelta {
+    fn from(u: crate::metrics::DrainedUsage) -> Self {
+        UsageDelta {
+            requests: u.requests,
+            ingress_bytes: u.ingress_bytes,
+            egress_bytes: u.egress_bytes,
+            tokens_in: u.tokens_in,
+            tokens_out: u.tokens_out,
+            cost_micros: u.cost_micros,
+            blocked: u.blocked,
+            waf_sqli: u.waf_sqli,
+            waf_xss: u.waf_xss,
+            waf_path_traversal: u.waf_path_traversal,
+            waf_custom: u.waf_custom,
         }
     }
 }
@@ -446,13 +468,21 @@ mod tests {
             requests: 3,
             ingress_bytes: 100,
             egress_bytes: 250,
+            tokens_in: 1_200,
+            tokens_out: 800,
+            cost_micros: 5_000,
+            blocked: 1,
+            ..Default::default()
         })
         .await
         .unwrap();
         let got = stub.last_usage.lock().unwrap().clone().unwrap();
         assert_eq!(got["requests"], 3);
+        assert_eq!(got["tokens_in"], 1_200);
+        assert_eq!(got["cost_micros"], 5_000);
         assert_eq!(got["ingress_bytes"], 100);
         assert_eq!(got["egress_bytes"], 250);
+        assert_eq!(got["blocked"], 1);
     }
 
     #[tokio::test]

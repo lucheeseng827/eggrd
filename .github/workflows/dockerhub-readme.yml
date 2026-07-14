@@ -1,0 +1,29 @@
+# Syncs docs/DOCKERHUB.md to the mancube/eggrd Docker Hub repository overview.
+# Runs whenever the overview file changes on main (the monorepo sync delivers edits here) or on
+# manual dispatch. Kept separate from release.yml so the Docker Hub page can be refreshed without
+# rebuilding images. Uses the cicd-environment secrets DOCKER_USERNAME / DOCKER_PASSWORD.
+name: dockerhub-readme
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/DOCKERHUB.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: cicd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Push overview to Docker Hub
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: mancube/eggrd
+          readme-filepath: ./docs/DOCKERHUB.md
+          short-description: "Drop-in Rust edge proxy: auth, rate limiting, WAF, hardened headers — zero app changes."

@@ -4,7 +4,7 @@
 # the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
 # crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
 name = "eggrd"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
 license = "Apache-2.0"
@@ -92,7 +92,7 @@ argon2 = { version = "0.5", features = ["std"] }
 # A `version` is required alongside `path` so the published `eggrd` manifest is valid (Cargo rejects
 # a path-only dep when packaging). The default build never pulls it (optional, off by default), so
 # `cargo package`/`publish` of eggrd succeeds; the `ner` feature is a build-from-source opt-in.
-edgeguard-ner = { path = "edgeguard-ner", version = "0.1.0", optional = true }
+edgeguard-ner = { path = "edgeguard-ner", version = "0.1.1", optional = true }
 
 [features]
 # Default build is the deterministic-only edge DLP (regex + gazetteer + entropy): no ML, no ONNX,

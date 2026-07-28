@@ -10,6 +10,49 @@ EdgeGuard is the missing front door for any HTTP app (including the ones generat
 - **Default config (baked in):** `/etc/edgeguard/edgeguard.toml`
 - **Source / full docs:** [github.com/lucheeseng827/eggrd](https://github.com/lucheeseng827/eggrd) · Apache-2.0
 
+## Where it fits
+
+EdgeGuard is the **secure front door**: one hop that sits **between your clients and
+the app**, so traffic reaches the app only after it clears auth, rate limiting, and
+validation. Your app stops listening on the public port — EdgeGuard does — and is
+forwarded to *unchanged*. One upstream, one hop; it is not a CDN, an API gateway, or
+an identity provider.
+
+```
+   CLIENTS                 EDGEGUARD                UPSTREAMS
+   (public internet)       (this image)             (what it fronts)
+
+ ┌───────────────┐
+ │ Browsers      │  ─┐
+ │ API callers   │   │          ┌────────────┐ plain HTTP  ┌───────────────┐
+ │ LLM / SSE apps│   ├ TLS·auth▶│  edgeguard │ ─────────▶  │ your app      │
+ │ bots·scanners │   │ rate-lim │  req path  │ (localhost) │ (unchanged)   │
+ └───────────────┘   │ WAF·DLP  │ ────────── │             ├───────────────┤
+ ┌───────────────┐   │          │  resp path │ ─────────▶  │ LLM provider  │
+ │ CDN / LB / DNS│  ─┘ :443/8080│ CSP · HSTS │  hardened   │ static site   │
+ │ (optional)    │              │  cookies   │  response   └───────────────┘
+ └───────────────┘              └─────┬──────┘
+                                      │
+            ┌─────────────────────────┘
+            ├──▶ Redis — one global rate-limit shared across replicas
+            ├──▶ control plane — policy pull · usage · quota (managed mode)
+            └──▶ Prometheus — scrapes /__edgeguard/metrics
+```
+
+- **Upstream** — every client hits EdgeGuard, never the app directly: browsers, API
+  callers, streaming LLM/SSE apps, bots and scanners. It may sit behind a CDN /
+  platform LB that forwards to it; EdgeGuard terminates TLS, authenticates,
+  rate-limits, and screens (WAF / edge DLP) before anything is forwarded.
+- **EdgeGuard** — the request path (auth, limit, validation) in, the response path
+  (CSP/HSTS, cookie hardening, leaky-header stripping) out — one static binary, no
+  required external services.
+- **Downstream** — a wrapped child on `APP_PORT` or an external `UPSTREAM` URL: your
+  own app, a streaming LLM backend, or a static frontend + `/api` backend split via
+  `[[upstreams]]`. The app is forwarded to unchanged — zero code changes.
+- **Side channels (optional)** — Redis for one global rate-limit across replicas, a
+  control plane (managed mode) for policy pull + usage/quota, and Prometheus scraping
+  `/__edgeguard/metrics`.
+
 ## Tags
 
 | Tag | Notes |

@@ -727,8 +727,7 @@ async fn handle_inner(
 
     // LLM unpriced-model policy (gateway L0): when `on_unpriced_model = "block"` and a price book is
     // configured, a request for a model absent from that book is rejected `402` *before* it reaches
-    // the upstream — an unpriced model is never served at a silent $0 (the LiteLLM `#24770` failure,
-    // designed out). Metering-only deployments (empty `[llm.models]`) never trip this. Runs after the
+    // the upstream — an unpriced model is never served at a silent $0. Metering-only deployments (empty `[llm.models]`) never trip this. Runs after the
     // vault (an unknown key is still `401` first) and before the budget reserve (no budget consumed).
     if let Some(model) = llm_model.as_ref() {
         if rt.llm.reject_unpriced(model) {

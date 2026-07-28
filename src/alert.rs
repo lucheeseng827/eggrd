@@ -2,8 +2,8 @@
 //!
 //! When `[alerts]` is enabled, EdgeGuard fires a Slack-compatible alert (`{ "text": … }`) when a
 //! hard-budget's consumed ratio crosses a threshold — cost-regression alerting with **no SaaS
-//! alerting plane** (the confirmed Phoenix gap: alerting gated behind the paid Arize AX cloud; teams
-//! otherwise pipe to Datadog/Grafana). Fire-and-forget: a background POST that never blocks or fails
+//! alerting plane** to depend on, and nothing leaving your own VPC.
+//! Fire-and-forget: a background POST that never blocks or fails
 //! the request. **Edge-triggered**: exactly one alert per crossing into the alert zone (tracked per
 //! budget), so a busy proxy over-budget for a while doesn't spam the channel.
 //!

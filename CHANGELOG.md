@@ -6,6 +6,17 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-07-28
+
+### Changed
+- **Documentation comments describe failure modes rather than attributing them.** A number of
+  doc comments across the LLM metering, DLP and alerting paths justified a design choice by
+  pointing at a specific defect in another vendor's issue tracker. The engineering rationale is
+  unchanged and still stated — an unmask that can restore another caller's value is still the
+  thing reversible masking is built to avoid, and an unknown model is still never served at a
+  silent `$0` — but the reasoning now stands on its own rather than on a third-party bug report
+  that this project does not re-check and cannot keep current.
+
 ## [0.2.1] — 2026-07-15
 
 ### Fixed

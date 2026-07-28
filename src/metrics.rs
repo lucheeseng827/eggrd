@@ -218,7 +218,7 @@ pub struct Metrics {
     /// Server-side time-to-first-token histogram (buckets parallel to [`LATENCY_BUCKETS`]) for
     /// streamed LLM responses, measured in the gateway as frames flow — no client clock, no in-app
     /// instrumentation. A trace backend only sees span-end duration, so this is a request-path-only
-    /// signal (Phoenix declined to build first-class TTFT; Langfuse approximates from a client clock).
+    /// signal, and a server-measured one rather than a client-clock approximation.
     llm_ttft_buckets: Vec<AtomicU64>,
     llm_ttft_sum_micros: AtomicU64,
     llm_ttft_count: AtomicU64,

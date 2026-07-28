@@ -43,7 +43,7 @@ pub struct Config {
 /// Outbound alerting (`[alerts]`). When `enabled` with a `webhook_url`, EdgeGuard POSTs a
 /// Slack-compatible alert (`{ "text": … }`) when a hard-budget's consumed ratio (`used/limit`)
 /// crosses `budget_consumed_threshold` — cost-regression alerting entirely in your own VPC (no SaaS
-/// alerting plane; the confirmed Phoenix gap of gating alerting behind a paid cloud). Fire-and-forget
+/// alerting plane to depend on). Fire-and-forget
 /// and **edge-triggered** (one alert per crossing into the alert zone, not one per request). Off by
 /// default. A first cut on budget breaches; latency-percentile / error-rate / eval-drift rules follow.
 #[derive(Debug, Clone, Deserialize)]
@@ -188,7 +188,8 @@ pub struct DlpCfg {
     /// stable placeholder token (`<edgeguard-<cat>-<n>>`) instead of an irreversible `[REDACTED]`
     /// tag, and the placeholder→original map is kept for the request so the **response is unmasked**
     /// (buffered *and* streamed) back to the original value. The provider never sees the PII; the
-    /// client gets its own data back — the round-trip `litellm#22821` gets wrong. Off by default.
+    /// client gets its own data back — the round-trip an unmask keyed on shared state gets wrong.
+    /// Off by default.
     /// When on, the response is unmasked rather than re-scanned/redacted (restore, not detect).
     pub reversible: bool,
     /// Built-in detectors.

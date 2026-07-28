@@ -1,5 +1,5 @@
-# Competitor baseline: Envoy as a pure reverse proxy to the SAME upstream.
-# C++ heavyweight feature twin — proves EdgeGuard beats the feature-heavy option on footprint.
+# Reference baseline: Envoy as a pure reverse proxy to the SAME upstream, so the rig measures
+# the same work on both sides.
 # Just the HTTP connection manager + router -> one cluster. No ext_authz, no rate-limit filter,
 # no header mutation: the bare proxy tax, comparable to EdgeGuard's baseline.
 

@@ -2259,7 +2259,7 @@ async fn spawn_sse_placeholder_then_multibyte_split_upstream() -> SocketAddr {
     addr
 }
 
-/// Reversible masking (gateway L3, litellm#22821): the provider only ever sees a placeholder, and the
+/// Reversible masking (gateway L3): the provider only ever sees a placeholder, and the
 /// client gets its own value restored on the response — the round-trip an irreversible tag can't do.
 #[tokio::test]
 async fn dlp_reversible_masks_at_provider_and_unmasks_to_client() {

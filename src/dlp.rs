@@ -600,7 +600,7 @@ const MAX_PLACEHOLDER_BYTES: usize = 96;
 /// A **reversible** mask map: the placeholder↔original mapping built while redacting an inbound
 /// request, used to **unmask** the response (buffered and streamed) back to the caller's own values.
 /// The provider only ever sees placeholders; the client gets its data restored — the round-trip an
-/// irreversible `[REDACTED]` tag (and the broken `litellm#22821` unmask) cannot do.
+/// irreversible `[REDACTED]` tag (and any unmask that can restore another caller's value) cannot do.
 ///
 /// Identical source values collapse to one placeholder (so the model sees a consistent token and the
 /// unmask is unambiguous). The map is per-request and short-lived; it holds plaintext PII in memory
@@ -1245,7 +1245,7 @@ mod tests {
         assert!(r.is_err(), "enabling NER without the feature must error");
     }
 
-    // ---- Reversible mask map (gateway L3, litellm#22821 designed out) --------------------------
+    // ---- Reversible mask map (gateway L3, cross-client unmask designed out) --------------------
 
     #[test]
     fn prompt_injection_is_opt_in_and_high_precision() {

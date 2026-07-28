@@ -15,7 +15,7 @@
 //! is a config choice ([`UnpricedPolicy`]): `count` keeps the historical fail-open behaviour (tokens
 //! counted, cost omitted — surfaced as the `unpriced` result), while `block` fails *closed* (`402`,
 //! the request never reaches the upstream) so a mispriced/unknown model can't be served at a silent
-//! `$0` — the LiteLLM `#24770` failure, designed out. Cost is accumulated in **micro-dollars**
+//! `$0`. Cost is accumulated in **micro-dollars**
 //! (1e-6 USD) as an integer to avoid float drift in a monotonic counter.
 //!
 //! Token accounting captures four dimensions, not two: `prompt` and `completion`, plus the
@@ -116,7 +116,7 @@ pub enum UnpricedPolicy {
     /// Meter tokens, omit cost (`unpriced` result), forward the request — the historical default.
     Count,
     /// Reject the request `402` before it reaches the upstream, so an unpriced model is never served
-    /// at a silent `$0` (the LiteLLM `#24770` failure). Only bites when a price book is configured.
+    /// at a silent `$0`. Only bites when a price book is configured.
     Block,
 }
 
@@ -217,10 +217,10 @@ impl LlmRuntime {
     }
 
     /// Resolve the price for `model`: an exact book entry wins; otherwise a provider-prefixed alias
-    /// (LiteLLM/OpenTelemetry-style `"openai/gpt-4o"`) falls back to the bare model name. Exact
+    /// (OpenTelemetry-style `"openai/gpt-4o"`) falls back to the bare model name. Exact
     /// entries always take precedence, so a book that prices the prefixed name explicitly is never
     /// overridden — this only rescues a prefixed request that would otherwise read `$0`/`unpriced`
-    /// (Opik #5621, Portkey #1564, LiteLLM #15329).
+    /// because the book is keyed on the bare name.
     fn resolve_rate(&self, model: &str) -> Option<&ModelRate> {
         if let Some(rate) = self.prices.get(model) {
             return Some(rate);
@@ -258,10 +258,10 @@ impl LlmRuntime {
     }
 }
 
-/// Provider prefixes used by LiteLLM/OpenTelemetry-style model ids (`"openai/gpt-4o"`). Stripping a
+/// Provider prefixes used by OpenTelemetry-style model ids (`"openai/gpt-4o"`). Stripping a
 /// known prefix lets a price book keyed by the bare model name still price a prefixed request instead
-/// of reading `$0` (Opik #5621, Portkey #1564). Deliberately a **curated** list — not "everything
-/// before the first slash" — so HuggingFace/OpenRouter-style ids like `"meta-llama/Llama-3"` are left
+/// of reading `$0`. Deliberately a **curated** list — not "everything
+/// before the first slash" — so HuggingFace-style ids like `"meta-llama/Llama-3"` are left
 /// intact and only unambiguous single-provider prefixes are stripped.
 const PROVIDER_PREFIXES: &[&str] = &[
     "openai/",
@@ -643,15 +643,15 @@ output_per_1m = 10.0
         assert!(UnpricedPolicy::parse("banana").is_err());
     }
 
-    // --- correctness guards for the #1 cross-competitor cost bug (top-20 QW #2) ------------
+    // --- correctness guards for the most common token/cost inflation bug ------------------
     // These lock in behaviour that is correct by construction, so a future refactor can't
-    // reintroduce the token/cost inflation seen across Langfuse, Weave, OpenLLMetry, Phoenix.
+    // reintroduce the inflation this class of bug produces.
 
     #[test]
     fn sse_usage_is_the_last_frame_never_the_sum_of_cumulative_chunks() {
         // Some providers (notably Gemini) repeat CUMULATIVE usage on every streamed chunk.
         // An accumulator that SUMS per-chunk usage then reports "massively inflated token
-        // counts" (W&B Weave #5880). eggrd takes the LAST authoritative frame, never a sum.
+        // counts". eggrd takes the LAST authoritative frame, never a sum.
         let stream = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10}}\n\n\
                       data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":25}}\n\n\
                       data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":60,\"total_tokens\":160}}\n\n\
@@ -669,7 +669,8 @@ output_per_1m = 10.0
 
     #[test]
     fn cached_prompt_tokens_are_never_billed_at_the_output_rate() {
-        // Phoenix's ~18-20x overstatement: cached (and reasoning) tokens get folded into
+        // The overstatement this guards against (an order of magnitude on cache-heavy
+        // traffic): cached (and reasoning) tokens get folded into
         // "completion = total - prompt" and billed at the (much higher) output rate. eggrd
         // prices each of the four token tiers at its own rate, subtracted from the base, so a
         // fully-cached prompt is billed at the cached rate — never the output rate.
@@ -701,8 +702,8 @@ output_per_1m = 10.0
 
     #[test]
     fn metering_reads_the_usage_object_not_the_request_body_size() {
-        // Multimodal base64 in the *request* must not inflate metered tokens (OpenLLMetry
-        // #3949 counted base64 image bytes as text tokens). eggrd meters from the upstream's
+        // Multimodal base64 in the *request* must not inflate metered tokens (counting base64
+        // image bytes as text tokens is a common miscount). eggrd meters from the upstream's
         // authoritative `usage`; the body-length heuristic is only the pre-flight reserve.
         let rt = runtime();
         let resp = br#"{"usage":{"prompt_tokens":50,"completion_tokens":10}}"#;
@@ -720,7 +721,7 @@ output_per_1m = 10.0
     #[test]
     fn provider_prefixed_model_resolves_to_the_bare_price() {
         // The #1 cross-competitor cost bug: "openai/gpt-4o" misses a book keyed by "gpt-4o" and
-        // reads $0 (Opik #5621, Portkey #1564). We resolve the bare name as a fallback.
+        // reads $0. We resolve the bare name as a fallback.
         let rt = runtime(); // book has "gpt-4o"
         let usage = Usage {
             prompt_tokens: 1_000,
@@ -773,8 +774,8 @@ output_per_1m = 10.0
 
     #[test]
     fn unknown_or_huggingface_style_prefix_is_left_unpriced() {
-        // A curated prefix list: an org/model id that isn't a known provider prefix (HuggingFace,
-        // OpenRouter) must NOT be stripped, so it stays unpriced rather than mis-resolving.
+        // A curated prefix list: an org/model id that isn't a known provider prefix
+        // (HuggingFace-style) must NOT be stripped, so it stays unpriced rather than mis-resolving.
         let rt = runtime();
         assert!(!rt.is_priced("meta-llama/Llama-3-8b"));
         assert_eq!(

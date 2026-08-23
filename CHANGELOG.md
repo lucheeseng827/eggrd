@@ -6,6 +6,78 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-08-24
+
+Three capabilities this crate shipped were compiled but had never been run against real
+infrastructure. Running them found one of the three genuinely broken, and that fix is the
+reason this is a minor bump rather than a patch.
+
+### Fixed
+- **ACME certificate issuance was broken in the field, and is now proven working.**
+  The pinned `instant-acme` 0.7.2 (October 2024) could no longer parse Let's Encrypt's
+  current authorization payload, so every issuance attempt failed at the first
+  authorization with:
+
+      Error: ACME certificate provisioning
+      Caused by:
+        0: fetching authorizations
+        1: missing field `token`
+
+  This affected anyone relying on `[tls] acme = true` for automatic certificates — the
+  proxy started, then failed to obtain a certificate. Bumped to `instant-acme` 0.8 and
+  reworked the order flow around its API: the HTTP-01 challenge responder is now started
+  **before** the authorizations are walked (the previous order raced the CA's validation),
+  challenges are marked ready explicitly, and both the order and the certificate are polled
+  with a retry policy instead of a hand-rolled sleep loop.
+
+  Verified end to end twice: against a local Pebble CA, and against Let's Encrypt's staging
+  environment, which issued a real certificate in about five seconds
+  (`CN=acme-test.eggrd.dev`, issuer `(STAGING) Artificial Amaranth YE1`).
+  `docs/ACME_TESTING.md` carries both recipes and every trap that stopped them working.
+
+### Removed
+- **The `rcgen` dependency.** `instant-acme` 0.8 generates the key pair and CSR inside
+  `finalize()` and returns the private key, so nothing in this crate constructed a
+  certificate itself any more. `rcgen` had been left behind as an unused dependency — in a
+  proxy that terminates TLS, an unused crypto dependency is supply-chain surface with no
+  compensating benefit.
+
+### Added
+- **Native `linux/arm64` images.** Releases now build each architecture on its own native
+  runner (`ubuntu-24.04` and `ubuntu-24.04-arm`), push by digest, and merge the two into one
+  multi-arch manifest. The release fails if the merged manifest does not contain both
+  architectures, so a half-published image cannot pass as a green release. Previous images
+  were amd64 only. The release also now asserts that `Cargo.toml` matches the tag being
+  released — the image tag came from the git tag while `--version` came from the manifest,
+  and nothing compared them, so a forgotten bump could have published an image labelled
+  `0.3.0` containing a binary reporting `0.2.2`.
+- **`examples/tls-termination.toml`** — a TLS configuration that has actually been run,
+  with the reproduce recipe in its header. Explicitly marked as a demonstration rather than
+  a production template.
+- **`docs/ACME_TESTING.md`** — how to test ACME locally against Pebble and against Let's
+  Encrypt staging, plus each failure encountered on the way and the misleading symptom it
+  presented.
+
+### Changed
+- **CI now runs on the public repository.** The crate's `ci.yml` travelled with the source
+  but was never registered, so the public repository had no CI at all after 2026-07-28. It
+  and the new `release.yml` are now shipped by the release pipeline and run on every push
+  there.
+
+### Proven, not changed
+No code change, but previously undemonstrated and now exercised:
+- **TLS termination with a supplied certificate** — TLS 1.3 negotiated, certificate
+  verified, the upstream response proxied back through it, plaintext refused on the TLS
+  port, and all six hardening headers present on the response.
+- **The shared-store rate limiter** — two replicas against one Redis, thirty requests from
+  a single client alternating between them: **5 allowed** against one shared key. The same
+  run with the per-replica store allowed **10**, exactly twice, which is the reason the
+  shared store exists.
+
+The **WASM edge worker remains unproven.** The crate compiles to
+`wasm32-unknown-unknown`, but `worker-build` — the step that produces the deployable
+bundle — fails on the pinned toolchain, so there is no artifact to run.
+
 ## [0.2.2] — 2026-07-28
 
 ### Changed
@@ -321,7 +393,10 @@ unchanged). Ships the v0–v2.5 feature set below.
 - Added an optional `validation.max_response_body` cap so a huge upstream response can't
   OOM the proxy.
 
-[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lucheeseng827/eggrd/compare/v0.2.2...v0.3.0
+[0.2.2]: https://github.com/lucheeseng827/eggrd/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/lucheeseng827/eggrd/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/lucheeseng827/eggrd/compare/v0.1.5...v0.2.0
 [0.1.3]: https://github.com/lucheeseng827/eggrd/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/lucheeseng827/eggrd/compare/v0.1.1...v0.1.2

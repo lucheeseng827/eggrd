@@ -4,7 +4,7 @@
 # the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
 # crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
 name = "eggrd"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
 license = "Apache-2.0"
@@ -76,10 +76,9 @@ tower-http = { version = "0.6", features = ["compression-gzip"] }
 # ACME / Let's Encrypt automatic certificates (HTTP-01), and CSR/key generation for it.
 # 0.7.2 (Oct 2024) could not parse Let's Encrypt's current authorization payload —
 # `missing field \`token\`` — so ACME issuance was broken in the field. 0.8 also
-# generates the key + CSR in `finalize()`, which is why rcgen is no longer needed
-# on this path.
+# generates the key + CSR in `finalize()`, which is why rcgen was dropped in 0.3.0:
+# nothing in this crate constructed a certificate itself any more.
 instant-acme = "0.8"
-rcgen = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Generate a request id (UUID v4) when an inbound request doesn't carry one, for end-to-end log

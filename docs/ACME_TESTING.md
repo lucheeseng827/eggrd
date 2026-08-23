@@ -4,7 +4,7 @@
 ordinary suite — it needs a certificate authority to talk to and port 80 to bind
 — so it lives behind `#[ignore]` and the two recipes below.
 
-Both were run on **2026-08-24** and both pass. That is new: the test had existed
+Both were run on **2026-08-23** and both pass. That is new: the test had existed
 for months and had **never once passed**, for four separate reasons. They are all
 written down in [Everything that was wrong](#everything-that-was-wrong), because
 every one of them produced a misleading symptom, and a future reader hitting any
@@ -49,7 +49,7 @@ test acme::tests::acme_http01_issues_against_pebble ... ok
 
 If your host cannot spare port 80, run the test in a container on the same
 network with a fixed address, and point `challtestsrv` at that address. This is
-how the 2026-08-24 run was done:
+how the 2026-08-23 run was done:
 
 ```sh
 podman network create acmenet --subnet 10.91.0.0/24
@@ -66,7 +66,8 @@ podman run --rm --network acmenet --ip 10.91.0.20 \
   -e EDGEGUARD_TEST_ACME_DIR=https://pebble:14000/dir \
   -e EDGEGUARD_TEST_ACME_DOMAIN=edgeguard.test \
   docker.io/library/rust:latest \
-  sh -c 'cp /repo/pebble.minica.pem /usr/local/share/ca-certificates/pebble.crt \
+  sh -c 'curl -sL https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/pebble.minica.pem \
+           -o /usr/local/share/ca-certificates/pebble.crt \
          && update-ca-certificates >/dev/null \
          && cargo test -p eggrd --lib acme_http01 -- --ignored'
 ```
@@ -105,7 +106,7 @@ cache_dir     = "/acme"
 accept_tos    = true
 ```
 
-The 2026-08-24 run issued in **five seconds**:
+The 2026-08-23 run issued in **five seconds**:
 
 ```
 INFO edgeguard::acme: starting ACME order domains=["acme-test.eggrd.dev"]

@@ -105,6 +105,22 @@ jobs:
           echo "push=$push"       >> "$GITHUB_OUTPUT"
           echo "Building $version for ${{ matrix.platform }} (push=$push)"
 
+      - name: Assert Cargo.toml agrees with the release version
+        env:
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The image tag comes from the git tag, but the binary's --version comes from
+          # Cargo.toml. Nothing else compares them, so a forgotten bump would publish
+          # `eggrd:0.3.0` containing a binary that reports 0.2.2 — a mismatch nobody
+          # notices until someone is debugging the wrong source.
+          crate=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$crate" != "$VERSION" ]; then
+            echo "::error::Cargo.toml is $crate but this release is $VERSION — bump Cargo.toml, or retag."
+            exit 1
+          fi
+          echo "Cargo.toml $crate matches release $VERSION."
+
       - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
       - name: Log in to Docker Hub

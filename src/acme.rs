@@ -1,19 +1,19 @@
 //! ACME (Let's Encrypt) automatic certificates via the HTTP-01 challenge, using
-//! `instant-acme` for the protocol and `rcgen` for the CSR.
+//! `instant-acme` for the protocol; it generates the key and CSR in `finalize()`.
 //!
 //! Flow: create/restore an ACME account → open an order for the configured domains → answer
 //! each domain's HTTP-01 challenge from a tiny listener on port 80 → finalize with a freshly
 //! generated key + CSR → write the issued chain and key to [`TlsCfg::cert_path`] /
 //! [`TlsCfg::key_path`], which the TLS listener then loads.
 //!
-//! # Proven working, 2026-08-24 (instant-acme 0.8)
+//! # Proven working, 2026-08-23 (instant-acme 0.8)
 //!
 //! `acme_http01_issues_against_pebble` passes against Pebble, a real ACME CA. It is the first
 //! time it ever has. It was blocked by four separate things, none of them this module's logic:
 //!
 //! 1. the test never installed a rustls `CryptoProvider`, so it panicked before any ACME ran;
 //! 2. `instant-acme` 0.7.2 (Oct 2024) could not parse the CA's authorization payload —
-//!    `missing field \`token\`` — which is what broke issuance in the field;
+//!    `` `missing field `token` `` `` — which is what broke issuance in the field;
 //! 3. 0.7 verified against compiled-in webpki-roots, so no private test CA could be trusted.
 //!    0.8 uses the platform trust store, so installing Pebble's root now works;
 //! 4. the test rig itself: the wrong Pebble root, the wrong challtestsrv flag, and AAAA
@@ -22,9 +22,10 @@
 //! NOTE: this path talks to a live ACME CA and binds port 80, so it is not exercised by the
 //! *default* suite (no domain, no inbound :80). A `#[ignore]`d end-to-end test
 //! (`acme_http01_issues_against_pebble`) is written against **Pebble** (a tiny test ACME CA) —
-//! see the test for the setup and `loadtest/pebble.compose.yaml`. It does **not** pass yet, and
-//! the reason is not this module: the ACME client trusts a compile-time root list, so a private
-//! test CA cannot be added to it. Read the test comment before assuming this path is verified.
+//! see the test for the setup and `loadtest/pebble.compose.yaml`. It **passes** against Pebble
+//! (0.8 verifies with the platform trust store, so a private test CA can now be installed — see
+//! the four blockers above and `docs/ACME_TESTING.md`); it stays `#[ignore]`d only because it
+//! needs a live CA and inbound port 80, which the default suite has neither of.
 //! The default directory is Let's Encrypt **staging** (see `AcmeCfg::directory_url`) precisely so
 //! a first run can't burn production rate limits.
 

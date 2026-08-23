@@ -1,7 +1,7 @@
 # Local test ACME CA for `src/acme.rs::acme_http01_issues_against_pebble`.
 #
 # Pebble (https://github.com/letsencrypt/pebble) is a small real ACME CA for testing. This file
-# was WRONG in three ways until 2026-08-24 and the test could not pass with it; each one is
+# was WRONG in three ways until 2026-08-23 and the test could not pass with it; each one is
 # called out below, because each cost an attempt to find.
 #
 # Bring it up:

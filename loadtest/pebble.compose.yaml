@@ -1,25 +1,43 @@
-# Local test ACME CA for the `#[ignore]`d HTTP-01 proof test (`src/acme.rs::acme_http01_issues_against_pebble`).
+# Local test ACME CA for `src/acme.rs::acme_http01_issues_against_pebble`.
 #
-# Pebble (https://github.com/letsencrypt/pebble) is a tiny ACME CA for testing — it issues real
-# certs over a self-signed directory at https://localhost:14000/dir without the production rate
-# limits. `pebble-challtestsrv` provides the DNS so the test domain resolves to the host running
-# the proxy's :80 HTTP-01 challenge server.
+# Pebble (https://github.com/letsencrypt/pebble) is a small real ACME CA for testing. This file
+# was WRONG in three ways until 2026-08-24 and the test could not pass with it; each one is
+# called out below, because each cost an attempt to find.
 #
-# This is a STARTING POINT — adjust the validation network to your host. Bring it up:
-#   docker compose -f loadtest/pebble.compose.yaml up
-# then trust Pebble's CA and run the test (see the comment on the test):
-#   export SSL_CERT_FILE=/path/to/pebble.minica.pem
-#   EDGEGUARD_TEST_ACME_DIR=https://localhost:14000/dir sudo -E cargo test -p eggrd --lib acme_http01 -- --ignored
+# Bring it up:
+#   docker compose -f loadtest/pebble.compose.yaml up -d
+#
+# Trust Pebble's DIRECTORY certificate — see the note on `pebble` below for which root:
+#   curl -sL https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/pebble.minica.pem \
+#     | sudo tee /usr/local/share/ca-certificates/pebble.crt >/dev/null
+#   sudo update-ca-certificates
+#
+# Then run it (`sudo`/CAP_NET_BIND_SERVICE so the challenge server can bind :80):
+#   EDGEGUARD_TEST_ACME_DIR=https://localhost:14000/dir \
+#   EDGEGUARD_TEST_ACME_DOMAIN=edgeguard.test \
+#   sudo -E cargo test -p eggrd --lib acme_http01 -- --ignored
+#
+# instant-acme 0.8 verifies with the PLATFORM trust store, so installing the root above is
+# enough. Under 0.7 it used compiled-in webpki-roots and no private CA could ever be trusted —
+# that is why this test had never passed.
 name: eggrd-pebble
 
 services:
   pebble:
     image: ghcr.io/letsencrypt/pebble:latest
-    # Validate challenges immediately (no random sleep); point the resolver at challtestsrv so
-    # Pebble looks up the test domain there instead of real DNS.
+    # FIX 1 — httpPort must be 80. Pebble's default validation port is 5002, but eggrd's
+    # HTTP-01 challenge server binds :80 (RFC 8555 §8.3), so the default can never reach it.
+    # pebble-config.json below overrides it.
+    #
+    # WHICH ROOT TO TRUST: Pebble serves TWO different roots and they are not interchangeable.
+    # `https://localhost:15000/roots/0` is the root for certificates Pebble ISSUES. The
+    # directory endpoint's own TLS certificate is signed by the separate *minica* root
+    # (test/certs/pebble.minica.pem). Trusting /roots/0 still fails with UnknownIssuer.
     command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "challtestsrv:8053"]
     environment:
-      PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_VA_NOSLEEP: "1"   # validate immediately instead of sleeping randomly
+    volumes:
+      - ./pebble-config.json:/test/config/pebble-config.json:ro
     ports:
       - "14000:14000" # ACME directory
       - "15000:15000" # management API
@@ -28,11 +46,23 @@ services:
 
   challtestsrv:
     image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
-    # Resolve every A query to the host gateway (where the cargo test binds the :80 challenge
-    # server). On Docker Desktop `host-gateway` maps to the host; on plain Linux set this to the
-    # host's IP reachable from the pebble container.
-    command: ["-defaultIPv4", "host-gateway", "-dns01", ":8053", "-management", ":8055"]
+    # FIX 2 — the flag is `-dnsserver`, not `-dns01`. With `-dns01` the container exits(2)
+    # printing usage, Pebble's resolver times out, and the failure surfaces as an opaque
+    # "i/o timeout" from the CA rather than as a broken test rig.
+    #
+    # FIX 3 — `-defaultIPv6 ""` is required. It otherwise answers AAAA with ::1, Pebble
+    # prefers IPv6, and validation dials [::1]:80 and is refused, even though the A record
+    # is perfectly correct.
+    command:
+      - "-defaultIPv4"
+      - "host-gateway"      # the host running the test; set to an explicit IP on plain Linux
+      - "-defaultIPv6"
+      - ""
+      - "-dnsserver"
+      - ":8053"
+      - "-management"
+      - ":8055"
     extra_hosts:
       - "host-gateway:host-gateway"
     ports:
-      - "8055:8055" # challtestsrv management (set/clear DNS at runtime if needed)
+      - "8055:8055" # management API, to set/clear DNS at runtime

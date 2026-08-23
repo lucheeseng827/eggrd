@@ -1,0 +1,41 @@
+# Proven working 2026-08-23 against eggrd 0.2.2. Reproduce:
+#
+#   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+#     -keyout key.pem -out cert.pem -subj '/CN=eggrd.test' \
+#     -addext 'subjectAltName=DNS:eggrd.test'
+#
+#   podman run -d --name up --network tlsnet nginx:alpine
+#   podman run -d --name egtls --network tlsnet \
+#     -v "$PWD:/cfg" -v "$PWD/tls:/tls" \
+#     -e EDGEGUARD_CONFIG=/cfg/tls-termination.toml mancube/eggrd:0.2.2
+#
+#   curl --cacert cert.pem --resolve eggrd.test:8443:<ip> https://eggrd.test:8443/
+#
+# Observed: TLS 1.3 / TLS_AES_256_GCM_SHA384, certificate verified, the upstream
+# nginx page returned through the tunnel, plaintext on :8443 refused, and all six
+# hardening headers present on the response.
+#
+# NOT A PRODUCTION TEMPLATE. `eggrd doctor` reports 0 errors and 2 warnings on
+# this file — auth is off and rate limiting is off — and both are deliberate:
+# the point here is to isolate TLS termination so the proof has one variable.
+# A real front door turns both back on.
+#
+# TLS termination with a supplied certificate. ACME is off: issuance is a
+# separate claim, and this config proves only that eggrd terminates TLS.
+[server]
+port = 8443
+upstream = "http://up:80"
+
+[auth]
+mode = "none"
+
+[ratelimit]
+enabled = false
+
+[tls]
+enabled = true
+cert_path = "/tls/cert.pem"
+key_path = "/tls/key.pem"
+
+[tls.acme]
+enabled = false

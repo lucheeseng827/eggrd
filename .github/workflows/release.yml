@@ -1,0 +1,208 @@
+# Release: build and push the multi-arch mancube/eggrd image.
+#
+# THIS RUNS ON THE PUBLIC MIRROR (lucheeseng827/eggrd), not in the monorepo.
+# GitHub Actions only runs workflows from `.github/workflows` at a repository root,
+# so this file does nothing where it lives; it is shipped to the mirror by
+# `.ossync.yaml` and runs there. That is deliberate: the mirror is public, and
+# public repositories get free `ubuntu-24.04-arm` runners.
+#
+# ── Why a matrix of native runners, and not `platforms: linux/amd64,linux/arm64`
+#
+# One x86 runner building both architectures means QEMU emulating aarch64, and a
+# `cargo build --release` under emulation is brutal: the 2026-07-14 release run on
+# this repo took **1h26m**. The same repo's `build-doneyet-backend.yml` already
+# moved off QEMU for exactly this reason and records 5–10 min cold, 1–3 min warm.
+#
+# So each architecture builds on its own native runner, in parallel, and pushes by
+# digest with no tag. A final job stitches the two digests into one manifest with
+# `docker buildx imagetools create`. Wall-clock is the slower of the two builds
+# rather than their sum, and nothing is emulated.
+#
+# ── Secrets
+#
+# `DOCKER_USERNAME` / `DOCKER_PASSWORD` on the `cicd` environment. A job must
+# declare `environment: cicd` for `secrets.*` to resolve at all — omit it and the
+# workflow runs green having pushed nothing, which is worse than failing.
+name: release
+
+on:
+  # The monorepo's sync job ends with `gh release create vX --repo lucheeseng827/eggrd`,
+  # so `release: published` is the trigger that actually fires in normal operation. The
+  # tag-push trigger is kept for a tag pushed directly on the mirror; a release created
+  # through the API does not always raise a push event, and relying on that alone is how
+  # a release silently ships no image.
+  release:
+    types: [published]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag the image with (e.g. 0.2.3). Defaults to the git tag."
+        required: false
+      push:
+        description: "Push to Docker Hub. false does a build-only dry run."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: mancube/eggrd
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    environment: cicd
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          # Free for public repositories. This is the line that brings arm64 back
+          # without paying 80 minutes of emulation for it.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    outputs:
+      push: ${{ steps.cfg.outputs.push }}
+      version: ${{ steps.cfg.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Resolve version and whether to push
+        id: cfg
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+          DISPATCH_PUSH: ${{ inputs.push }}
+          REF_NAME: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          HAS_CREDS: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$DISPATCH_VERSION" ]; then
+            version="$DISPATCH_VERSION"
+          elif [ -n "$RELEASE_TAG" ]; then
+            version="${RELEASE_TAG#v}"        # release event
+          else
+            version="${REF_NAME#v}"           # tag push
+          fi
+          # A version is required: without one the tags below would be garbage.
+          case "$version" in
+            ""|v*) echo "::error::could not derive a version (event=$EVENT ref=$REF_NAME tag=$RELEASE_TAG)"; exit 1 ;;
+          esac
+          # A fork has no credentials; build anyway so the Dockerfile stays honest,
+          # but never claim to have pushed.
+          push=true
+          [ "$EVENT" = "workflow_dispatch" ] && [ "$DISPATCH_PUSH" != "true" ] && push=false
+          [ "$HAS_CREDS" != "true" ] && push=false
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "push=$push"       >> "$GITHUB_OUTPUT"
+          echo "Building $version for ${{ matrix.platform }} (push=$push)"
+
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Log in to Docker Hub
+        if: steps.cfg.outputs.push == 'true'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # Push by digest only. Tags are applied once, on the merged manifest, so a
+      # half-finished release never leaves a tag pointing at a single architecture.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: ${{ steps.cfg.outputs.push == 'true' }}
+          # Keep the manifest a plain multi-arch image: some runtimes choke on the
+          # attestation manifest buildx adds by default.
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=${{ steps.cfg.outputs.push }},name-canonical=true,push=${{ steps.cfg.outputs.push }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export the digest
+        if: steps.cfg.outputs.push == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          test -n "$digest" || { echo "::error::build produced no digest"; exit 1; }
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: steps.cfg.outputs.push == 'true'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: merge manifest
+    needs: [build]
+    if: needs.build.outputs.push == 'true'
+    runs-on: ubuntu-24.04
+    environment: cicd
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Create and push the multi-arch manifest
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd /tmp/digests
+          n=$(ls -1 | wc -l)
+          # Two digests, or the manifest would silently ship one architecture.
+          [ "$n" -eq 2 ] || { echo "::error::expected 2 digests, found $n"; exit 1; }
+          major_minor="${VERSION%.*}"
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:${major_minor}" \
+            -t "${IMAGE}:latest" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Verify both architectures are really in the manifest
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          out=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw)
+          echo "$out" | grep -q '"architecture":"amd64"' || { echo "::error::amd64 missing"; exit 1; }
+          echo "$out" | grep -q '"architecture":"arm64"' || { echo "::error::arm64 missing"; exit 1; }
+          echo "amd64 and arm64 both present in ${IMAGE}:${VERSION}"
+
+      - name: Summary
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          {
+            echo "### Pushed \`${IMAGE}:${VERSION}\`"
+            echo
+            echo "- \`linux/amd64\` built natively on \`ubuntu-24.04\`"
+            echo "- \`linux/arm64\` built natively on \`ubuntu-24.04-arm\` (no QEMU)"
+            echo "- tags: \`${VERSION}\`, \`${VERSION%.*}\`, \`latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

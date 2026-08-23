@@ -464,6 +464,15 @@ when `ratelimit.store = "redis"`), a **control plane** (managed mode: the `cp.rs
 pull/report loops against the private `ee/` workspace), and the ACME CA at
 certificate issuance.
 
+[![EdgeGuard system context](docs/images/architecture-system-context.png)](docs/images/architecture-system-context.png)
+
+<sub>Redrawn from the Mermaid source below. The drawing folds the listener into the
+request pipeline it always precedes, drops the `--wrap` supervisor and the admin
+router / Prometheus scrape as cross-cutting, and attaches the control plane to the
+runtime snapshot it actually feeds. Source:
+[`docs/images/architecture-system-context.html`](docs/images/architecture-system-context.html).
+The same topology as Mermaid, for diffing and for editing the drawing from:</sub>
+
 ```mermaid
 flowchart TD
     client["Clients — browsers · API callers · LLM apps"]
@@ -1133,3 +1142,7 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 Unless you explicitly state otherwise, any contribution intentionally submitted for
 inclusion in this project by you, as defined in the Apache-2.0 license, shall be
 licensed as above, without any additional terms or conditions.
+
+## Testing ACME issuance
+
+[docs/ACME_TESTING.md](docs/ACME_TESTING.md) has both recipes — Pebble locally for a ten-second loop, Let's Encrypt staging on a public host for the real thing — plus every trap that stopped them working.

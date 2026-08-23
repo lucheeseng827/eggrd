@@ -6,17 +6,31 @@
 //! generated key + CSR → write the issued chain and key to [`TlsCfg::cert_path`] /
 //! [`TlsCfg::key_path`], which the TLS listener then loads.
 //!
+//! # Proven working, 2026-08-24 (instant-acme 0.8)
+//!
+//! `acme_http01_issues_against_pebble` passes against Pebble, a real ACME CA. It is the first
+//! time it ever has. It was blocked by four separate things, none of them this module's logic:
+//!
+//! 1. the test never installed a rustls `CryptoProvider`, so it panicked before any ACME ran;
+//! 2. `instant-acme` 0.7.2 (Oct 2024) could not parse the CA's authorization payload —
+//!    `missing field \`token\`` — which is what broke issuance in the field;
+//! 3. 0.7 verified against compiled-in webpki-roots, so no private test CA could be trusted.
+//!    0.8 uses the platform trust store, so installing Pebble's root now works;
+//! 4. the test rig itself: the wrong Pebble root, the wrong challtestsrv flag, and AAAA
+//!    answers pointing validation at ::1. See `loadtest/pebble.compose.yaml`.
+//!
 //! NOTE: this path talks to a live ACME CA and binds port 80, so it is not exercised by the
 //! *default* suite (no domain, no inbound :80). A `#[ignore]`d end-to-end test
-//! (`acme_http01_issues_against_pebble`) proves it against **Pebble** (a tiny test ACME CA) when
-//! run with `--ignored` — see the test for the setup recipe and `loadtest/pebble.compose.yaml`.
+//! (`acme_http01_issues_against_pebble`) is written against **Pebble** (a tiny test ACME CA) —
+//! see the test for the setup and `loadtest/pebble.compose.yaml`. It does **not** pass yet, and
+//! the reason is not this module: the ACME client trusts a compile-time root list, so a private
+//! test CA cannot be added to it. Read the test comment before assuming this path is verified.
 //! The default directory is Let's Encrypt **staging** (see `AcmeCfg::directory_url`) precisely so
 //! a first run can't burn production rate limits.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -27,9 +41,8 @@ use axum::{
 };
 use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
-    NewOrder, OrderStatus,
+    NewOrder, OrderStatus, RetryPolicy,
 };
-use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -64,66 +77,61 @@ pub async fn obtain_certificate(acme: &AcmeCfg, tls: &TlsCfg) -> Result<()> {
         .map(|d| Identifier::Dns(d.clone()))
         .collect();
     let mut order = account
-        .new_order(&NewOrder {
-            identifiers: &identifiers,
-        })
+        .new_order(&NewOrder::new(&identifiers))
         .await
         .context("creating ACME order")?;
 
-    // Collect each authorization's HTTP-01 response into a token -> key-authorization map and
-    // the challenge URLs to mark ready.
-    let authorizations = order
-        .authorizations()
-        .await
-        .context("fetching authorizations")?;
-    let mut responses: HashMap<String, String> = HashMap::new();
-    let mut challenge_urls: Vec<String> = Vec::new();
-    for authz in &authorizations {
+    // The challenge server starts BEFORE the authorizations are walked, sharing a map the loop
+    // fills in. In 0.8 a challenge is marked ready through a handle that only exists inside the
+    // iteration, so responses cannot all be gathered first and served afterwards. Publishing
+    // each response *then* signalling ready also closes a window the old two-pass version had,
+    // where the CA could validate a token that was not being served yet.
+    let responses: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+    let _server = AbortOnDrop(spawn_challenge_server(Arc::clone(&responses)).await?);
+
+    let mut authorizations = order.authorizations();
+    while let Some(result) = authorizations.next().await {
+        let mut authz = result.context("fetching authorizations")?;
         match authz.status {
             AuthorizationStatus::Pending => {}
             AuthorizationStatus::Valid => continue,
             other => anyhow::bail!("unexpected authorization status: {other:?}"),
         }
-        let challenge = authz
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::Http01)
+        let mut challenge = authz
+            .challenge(ChallengeType::Http01)
             .context("CA offered no http-01 challenge")?;
-        let key_auth = order.key_authorization(challenge);
-        responses.insert(challenge.token.clone(), key_auth.as_str().to_string());
-        challenge_urls.push(challenge.url.clone());
-    }
-
-    // Serve the challenge responses on :80 while the CA validates. The guard aborts the
-    // listener when it drops, so every error path below also tears it down.
-    let _server = AbortOnDrop(spawn_challenge_server(responses).await?);
-
-    for url in &challenge_urls {
-        order
-            .set_challenge_ready(url)
+        // `ChallengeHandle` derefs to `Challenge`, so the token is still readable here.
+        let token = challenge.token.clone();
+        let key_auth = challenge.key_authorization().as_str().to_string();
+        responses
+            .write()
+            .expect("challenge response map poisoned")
+            .insert(token, key_auth);
+        challenge
+            .set_ready()
             .await
             .context("signaling challenge ready")?;
     }
 
-    poll_until_ready(&mut order).await?;
-
-    // Generate a fresh key + CSR for the domains and finalize.
-    let mut params =
-        CertificateParams::new(acme.domains.clone()).context("building certificate params")?;
-    params.distinguished_name = DistinguishedName::new();
-    let key_pair = KeyPair::generate().context("generating certificate key pair")?;
-    let csr = params
-        .serialize_request(&key_pair)
-        .context("serializing CSR")?;
-    order
-        .finalize(csr.der())
+    let status = order
+        .poll_ready(&RetryPolicy::default())
         .await
-        .context("finalizing ACME order")?;
+        .context("waiting for the ACME order to become ready")?;
+    anyhow::ensure!(
+        status == OrderStatus::Ready,
+        "ACME order did not become ready (status: {status:?})"
+    );
 
-    let cert_chain_pem = poll_for_certificate(&mut order).await?;
+    // 0.8 generates the key pair and CSR itself and hands back the private key, so there is no
+    // rcgen step here any more.
+    let key_pem = order.finalize().await.context("finalizing ACME order")?;
+    let cert_chain_pem = order
+        .poll_certificate(&RetryPolicy::default())
+        .await
+        .context("waiting for the issued certificate")?;
 
     write_pem(&tls.cert_path, &cert_chain_pem)?;
-    write_key_pem(&tls.key_path, &key_pair.serialize_pem())?;
+    write_key_pem(&tls.key_path, &key_pem)?;
     info!(cert = %tls.cert_path, key = %tls.key_path, "ACME certificate stored");
     Ok(())
 }
@@ -137,24 +145,28 @@ async fn account(acme: &AcmeCfg) -> Result<Account> {
             .with_context(|| format!("reading cached ACME account {}", creds_path.display()))?;
         let creds: AccountCredentials =
             serde_json::from_str(&raw).context("parsing cached ACME account credentials")?;
-        return Account::from_credentials(creds)
+        return Account::builder()
+            .context("building ACME client")?
+            .from_credentials(creds)
             .await
             .context("restoring ACME account from cached credentials");
     }
 
     let mailto = (!acme.email.is_empty()).then(|| format!("mailto:{}", acme.email));
     let contact: Vec<&str> = mailto.as_deref().into_iter().collect();
-    let (account, credentials) = Account::create(
-        &NewAccount {
-            contact: &contact,
-            terms_of_service_agreed: acme.accept_tos,
-            only_return_existing: false,
-        },
-        &acme.directory_url,
-        None,
-    )
-    .await
-    .context("creating ACME account")?;
+    let (account, credentials) = Account::builder()
+        .context("building ACME client")?
+        .create(
+            &NewAccount {
+                contact: &contact,
+                terms_of_service_agreed: acme.accept_tos,
+                only_return_existing: false,
+            },
+            acme.directory_url.clone(),
+            None,
+        )
+        .await
+        .context("creating ACME account")?;
 
     if let Err(e) = std::fs::create_dir_all(&acme.cache_dir)
         .and_then(|_| serde_json::to_string_pretty(&credentials).map_err(std::io::Error::other))
@@ -167,11 +179,11 @@ async fn account(acme: &AcmeCfg) -> Result<Account> {
 
 /// Start a minimal HTTP-01 responder on `:80` serving `token -> key authorization`.
 async fn spawn_challenge_server(
-    responses: HashMap<String, String>,
+    responses: Arc<RwLock<HashMap<String, String>>>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let app = Router::new()
         .route("/.well-known/acme-challenge/:token", get(challenge_handler))
-        .with_state(Arc::new(responses));
+        .with_state(responses);
     let listener = TcpListener::bind(("0.0.0.0", HTTP01_PORT))
         .await
         .with_context(|| format!("binding ACME HTTP-01 listener on :{HTTP01_PORT}"))?;
@@ -183,39 +195,16 @@ async fn spawn_challenge_server(
 }
 
 async fn challenge_handler(
-    State(responses): State<Arc<HashMap<String, String>>>,
+    State(responses): State<Arc<RwLock<HashMap<String, String>>>>,
     AxPath(token): AxPath<String>,
 ) -> (StatusCode, String) {
-    match responses.get(&token) {
-        Some(key_auth) => (StatusCode::OK, key_auth.clone()),
+    // The map is filled in as each authorization is walked, so this reads under a
+    // lock rather than from a snapshot taken before the order started.
+    let found = responses.read().ok().and_then(|m| m.get(&token).cloned());
+    match found {
+        Some(key_auth) => (StatusCode::OK, key_auth),
         None => (StatusCode::NOT_FOUND, String::new()),
     }
-}
-
-/// Poll the order until it leaves `Pending`/`Processing`, erroring if it goes `Invalid`.
-async fn poll_until_ready(order: &mut instant_acme::Order) -> Result<()> {
-    let mut delay = Duration::from_millis(250);
-    for _ in 0..10 {
-        tokio::time::sleep(delay).await;
-        let state = order.refresh().await.context("refreshing order")?;
-        match state.status {
-            OrderStatus::Ready => return Ok(()),
-            OrderStatus::Invalid => anyhow::bail!("ACME order became invalid"),
-            _ => delay = (delay * 2).min(Duration::from_secs(5)),
-        }
-    }
-    anyhow::bail!("ACME order not ready after polling")
-}
-
-/// Poll for the issued certificate chain after finalize.
-async fn poll_for_certificate(order: &mut instant_acme::Order) -> Result<String> {
-    for _ in 0..10 {
-        if let Some(pem) = order.certificate().await.context("fetching certificate")? {
-            return Ok(pem);
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    anyhow::bail!("certificate not issued after polling")
 }
 
 fn create_parent(path: &str) -> Result<()> {
@@ -285,8 +274,12 @@ mod tests {
     //   1. Run Pebble + pebble-challtestsrv (see https://github.com/letsencrypt/pebble; a starting
     //      compose is at loadtest/pebble.compose.yaml). challtestsrv must resolve the test domain
     //      to the host running this test, and Pebble's HTTP-01 validation must reach this host's :80.
-    //   2. Trust Pebble's self-signed directory cert for the ACME HTTPS client:
-    //        export SSL_CERT_FILE=/path/to/pebble.minica.pem
+    //   2. Trust Pebble's DIRECTORY certificate. Note it is signed by the *minica* root, NOT
+    //      by `https://localhost:15000/roots/0` (that one signs the certs Pebble issues):
+    //        curl -sL https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/pebble.minica.pem     //          | sudo tee /usr/local/share/ca-certificates/pebble.crt >/dev/null
+    //        sudo update-ca-certificates
+    //      instant-acme 0.8 verifies against the platform store, so this is enough. Under 0.7
+    //      it used compiled-in roots and no amount of trust configuration could work.
     //   3. Run it:
     //        EDGEGUARD_TEST_ACME_DIR=https://localhost:14000/dir \
     //        EDGEGUARD_TEST_ACME_DOMAIN=edgeguard.test \
@@ -301,6 +294,14 @@ mod tests {
         };
         let domain =
             std::env::var("EDGEGUARD_TEST_ACME_DOMAIN").unwrap_or_else(|_| "edgeguard.test".into());
+
+        // `main` installs the process-wide rustls provider before it reaches the ACME block
+        // (main.rs: `tls::init_crypto()` immediately precedes it), so the shipping path is
+        // fine. This test calls `obtain_certificate` directly and so has to do the same, or
+        // rustls panics on the first HTTPS request to the directory — before any ACME logic
+        // runs at all. Without this line the test cannot pass, which is why it had never
+        // reported anything despite being written.
+        crate::tls::init_crypto();
 
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

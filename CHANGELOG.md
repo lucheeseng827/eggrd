@@ -6,6 +6,26 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed (release tooling, no crate change)
+- **The crate is published to crates.io again.** The mirror's release workflow had a `crates`
+  job that published `edgeguard-ner` and then `eggrd`; rewriting that workflow upstream dropped
+  it, and nothing noticed because the images kept publishing. crates.io stopped at **0.2.1**
+  (2026-07-14) while 0.2.2, 0.3.0 and 0.3.1 shipped as containers — so `cargo install eggrd`,
+  which the site and this README both recommend, was installing the version whose ACME issuance
+  is broken.
+
+  Restored, and deliberately independent of the image jobs so a Docker Hub outage cannot block
+  the crate. It keeps the ordering the original had, which a dry run confirms is still required:
+  `eggrd` declares `edgeguard-ner = "^0.1.1"`, only `0.1.0` is on the index, and packaging
+  `eggrd` fails outright until the new `edgeguard-ner` is published *and* indexed. Both steps
+  treat an already-published version as success, and the retry loop waits only on index
+  propagation — any other failure exits immediately rather than burning four minutes to report
+  the wrong cause.
+
+  A `workflow_dispatch` with `push: false` now skips the crate publish as well as the image
+  push. A crates.io release cannot be withdrawn, only yanked, so a "dry run" that publishes one
+  is not a dry run.
+
 ## [0.3.1] — 2026-08-24
 
 A patch release, but read the argument-parsing note before upgrading: it changes what happens to

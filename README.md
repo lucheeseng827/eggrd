@@ -3,13 +3,13 @@
 <img src=".github/assets/banner.svg" alt="eggrd — a secure front door for an app you don't change" width="820">
 
 [![crates.io](https://img.shields.io/crates/v/eggrd?logo=rust&color=%23f0796a)](https://crates.io/crates/eggrd)
-[![docs](https://img.shields.io/badge/docs-eggrd.dev-8fb5d8)](https://eggrd.dev/docs/)
+[![docs](https://img.shields.io/badge/docs-eggrd.dev-8fb5d8)](https://eggrd.dev/docs/index.html)
 [![CI](https://github.com/lucheeseng827/eggrd/actions/workflows/ci.yml/badge.svg)](https://github.com/lucheeseng827/eggrd/actions/workflows/ci.yml)
 [![Docker](https://img.shields.io/docker/v/mancube/eggrd?logo=docker&label=image&color=%238fb5d8)](https://hub.docker.com/r/mancube/eggrd)
 [![Downloads](https://img.shields.io/crates/d/eggrd?color=%23a9c6e0)](https://crates.io/crates/eggrd)
 [![License](https://img.shields.io/badge/license-Apache--2.0-8fb5d8)](#license)
 
-**[Documentation](https://eggrd.dev/docs/)** ·
+**[Documentation](https://eggrd.dev/docs/index.html)** ·
 [Configuration reference](https://eggrd.dev/docs/config.html) ·
 [CLI](https://eggrd.dev/docs/cli.html) ·
 [Operations](https://eggrd.dev/docs/operations.html) ·

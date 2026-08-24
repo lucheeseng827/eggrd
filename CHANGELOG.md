@@ -6,6 +6,23 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed (release tooling, no crate change)
+- **The 0.3.0 manifest assertion could never pass.** It grepped the raw manifest for
+  `"architecture":"amd64"`, but `docker buildx imagetools inspect --raw` returns
+  pretty-printed JSON — `"architecture": "amd64"`, with a space. The 0.3.0 release therefore
+  reported `amd64 missing` and failed while all three tags were in fact correctly
+  multi-arch. It now parses the index with `jq` and prints what it found, so a real failure
+  is diagnosable and a false one cannot recur. An assertion that cannot pass is worse than
+  no assertion: it teaches people to re-run through red.
+- **Two release pipelines could run concurrently.** `gh release create` creates the tag,
+  raising a push event alongside the release event, so 0.3.0 ran the whole pipeline twice
+  against the same tags. Serialized with a concurrency group keyed on the ref, deliberately
+  *without* `cancel-in-progress` — cancelling mid-push is what leaves half-written tags.
+- **The Docker Hub overview stopped updating.** `dockerhub-readme.yml` existed only on the
+  public mirror, hand-placed and untracked upstream, so the first sync that owned
+  `.github/workflows/` deleted it. The overview kept advertising 0.2.1 after 0.3.0 shipped.
+  Restored upstream and added to the sync manifest, which is the only place it survives.
+
 ## [0.3.0] — 2026-08-24
 
 Three capabilities this crate shipped were compiled but had never been run against real

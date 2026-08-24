@@ -31,7 +31,7 @@ services:
   # is on the private admin listener :9090, which is the listener Prometheus scrapes — exactly
   # the split a real deployment uses to keep metrics off the public port.
   edgeguard:
-    image: docker.io/mancube/eggrd:0.1.5
+    image: docker.io/mancube/eggrd:0.3.0
     command: ["--config", "/etc/edgeguard/edgeguard.toml"]
     depends_on:
       - upstream

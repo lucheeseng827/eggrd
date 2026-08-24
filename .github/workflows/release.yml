@@ -45,6 +45,20 @@ on:
         type: boolean
         default: true
 
+# Both triggers above can fire for one release: `gh release create` creates the tag, which
+# raises a push event alongside the release event. On 0.3.0 that ran two full pipelines
+# concurrently against the same tags, and they interleaved — `0.3` ended up correctly
+# multi-arch while `0.3.0` and `latest` were overwritten as amd64-only, so arm64 users
+# pulling `latest` silently got an amd64 image. The manifest assertion caught it and failed
+# the release, which is the only reason it did not pass as green.
+#
+# Keyed on the ref so the duplicate queues behind the first run instead of racing it, and
+# NOT cancel-in-progress: cancelling mid-push is what leaves half-written tags. The second
+# run then redoes the same work against the same digests, which is idempotent and harmless.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -206,9 +220,18 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          # Parse the index rather than grepping it. `--raw` returns pretty-printed JSON —
+          # `"architecture": "amd64"`, with a space — so the previous grep for
+          # '"architecture":"amd64"' could never match and failed 0.3.0 as "amd64 missing"
+          # while all three tags were in fact correctly multi-arch. An assertion that cannot
+          # pass is worse than none: it cost a release investigation and teaches people to
+          # re-run through red.
           out=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw)
-          echo "$out" | grep -q '"architecture":"amd64"' || { echo "::error::amd64 missing"; exit 1; }
-          echo "$out" | grep -q '"architecture":"arm64"' || { echo "::error::arm64 missing"; exit 1; }
+          archs=$(echo "$out" | jq -r '[.manifests[]?.platform.architecture] | sort | join(",")')
+          echo "${IMAGE}:${VERSION} advertises: ${archs:-<none>}"
+          for want in amd64 arm64; do
+            echo "$out" | jq -e --arg a "$want" '[.manifests[]?.platform.architecture] | index($a)' >/dev/null               || { echo "::error::$want missing from ${IMAGE}:${VERSION} (found: ${archs:-none})"; exit 1; }
+          done
           echo "amd64 and arm64 both present in ${IMAGE}:${VERSION}"
 
       - name: Summary

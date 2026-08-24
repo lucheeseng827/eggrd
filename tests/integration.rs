@@ -86,6 +86,30 @@ async fn spawn_proxy_with_quota(cfg: Config) -> (SocketAddr, Arc<edgeguard::cp::
 }
 
 /// Stub upstream that sleeps `delay` before responding, to exercise the upstream timeout.
+/// Plain upstream that **counts** the requests it receives.
+///
+/// The LLM gates got this treatment first; this is the same instrument for the gates in front of
+/// an ordinary app. Every rejection the proxy makes is supposed to happen before the upstream is
+/// touched — that is the point of a front door — but the tests only ever checked the status the
+/// client got back, which is identical whether the gate ran first or last.
+async fn spawn_counting_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let app = Router::new().fallback(any(move || {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            "upstream"
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, hits)
+}
+
 async fn spawn_slow_upstream(delay: Duration) -> SocketAddr {
     let app = Router::new().fallback(any(move || async move {
         tokio::time::sleep(delay).await;
@@ -99,12 +123,17 @@ async fn spawn_slow_upstream(delay: Duration) -> SocketAddr {
     addr
 }
 
-/// A port nothing is listening on (bind then drop), to simulate a down upstream.
+/// An address that refuses connections, to simulate a down upstream.
+///
+/// This used to bind an ephemeral port and drop it, which is racy: the OS is free to hand that
+/// just-freed port to the next listener, and with enough concurrent tests it does. The "dead"
+/// upstream then answers `200` and `bad_gateway_when_upstream_down` fails claiming the proxy
+/// returned the wrong status — pointing at the proxy when the fault is in the fixture.
+///
+/// Port 1 is privileged and unallocated, so nothing in the suite can take it and connections are
+/// refused immediately rather than timing out.
 async fn dead_addr() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    drop(l);
-    addr
+    "127.0.0.1:1".parse().unwrap()
 }
 
 /// Baseline config: Basic auth with one user, rate limiting off (so a shared limiter token
@@ -1681,6 +1710,45 @@ async fn spawn_llm_upstream() -> SocketAddr {
     addr
 }
 
+/// Stub OpenAI-compatible upstream that **counts** the requests it receives.
+///
+/// The gateway's whole economic argument is that budget, model-allowlist and DLP gates run
+/// *before* the provider is called — a request that reaches the provider has already cost money,
+/// whatever status the client eventually sees. Every denial test asserted the client's status and
+/// the metric, and stated "never reaches the upstream" in a comment, but nothing observed the
+/// upstream. A gate that denied *after* forwarding would have passed all of them.
+///
+/// Returns the address and the hit counter so a test can assert the count is exactly zero.
+async fn spawn_counting_llm_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let app = Router::new().fallback(any(move || {
+        let seen = seen.clone();
+        async move {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 22, "total_tokens": 33}
+            })
+            .to_string();
+            let mut resp = Response::new(Body::from(body));
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            resp
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, hits)
+}
+
 /// Stub OpenAI-compatible upstream: an SSE stream whose terminal frame carries `usage`.
 async fn spawn_llm_sse_upstream() -> SocketAddr {
     async fn handler() -> Response<Body> {
@@ -2617,4 +2685,267 @@ async fn budget_alert_posts_a_slack_message_once_per_crossing() {
     // before asserting, rather than checking immediately after the first delivery arrives.
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(captured.lock().unwrap().len(), 1);
+}
+
+// ── "before the provider is called" ────────────────────────────────────────────────────────────
+//
+// The landing page's LLM panel reads: BUDGET RESERVE · TOKEN METER · DLP —
+// FAIL-CLOSED, BEFORE THE PROVIDER IS CALLED. That is a claim about *ordering*, and ordering is
+// the part that cannot be inferred from a status code: a gate that forwarded first and denied
+// afterwards would return the same 402/403/429 to the client while the provider bill still
+// arrived. Each of these asserts the upstream saw exactly zero requests.
+
+/// Control. Without this, every assertion below could pass because the counter never increments
+/// at all — a broken harness and a perfect gate look identical from the denial side.
+#[tokio::test]
+async fn counting_upstream_actually_counts() {
+    let (up, hits) = spawn_counting_llm_upstream().await;
+    let proxy = spawn_proxy(llm_cfg(format!("http://{up}"), false)).await;
+
+    let body = Bytes::from_static(br#"{"model":"gpt-4o","max_tokens":10,"messages":[]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an admitted request must reach the provider exactly once, or the counter proves nothing"
+    );
+}
+
+#[tokio::test]
+async fn over_budget_request_never_reaches_the_provider() {
+    let (up, hits) = spawn_counting_llm_upstream().await;
+    let mut cfg = llm_cfg(format!("http://{up}"), false);
+    cfg.llm.budgets = vec![BudgetCfg {
+        name: "tight".into(),
+        scope: "global".into(),
+        unit: "tokens".into(),
+        limit: 5.0,
+        window: "1h".into(),
+    }];
+    let proxy = spawn_proxy(cfg).await;
+
+    let body = Bytes::from_static(br#"{"model":"gpt-4o","max_tokens":50,"messages":[]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the budget reserve must deny before forwarding — a forwarded request has already been paid for"
+    );
+}
+
+#[tokio::test]
+async fn dlp_blocked_request_never_reaches_the_provider() {
+    let (up, hits) = spawn_counting_llm_upstream().await;
+    let proxy = spawn_proxy(dlp_cfg(format!("http://{up}"), "block")).await;
+
+    let body = Bytes::from_static(
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"my email is alice@example.com"}]}"#,
+    );
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "DLP blocking is pointless if the secret was already sent to the provider"
+    );
+}
+
+#[tokio::test]
+async fn disallowed_model_never_reaches_the_provider() {
+    let (up, hits) = spawn_counting_llm_upstream().await;
+    let proxy = spawn_proxy(vault_cfg(
+        format!("http://{up}"),
+        vec!["gpt-4o-mini".into()],
+    ))
+    .await;
+
+    let body = Bytes::from_static(br#"{"model":"gpt-4o","max_tokens":10,"messages":[]}"#);
+    let r = send(
+        proxy,
+        "POST",
+        "/v1/chat/completions",
+        Some("Bearer sk-virt-team-a"),
+        body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an off-allowlist model must be refused before the provider key is spent on it"
+    );
+}
+
+/// The other half of the panel's claim: **fail-closed**. `fail_open` defaults to `false`, so a
+/// budget store that cannot be reached must refuse the request rather than wave it through — an
+/// outage that silently uncapped spend would be the worst possible failure for a spend cap.
+///
+/// The store here points at a closed port, which is the cheapest honest way to produce a real
+/// store error without a Redis container.
+#[tokio::test]
+async fn budget_store_outage_fails_closed_and_never_reaches_the_provider() {
+    let (up, hits) = spawn_counting_llm_upstream().await;
+    let mut cfg = llm_cfg(format!("http://{up}"), false);
+    cfg.llm.store = "redis".into();
+    cfg.llm.redis_url = "redis://127.0.0.1:1".into(); // nothing listens here
+    assert!(
+        !cfg.llm.fail_open,
+        "this test is only meaningful while fail-closed is the default"
+    );
+    cfg.llm.budgets = vec![BudgetCfg {
+        name: "shared".into(),
+        scope: "global".into(),
+        unit: "tokens".into(),
+        limit: 1_000_000.0,
+        window: "1h".into(),
+    }];
+    let proxy = spawn_proxy(cfg).await;
+
+    let body = Bytes::from_static(br#"{"model":"gpt-4o","max_tokens":10,"messages":[]}"#);
+    let r = send(proxy, "POST", "/v1/chat/completions", None, body).await;
+    assert_eq!(
+        r.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreachable budget store must fail closed, not admit"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "failing closed means the provider is not called either"
+    );
+}
+
+// ── the same sweep, for the gates in front of an ordinary app ──────────────────────────────────
+//
+// Everything above covers the LLM path. These cover the rest of the front door. Each gate is
+// supposed to reject before the upstream is touched; each existing test only checked the status
+// the client received, which looks identical whether the gate ran before or after forwarding.
+
+/// Control for this group, for the same reason as the LLM one: if the counter never incremented,
+/// every assertion below would pass while proving nothing.
+#[tokio::test]
+async fn counting_upstream_counts_an_allowed_request() {
+    let (up, hits) = spawn_counting_upstream().await;
+    let proxy = spawn_proxy(base_cfg(format!("http://{up}"))).await;
+
+    let r = get(proxy, Some(&basic("admin", "secret"))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn unauthenticated_request_never_reaches_the_upstream() {
+    let (up, hits) = spawn_counting_upstream().await;
+    let proxy = spawn_proxy(base_cfg(format!("http://{up}"))).await;
+
+    let r = get(proxy, None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "auth that forwards before rejecting is not auth"
+    );
+}
+
+#[tokio::test]
+async fn waf_blocked_request_never_reaches_the_upstream() {
+    let (up, hits) = spawn_counting_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.waf = WafCfg {
+        mode: "block".into(),
+        ..Default::default()
+    };
+    let proxy = spawn_proxy(cfg).await;
+
+    let r = send(proxy, "GET", "/items?id=1%20OR%201%3D1", None, Bytes::new()).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the payload the WAF blocked must not have been delivered anyway"
+    );
+}
+
+#[tokio::test]
+async fn ip_denied_request_never_reaches_the_upstream() {
+    let (up, hits) = spawn_counting_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.access.deny = vec!["127.0.0.1/32".into(), "::1/128".into()];
+    let proxy = spawn_proxy(cfg).await;
+
+    let r = get(proxy, None).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn oversized_body_never_reaches_the_upstream() {
+    let (up, hits) = spawn_counting_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.validation.max_body = "8B".into();
+    let proxy = spawn_proxy(cfg).await;
+
+    let r = send(
+        proxy,
+        "POST",
+        "/",
+        Some(&basic("admin", "secret")),
+        Bytes::from_static(b"way more than eight bytes"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a body cap that streams the oversized body upstream first protects nothing"
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_request_never_reaches_the_upstream() {
+    let (up, hits) = spawn_counting_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.ratelimit.enabled = true;
+    cfg.ratelimit.rate = "1/min".into();
+    cfg.ratelimit.burst = 1;
+    let proxy = spawn_proxy(cfg).await;
+
+    assert_eq!(get(proxy, None).await.status, StatusCode::OK);
+    let blocked = get(proxy, None).await;
+    assert_eq!(blocked.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly the one admitted request should have reached the upstream"
+    );
+}
+
+/// Fail-closed for the *rate limiter's* shared store, the counterpart to the budget-store test.
+/// `fail_open` defaults to false so a Redis outage cannot silently disable rate limiting.
+#[tokio::test]
+async fn limiter_store_outage_fails_closed_and_never_reaches_the_upstream() {
+    let (up, hits) = spawn_counting_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.ratelimit.enabled = true;
+    cfg.ratelimit.store = "redis".into();
+    cfg.ratelimit.redis_url = "redis://127.0.0.1:1".into(); // nothing listens here
+    assert!(
+        !cfg.ratelimit.fail_open,
+        "this test is only meaningful while fail-closed is the default"
+    );
+    let proxy = spawn_proxy(cfg).await;
+
+    let r = get(proxy, None).await;
+    assert_eq!(
+        r.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreachable limiter store must fail closed"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

@@ -1,27 +1,60 @@
-# EdgeGuard
+<div align="center">
+
+<img src=".github/assets/banner.svg" alt="eggrd — a secure front door for an app you don't change" width="820">
+
+[![crates.io](https://img.shields.io/crates/v/eggrd?logo=rust&color=%23f0796a)](https://crates.io/crates/eggrd)
+[![docs](https://img.shields.io/badge/docs-eggrd.dev-8fb5d8)](https://eggrd.dev/docs/)
+[![CI](https://github.com/lucheeseng827/eggrd/actions/workflows/ci.yml/badge.svg)](https://github.com/lucheeseng827/eggrd/actions/workflows/ci.yml)
+[![Docker](https://img.shields.io/docker/v/mancube/eggrd?logo=docker&label=image&color=%238fb5d8)](https://hub.docker.com/r/mancube/eggrd)
+[![Downloads](https://img.shields.io/crates/d/eggrd?color=%23a9c6e0)](https://crates.io/crates/eggrd)
+[![License](https://img.shields.io/badge/license-Apache--2.0-8fb5d8)](#license)
+
+**[Documentation](https://eggrd.dev/docs/)** ·
+[Configuration reference](https://eggrd.dev/docs/config.html) ·
+[CLI](https://eggrd.dev/docs/cli.html) ·
+[Operations](https://eggrd.dev/docs/operations.html) ·
+[Changelog](CHANGELOG.md)
+
+</div>
+
+---
+
+# eggrd
 
 A drop-in Rust edge proxy that gives any HTTP app a secure front door — **authentication,
 rate limiting, TLS, and hardened response headers** — with secure-by-default config and
 **zero code changes** to the upstream app.
 
-It's the missing front door for apps that were generated (vibe-coded) without one.
-EdgeGuard owns the request path (auth, rate-limit, validation) and the response path
-(CSP/HSTS/cookie hardening) in a single static binary.
+It is the missing front door for apps that were generated (vibe-coded) without one. eggrd owns
+the request path (auth, rate-limit, validation) and the response path (CSP/HSTS/cookie
+hardening) in a single static binary.
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
+> The crate is **`eggrd`**; the binary it installs is **`edgeguard`**, an earlier working title
+> kept so existing deployments keep working. Both names appear below and mean the same thing.
 
-> **Status: v0 shipped, v1 landed, v2 landed, v2.5 underway.** The barebone v0 slice is stable;
-> the **v1** (self-hostable & production-usable) feature set below has landed and is tested
-> in-process. The one exception is **ACME**, which is implemented and compiled but can only be
-> proven against a live CA (see [Platform support](#tls--acme)). The **v2 (WAF-lite)** phase has
-> landed: [input inspection](#waf-lite-input-rules) (off by default), a [shared-store rate
-> limiter](#distributed-rate-limiting) for multi-replica deployments, and an optional
-> [public/private split](#publicprivate-split) for the ops endpoints. (The Redis limiter
-> backend, like ACME, is compiled but proven only against a live store.) **v2.5 (static/edge
-> surface)** is underway: an [`edgeguard generate`](#static--edge-hosts) config generator for
-> static hosts and a [Rust→WASM Cloudflare Worker](worker/README.md) (the worker, like ACME and
-> Redis, compiles but is proven only against a live deploy). Codename "EdgeGuard" is a working
-> title — see the [roadmap](docs/ROADMAP.md).
+```bash
+cargo install eggrd && edgeguard init && edgeguard doctor
+# or
+docker run -p 8080:8080 mancube/eggrd:0.3.1
+```
+
+## Status
+
+v0, v1, v2 and v2.5 have landed. What matters more than the phase numbers is which capabilities
+have actually been **run** rather than merely compiled — that list used to be short, and this
+section used to overstate it.
+
+| Capability | State | How it was checked |
+|---|---|---|
+| Auth, rate limiting, WAF-lite, response hardening, validation | **proven** | Covered in-process; every gate is asserted to reject *before* the upstream is contacted, not merely to return the right status. |
+| TLS termination | **proven** | TLS 1.3 negotiated, certificate verified, upstream response proxied back through it, plaintext refused on the TLS port, all six hardening headers present. |
+| Shared-store rate limiting | **proven** | Two replicas against one Redis: 5 allowed against a single key, where the per-replica store allowed 10. |
+| ACME issuance | **proven, and it was broken** | Not "untested and probably fine" — a two-year-old client could no longer read the CA's replies. Found by running it, fixed, and it now issues in about five seconds against Let's Encrypt staging. |
+| WASM edge worker | **runs, not deployed** | Builds a deployable bundle and serves requests on **workerd**, the runtime Cloudflare runs in production: 401 unauthenticated, 200 from the origin with all six hardening headers. It has *not* been deployed to a Cloudflare account, so routes, custom domains and secret bindings remain untested. |
+
+The [revision block on the site](https://eggrd.dev/#revisions) carries the same list with the
+evidence attached. A row goes green there only after something has been run; nothing is marked
+proven because it looks correct.
 
 ## Where it fits
 
@@ -30,33 +63,20 @@ between the public internet (or your platform's load balancer) and your applicat
 terminates/authenticates the request, forwards it to your app *unchanged*, and hardens the
 response on the way back.
 
-```text
-         public internet
-    (clients · bots · scanners)
-               │   :443 / :8080
-               │   TLS · auth · rate-limit · WAF · request validation
-               ▼
-       ┌──────────────────┐
-       │     EdgeGuard     │   ◀── this project (the secure front door)
-       └──────────────────┘
-               │   plain HTTP on APP_PORT, localhost only
-               │   CSP · HSTS · cookie hardening · leaky-header stripping on the way back
-               ▼
-       ┌──────────────────┐
-       │      your app     │   ◀── unchanged (Node / Python / Go / Rust / …)
-       └──────────────────┘
-               │
-               ▼
-        DB · internal APIs
-```
+<p align="center">
+  <img src=".github/assets/where-it-fits.svg"
+       alt="The public internet reaches eggrd on 443 or 8080, where TLS, auth, rate limiting, WAF and request validation are applied. eggrd forwards over plain HTTP on APP_PORT to your unchanged app, and hardens the response with CSP, HSTS, cookie hardening and leaky-header stripping on the way back. The app talks to its database and internal APIs."
+       width="680">
+</p>
 
 In the larger picture it sits **between your edge (CDN / platform LB / DNS) and your app** — one
 hop, one upstream:
 
-```text
-  DNS ─▶ [ CDN / platform LB ] ─▶ [ EdgeGuard ] ─▶ [ your app ] ─▶ [ DB / internal APIs ]
-          optional: caching, DDoS    this project     unchanged
-```
+<p align="center">
+  <img src=".github/assets/request-path.svg"
+       alt="DNS to an optional CDN or platform load balancer, to eggrd, to your unchanged app, to the database and internal APIs."
+       width="820">
+</p>
 
 Run it as the container **entrypoint that wraps your app**, or as a **separate front service**
 pointing at an upstream URL — see [Two deployment modes](#two-deployment-modes).
@@ -1068,8 +1088,11 @@ edge, use the worker.
 response-hardening **and** edge-auth subset (HTTP Basic / static API key). It authenticates the
 request, forwards to your origin, and hardens the response — the same security-header set and
 cookie hardening as the proxy. Build and deploy with `worker-build` + `wrangler`; configure the
-origin, auth, and hardening via `wrangler.toml` vars / secrets. Like ACME, it compiles to wasm but
-is proven only against a live deploy; rate limiting and JWT are out of scope for the edge subset.
+origin, auth, and hardening via `wrangler.toml` vars / secrets. It has been **run on workerd**,
+the runtime Cloudflare uses in production — 401 unauthenticated, 401 on a wrong password, 200 from
+the origin with all six hardening headers — but has not been deployed to a Cloudflare account, so
+routes, custom domains and secret bindings are still untested. Rate limiting and JWT are out of
+scope for the edge subset.
 
 ## Managed mode (optional)
 

@@ -77,6 +77,8 @@ impl Default for AlertsCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LlmCfg {
+    /// Turn on the LLM gateway: token metering, cost attribution, budgets, the key vault
+    /// and DLP. Off by default, and irrelevant unless the upstream is an LLM API.
     pub enabled: bool,
     /// Wire format. Only `"openai"` is understood today (the default).
     pub api_style: String,
@@ -194,6 +196,8 @@ pub struct DlpCfg {
     pub reversible: bool,
     /// Built-in detectors.
     pub detect_email: bool,
+    /// Detect card numbers. Pair with `luhn_validate_credit_card` to require a valid
+    /// checksum, which removes most false positives from ordinary long digit strings.
     pub detect_credit_card: bool,
     /// Require the Luhn checksum before flagging a digit run as a card (cuts false positives).
     /// Default true.
@@ -368,7 +372,9 @@ impl Default for BudgetCfg {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default)]
 pub struct ModelPrice {
+    /// USD per 1,000,000 prompt (input) tokens for this model, as billed by the provider.
     pub input_per_1m: f64,
+    /// USD per 1,000,000 completion (output) tokens for this model.
     pub output_per_1m: f64,
     /// USD per 1M cached prompt tokens. `0.0` = inherit `input_per_1m`.
     pub cached_per_1m: f64,
@@ -383,6 +389,8 @@ pub struct ModelPrice {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControlPlaneCfg {
+    /// Enrol this instance with a managed control plane for pushed policy and quota.
+    /// Off by default; EdgeGuard is fully functional without one.
     pub enabled: bool,
     /// Base URL of the control plane, e.g. `https://cp.example`.
     pub url: String,
@@ -455,6 +463,8 @@ pub struct AuthCfg {
     /// "none" | "basic" | "apikey" | "jwt". Selects the gate applied to every proxied
     /// request; the internal `/__edgeguard/*` endpoints are always exempt.
     pub mode: String,
+    /// Realm shown in the `WWW-Authenticate` challenge on a 401, i.e. the name the browser's
+    /// password prompt displays. Only used when `mode = "basic"`.
     pub realm: String,
     /// username -> password. Value may be plaintext (dev) or a `$argon2...` PHC hash.
     /// Used when `mode = "basic"`.
@@ -502,9 +512,13 @@ pub struct JwtCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RateLimitCfg {
+    /// Master switch for rate limiting. On by default: an unlimited front door is not a
+    /// front door. Turn it off only when something ahead of EdgeGuard already limits.
     pub enabled: bool,
     /// Default per-client-IP limit, e.g. "60/min", "10/sec", "1000/hour".
     pub rate: String,
+    /// How many requests may arrive at once before `rate` applies. The bucket refills at
+    /// `rate`, so this is the size of a legitimate spike you are willing to absorb.
     pub burst: u32,
     /// Per-route overrides. A request whose path starts with `path` uses that route's limit
     /// (still keyed per client IP) instead of the global one; the longest matching prefix
@@ -557,8 +571,13 @@ impl Default for RouteRateLimit {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PerKeyRateLimit {
+    /// Apply a second, per-principal limit on top of the global one. Off by default,
+    /// because it only means something once requests are authenticated.
     pub enabled: bool,
+    /// Sustained rate per authenticated principal, same syntax as `ratelimit.rate`
+    /// (e.g. `"1000/hour"`). Applies per key, not per IP.
     pub rate: String,
+    /// Burst allowance per principal. See `ratelimit.burst`.
     pub burst: u32,
 }
 
@@ -619,7 +638,13 @@ pub struct ValidationCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HeadersCfg {
+    /// Send `Strict-Transport-Security`, telling browsers to refuse plain HTTP for this
+    /// host in future. Only meaningful once the site is genuinely HTTPS-only: a browser
+    /// that has seen it cannot be talked out of it for the max-age.
     pub hsts: bool,
+    /// `Content-Security-Policy` value. The default is deliberately strict and will block
+    /// inline scripts and third-party assets; widen it once you know what the app loads,
+    /// and use `csp_report_only` while you find out.
     pub csp: String,
     /// Send the CSP as `Content-Security-Policy-Report-Only` instead of enforcing it. Lets
     /// you roll out / tighten a policy by collecting violations first without breaking the
@@ -629,9 +654,17 @@ pub struct HeadersCfg {
     /// violation reports there. Point it at EdgeGuard's own sink ("/__edgeguard/csp-report")
     /// to have them logged, or at any external collector.
     pub csp_report_uri: String,
+    /// `Referrer-Policy` value. The default sends no referrer at all, so internal URLs
+    /// cannot leak to third parties through ordinary navigation.
     pub referrer_policy: String,
+    /// `Permissions-Policy` value. The default denies geolocation, microphone and camera,
+    /// which an app that needs them must explicitly re-enable.
     pub permissions_policy: String,
+    /// `X-Frame-Options` value: `DENY`, `SAMEORIGIN`, or empty to omit the header.
+    /// Clickjacking protection for browsers predating CSP `frame-ancestors`.
     pub frame_options: String,
+    /// Add `Secure` to every `Set-Cookie` the upstream returns, so cookies are never sent
+    /// over plain HTTP. See `httponly_cookies` for the separate `HttpOnly` control.
     pub force_secure_cookies: bool,
     /// Add `HttpOnly` to `Set-Cookie` responses that lack it. On by default. Turn off (or use
     /// `httponly_cookie_exempt`) for apps that intentionally expose a cookie to JavaScript —
@@ -741,12 +774,15 @@ impl Default for HeadersCfg {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct TlsCfg {
+    /// Terminate TLS in EdgeGuard itself. Leave off when something upstream already does
+    /// (a load balancer, a platform edge) and EdgeGuard only sees plaintext behind it.
     pub enabled: bool,
     /// PEM certificate chain (leaf first). When ACME is enabled this is where the obtained
     /// certificate is written/read.
     pub cert_path: String,
     /// PEM private key (PKCS#8/PKCS#1/SEC1).
     pub key_path: String,
+    /// Automatic certificate issuance. See `[tls.acme]`.
     pub acme: AcmeCfg,
 }
 
@@ -758,6 +794,8 @@ pub struct TlsCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AcmeCfg {
+    /// Obtain and renew a certificate automatically over ACME HTTP-01 instead of reading
+    /// `cert_path`/`key_path` from disk. Requires port 80 to be reachable from the CA.
     pub enabled: bool,
     /// Domains to request a certificate for (the first is the primary CN).
     pub domains: Vec<String>,
@@ -894,6 +932,8 @@ pub struct AccessCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CorsCfg {
+    /// Answer CORS preflights and decorate responses. Off by default: a proxy that adds
+    /// permissive CORS headers by surprise is a security hole, not a convenience.
     pub enabled: bool,
     /// Allowed request origins, matched exactly (scheme + host + port), e.g.
     /// `["https://app.example.com"]`. The single entry `["*"]` allows any origin — but a

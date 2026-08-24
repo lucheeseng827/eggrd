@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" width="900" height="560" role="img" aria-label="Diagram: the public internet reaches eggrd on 443 or 8080, where TLS, auth, rate limiting, WAF and request validation are applied; eggrd forwards over plain HTTP on APP_PORT to your unchanged app, and hardens the response with CSP, HSTS, cookie hardening and leaky-header stripping on the way back; the app talks to its database and internal APIs.">
+  <title>Where eggrd sits</title>
+  <desc>The public internet reaches eggrd on port 443 or 8080. eggrd applies TLS, authentication, rate limiting, WAF-lite and request validation, then forwards over plain HTTP on APP_PORT to your unchanged app. On the way back it applies CSP, HSTS, cookie hardening and leaky-header stripping. The app talks to a database and internal APIs behind it.</desc>
+  <defs>
+    <pattern id="g" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0 H0 V24" fill="none" stroke="#8fb5d8" stroke-width="0.5" opacity="0.10"/>
+    </pattern>
+    <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8fb5d8"/>
+    </marker>
+    <marker id="arwr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#f0796a"/>
+    </marker>
+  </defs>
+
+  <rect width="900" height="560" fill="#0b2038"/>
+  <rect width="900" height="560" fill="url(#g)"/>
+  <rect x="10.5" y="10.5" width="879" height="539" fill="none" stroke="#8fb5d8" stroke-width="1" opacity="0.30"/>
+
+  <!-- top: the internet -->
+  <text x="450" y="56" text-anchor="middle" fill="#eaf2fa"
+        font-family="Saira Condensed, Saira, Archivo Narrow, system-ui, sans-serif"
+        font-size="20" font-weight="600" letter-spacing="2.4">PUBLIC INTERNET</text>
+  <text x="450" y="78" text-anchor="middle" fill="#a9c6e0"
+        font-family="Saira, system-ui, sans-serif" font-size="14">clients · bots · scanners</text>
+
+  <!-- inbound -->
+  <path d="M450 92 V150" stroke="#8fb5d8" stroke-width="1.6" marker-end="url(#arw)"/>
+  <text x="470" y="114" fill="#eaf2fa" font-family="Saira, system-ui, sans-serif" font-size="13">:443 / :8080</text>
+  <text x="470" y="134" fill="#a9c6e0" font-family="Saira, system-ui, sans-serif" font-size="13">TLS · auth · rate limit · WAF · request validation</text>
+
+  <!-- eggrd -->
+  <rect x="250" y="158" width="400" height="76" fill="#12304f" stroke="#f0796a" stroke-width="2"/>
+  <text x="450" y="196" text-anchor="middle" fill="#eaf2fa"
+        font-family="Saira Condensed, Saira, Archivo Narrow, system-ui, sans-serif"
+        font-size="26" font-weight="700" letter-spacing="6">eggrd</text>
+  <text x="450" y="218" text-anchor="middle" fill="#a9c6e0"
+        font-family="Saira Condensed, Saira, system-ui, sans-serif" font-size="13" letter-spacing="1.6">THE SECURE FRONT DOOR</text>
+
+  <!-- to app -->
+  <path d="M450 234 V300" stroke="#8fb5d8" stroke-width="1.6" marker-end="url(#arw)"/>
+  <text x="470" y="258" fill="#eaf2fa" font-family="Saira, system-ui, sans-serif" font-size="13">plain HTTP on APP_PORT, localhost only</text>
+
+  <!-- response path, drawn as its own line so both directions are visible -->
+  <path d="M410 300 V234" stroke="#f0796a" stroke-width="1.6" marker-end="url(#arwr)" opacity="0.9"/>
+  <text x="60" y="284" fill="#f0796a" font-family="Saira, system-ui, sans-serif" font-size="13">CSP · HSTS · cookie hardening ·</text>
+  <text x="60" y="302" fill="#f0796a" font-family="Saira, system-ui, sans-serif" font-size="13">leaky-header stripping, on the way back</text>
+
+  <!-- app -->
+  <rect x="250" y="308" width="400" height="76" fill="#12304f" stroke="#8fb5d8" stroke-width="1.4"/>
+  <text x="450" y="346" text-anchor="middle" fill="#eaf2fa"
+        font-family="Saira Condensed, Saira, Archivo Narrow, system-ui, sans-serif"
+        font-size="24" font-weight="600" letter-spacing="3">YOUR APP</text>
+  <text x="450" y="368" text-anchor="middle" fill="#a9c6e0"
+        font-family="Saira, system-ui, sans-serif" font-size="13">unchanged — Node / Python / Go / Rust / …</text>
+
+  <path d="M450 384 V444" stroke="#8fb5d8" stroke-width="1.6" marker-end="url(#arw)"/>
+
+  <!-- backends -->
+  <rect x="250" y="452" width="400" height="60" fill="none" stroke="#8fb5d8" stroke-width="1" stroke-dasharray="5 4" opacity="0.75"/>
+  <text x="450" y="489" text-anchor="middle" fill="#a9c6e0"
+        font-family="Saira, system-ui, sans-serif" font-size="15">DB · internal APIs</text>
+
+  <text x="880" y="538" text-anchor="end" fill="#8fb5d8"
+        font-family="Saira Condensed, Saira, system-ui, sans-serif" font-size="12" letter-spacing="1.6" opacity="0.8">ZERO CODE CHANGES IN THE APP</text>
+</svg>

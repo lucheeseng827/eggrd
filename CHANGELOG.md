@@ -6,6 +6,53 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **A documentation site at `eggrd.dev/docs`, so the reference is not the source.** The landing
+  page's "Documentation" link pointed at the GitHub README, which meant every question about a
+  configuration key ended in `config.rs`. There are now four pages: an overview, the CLI and
+  environment variables, the full configuration reference, and operations (endpoints, every
+  Prometheus series, and what fails closed).
+
+  **The configuration page is generated** from `src/config.rs` by
+  `scripts/build-config-reference.py` — 151 keys across 21 tables, with the doc comment as the
+  description and the `Default` impl as the stated default. It cannot describe a binary that
+  does not exist, and a field added without a doc comment fails the generator rather than
+  producing a blank row: a reference with silent holes looks complete and is not.
+
+  Writing it found **21 public config fields with no doc comment at all**, including
+  `auth.realm`, all six `[headers]` policy values and every `enabled` flag. Those are now
+  documented in `config.rs`, which improves the source as much as the page.
+
+### Added
+- **The LLM gateway's ordering guarantee is now enforced by tests, not asserted in comments.**
+  The landing page claims the budget reserve, model allowlist and DLP gates run *before the
+  provider is called* — the whole economic argument, since a request that reaches the provider has
+  been paid for whatever the client eventually sees. Every denial test checked the client's status
+  and the metric and said "never reaches the upstream" in a comment; none of them observed the
+  upstream. A gate that forwarded first and denied afterwards would have passed all of them.
+
+  Five tests now use a counting stub provider and assert it saw **exactly zero** requests: over
+  budget, DLP block, off-allowlist model, and a budget-store outage (fail-closed, the default).
+  A control test asserts an admitted request registers exactly one hit — without it, a counter
+  that never incremented would make the rest pass vacuously.
+
+  Confirmed to have teeth by mutation: making the denial path call the provider before returning
+  makes `over_budget_request_never_reaches_the_provider` fail with `left: 1, right: 0`, while the
+  client still receives the same `429` the old test accepted.
+- **The same guarantee is now covered for the gates in front of an ordinary app**, not just the
+  LLM path: unauthenticated (`401`), WAF block (`403`), IP-denied (`403`), oversized body (`413`),
+  rate-limited (`429`), and a rate-limiter store outage (`503`, fail-closed). Each asserts the
+  upstream saw zero requests, with a control asserting an allowed request reaches it exactly once.
+  Mutating the auth path to forward before rejecting makes
+  `unauthenticated_request_never_reaches_the_upstream` fail the same way.
+
+### Fixed
+- **`dead_addr()` in the integration tests was racy.** It bound an ephemeral port and dropped it,
+  assuming nothing would claim it — but the OS is free to hand that port to the next listener, and
+  with more concurrent tests it does. The "down" upstream then answered `200` and
+  `bad_gateway_when_upstream_down` failed pointing at the proxy, when the fault was in the
+  fixture. Now returns `127.0.0.1:1`, which is privileged, unallocated, and refuses immediately.
+
 ### Fixed (release tooling, no crate change)
 - **The crate is published to crates.io again.** The mirror's release workflow had a `crates`
   job that published `edgeguard-ner` and then `eggrd`; rewriting that workflow upstream dropped

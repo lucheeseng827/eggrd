@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 160" width="1120" height="160" role="img" aria-label="Diagram: DNS to an optional CDN or platform load balancer, to eggrd, to your unchanged app, to the database and internal APIs.">
+  <title>Where eggrd sits in the chain</title>
+  <desc>DNS resolves to an optional CDN or platform load balancer that provides caching and DDoS protection, which forwards to eggrd, which forwards to your unchanged app, which talks to the database and internal APIs.</desc>
+  <defs>
+    <pattern id="g2" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0 H0 V24" fill="none" stroke="#8fb5d8" stroke-width="0.5" opacity="0.10"/>
+    </pattern>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8fb5d8"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="160" fill="#0b2038"/>
+  <rect width="1120" height="160" fill="url(#g2)"/>
+  <rect x="10.5" y="10.5" width="1099" height="139" fill="none" stroke="#8fb5d8" stroke-width="1" opacity="0.30"/>
+
+  <!-- DNS -->
+  <text x="46" y="80" fill="#a9c6e0" font-family="Saira Condensed, Saira, system-ui, sans-serif"
+        font-size="17" letter-spacing="2">DNS</text>
+  <path d="M92 74 H132" stroke="#8fb5d8" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <!-- CDN / LB, optional -->
+  <rect x="140" y="48" width="212" height="52" fill="none" stroke="#8fb5d8" stroke-width="1" stroke-dasharray="5 4" opacity="0.8"/>
+  <text x="246" y="72" text-anchor="middle" fill="#eaf2fa" font-family="Saira, system-ui, sans-serif" font-size="14">CDN / platform LB</text>
+  <text x="246" y="90" text-anchor="middle" fill="#8fb5d8" font-family="Saira, system-ui, sans-serif" font-size="12">optional — caching, DDoS</text>
+  <path d="M360 74 H400" stroke="#8fb5d8" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <!-- eggrd -->
+  <rect x="408" y="44" width="196" height="60" fill="#12304f" stroke="#f0796a" stroke-width="2"/>
+  <text x="506" y="74" text-anchor="middle" fill="#eaf2fa"
+        font-family="Saira Condensed, Saira, Archivo Narrow, system-ui, sans-serif"
+        font-size="24" font-weight="700" letter-spacing="5">eggrd</text>
+  <text x="506" y="92" text-anchor="middle" fill="#a9c6e0"
+        font-family="Saira Condensed, Saira, system-ui, sans-serif" font-size="11" letter-spacing="1.4">THIS PROJECT</text>
+  <path d="M612 74 H652" stroke="#8fb5d8" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <!-- app -->
+  <rect x="660" y="48" width="180" height="52" fill="#12304f" stroke="#8fb5d8" stroke-width="1.4"/>
+  <text x="750" y="72" text-anchor="middle" fill="#eaf2fa" font-family="Saira, system-ui, sans-serif" font-size="15">your app</text>
+  <text x="750" y="90" text-anchor="middle" fill="#8fb5d8" font-family="Saira, system-ui, sans-serif" font-size="12">unchanged</text>
+  <path d="M848 74 H888" stroke="#8fb5d8" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <!-- backends -->
+  <rect x="896" y="48" width="192" height="52" fill="none" stroke="#8fb5d8" stroke-width="1" stroke-dasharray="5 4" opacity="0.75"/>
+  <text x="992" y="80" text-anchor="middle" fill="#a9c6e0" font-family="Saira, system-ui, sans-serif" font-size="14">DB · internal APIs</text>
+
+  <text x="1088" y="138" text-anchor="end" fill="#8fb5d8"
+        font-family="Saira Condensed, Saira, system-ui, sans-serif" font-size="11" letter-spacing="1.4" opacity="0.8">ONE HOP, IN FRONT OF ONE APP</text>
+</svg>

@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 260" width="1200" height="260" role="img" aria-label="eggrd — a secure front door for an app you don't change">
+  <!--
+    README banner. Carries its own ground on purpose: the site's wordmark is light-on-dark and
+    would disappear against GitHub's light theme, and a <picture> pair means two files to keep
+    in step. A card is readable on both themes and stays one file.
+
+    Type is Saira Condensed to match the site's drafting lettering, with a system condensed
+    fallback — the mark, not the face, is what identifies it.
+  -->
+  <defs>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M24 0 H0 V24" fill="none" stroke="#8fb5d8" stroke-width="0.5" opacity="0.10"/>
+    </pattern>
+    <pattern id="hatch" width="4" height="4" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+      <line x1="0" y1="0" x2="0" y2="4" stroke="#eaf2fa" stroke-width="1" opacity="0.55"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="260" fill="#0b2038"/>
+  <rect width="1200" height="260" fill="url(#grid)"/>
+  <rect x="10.5" y="10.5" width="1179" height="239" fill="none" stroke="#8fb5d8" stroke-width="1" opacity="0.30"/>
+
+  <!-- mark: a body cut open in section, traffic crossing it both ways -->
+  <g transform="translate(72,86)" color="#eaf2fa">
+    <rect x="12.5" y="3" width="7" height="26" fill="url(#hatch)" stroke="#eaf2fa" stroke-width="1.6"/>
+    <path d="M1 11 H27" stroke="#eaf2fa" stroke-width="1.8" fill="none" stroke-linecap="square"/>
+    <path d="M25.5 8.2 L30 11 L25.5 13.8 Z" fill="#eaf2fa"/>
+    <path d="M31 21 H5" stroke="#eaf2fa" stroke-width="1.8" fill="none" stroke-linecap="square"/>
+    <path d="M6.5 18.2 L2 21 L6.5 23.8 Z" fill="#eaf2fa"/>
+  </g>
+
+  <text x="128" y="122" fill="#eaf2fa"
+        font-family="Saira Condensed, Saira, Archivo Narrow, Arial Narrow, system-ui, sans-serif"
+        font-size="72" font-weight="700" letter-spacing="12">eggrd</text>
+
+  <path d="M72 150 H1128" stroke="#8fb5d8" stroke-width="1" opacity="0.30"/>
+
+  <text x="72" y="188" fill="#eaf2fa"
+        font-family="Saira, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+        font-size="27" font-weight="400">A secure front door for an app you <tspan font-style="italic" fill="#f0796a">don't change.</tspan></text>
+
+  <text x="72" y="222" fill="#a9c6e0"
+        font-family="Saira Condensed, Saira, Archivo Narrow, system-ui, sans-serif"
+        font-size="17" letter-spacing="2.4">AUTH · RATE LIMITING · WAF-LITE · TLS · HARDENED RESPONSE HEADERS</text>
+
+  <!-- Top-right stamp rather than a second line at the bottom: on the bottom baseline it ran
+       into the capability caption and the two read as one crowded line. -->
+  <text x="1128" y="58" text-anchor="end" fill="#8fb5d8"
+        font-family="Saira Condensed, Saira, Archivo Narrow, system-ui, sans-serif"
+        font-size="15" letter-spacing="2.2">RUST · STATIC MUSL · amd64 + arm64</text>
+  <path d="M948 70 H1128" stroke="#8fb5d8" stroke-width="1" opacity="0.30"/>
+</svg>

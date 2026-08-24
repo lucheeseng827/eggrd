@@ -32,4 +32,19 @@ wasm-bindgen = "0.2"
 [profile.release]
 opt-level = "s"
 lto = true
-strip = true
+# NO `strip = true`.
+#
+# Stripping this crate broke the build outright — not the size, the build. `worker-build`
+# invokes wasm-bindgen with `--force-enable-abort-handler`, which generates catch wrappers, and
+# those need the externref table. Stripping removes the symbols wasm-bindgen uses to find it, so
+# it failed with:
+#
+#     error: failed to generate catch wrappers
+#     caused by: externref table required for catch wrappers
+#
+# which names neither `strip` nor this file, and reads like a toolchain incompatibility. It was
+# bisected by holding everything else constant: lto=true + strip=none builds, lto=false +
+# strip=true fails. LTO was never the problem.
+#
+# wasm-bindgen and wasm-opt strip what is safe to strip during their own passes, so the emitted
+# artifact is not meaningfully larger for having left this off.

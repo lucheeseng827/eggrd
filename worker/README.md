@@ -10,11 +10,29 @@ It is the compute counterpart to `edgeguard generate` (which emits static `_head
 edge-middleware config): use the generator when you only need headers, use this worker when you
 also want auth at the edge.
 
-> **Status / honesty note.** Like ACME and the Redis limiter in the main crate, this worker is
-> implemented and builds to wasm, but is **proven only against a live Cloudflare deploy** — the
-> wasm `fetch` entrypoint can't run in EdgeGuard's in-process test suite. The pure logic it
-> relies on (the security-header set, the auth decision, cookie hardening, header stripping,
-> origin-URL joining, env parsing) *is* unit-tested on the native target: `cargo test` here.
+> **Status / honesty note.** This worker now **runs**, and was checked by running it rather than
+> by reading it. `worker-build --release` produces the deployable bundle, and the bundle was
+> executed on **workerd — the same runtime Cloudflare runs in production** — via `wrangler dev`.
+> Against a live origin, on 2026-08-24:
+>
+> | Request | Result |
+> |---|---|
+> | No credentials, `AUTH_MODE=basic` | `401` with `WWW-Authenticate: Basic realm="EdgeGuard"` |
+> | Wrong password | `401` |
+> | Correct password | `200`, fetched from the origin, response hardened |
+>
+> The `200` carried all six hardening headers — HSTS, CSP, `Permissions-Policy`,
+> `Referrer-Policy`, `X-Content-Type-Options`, `X-Frame-Options` — and `Server` /
+> `X-Powered-By` were stripped.
+>
+> **The remaining gap is deployment, not execution.** It has not been deployed to a Cloudflare
+> account and served public traffic, so account-level concerns — routes, custom domains, secret
+> bindings, quotas — are still untested. What is settled is that the wasm builds, loads and
+> handles requests correctly in the real runtime.
+>
+> The pure logic it relies on (the security-header set, the auth decision, cookie hardening,
+> header stripping, origin-URL joining, env parsing) is additionally unit-tested on the native
+> target: `cargo test` here.
 
 ## What it does
 
@@ -81,3 +99,59 @@ cargo test          # native target: header set, auth decisions, cookie hardenin
 This crate is a **detached workspace** (note the empty `[workspace]` in `Cargo.toml`): it targets
 wasm and depends on the Cloudflare `worker` runtime, so it is intentionally excluded from the
 the parent workspace's native build and from this crate's CI. Build it only with `worker-build` / `wrangler`.
+
+## Reproducing the proof
+
+Two containers, no host toolchain needed. **Run these from this directory** — the mount is
+the parent, so `worker/` resolves the same way regardless of what sits above it.
+First build the bundle:
+
+```sh
+podman run --rm -v "$PWD/..":/w -w /w/worker \
+  docker.io/library/rust:1.90 bash -c '
+    rustup target add wasm32-unknown-unknown
+    cargo install worker-build --locked
+    worker-build --release'
+```
+
+That must emit `build/index.js` and `build/index_bg.wasm` (~415 KB). Then run it:
+
+```sh
+podman run --rm -v "$PWD/..":/w -w /w/worker \
+  docker.io/library/node:22 bash -c '
+    npx --yes wrangler@latest dev --local --port 8787 --ip 127.0.0.1 &
+    sleep 20
+    curl -s -o /dev/null -w "no creds:    %{http_code}\n" http://127.0.0.1:8787/
+    curl -s -o /dev/null -w "wrong pass:  %{http_code}\n" -u alice:wrong http://127.0.0.1:8787/
+    curl -s -I -u alice:correct-horse http://127.0.0.1:8787/ | grep -iE "^(strict-transport|content-security|x-frame|server|x-powered-by):"'
+```
+
+Set `EDGEGUARD_AUTH_MODE = "basic"` plus `EDGEGUARD_BASIC_USER` / `EDGEGUARD_BASIC_PASS` in the
+config you pass. Expect `401`, `401`, then a `200` whose headers include the hardening set and
+exclude `Server` and `X-Powered-By`.
+
+### Why `strip` is absent from `[profile.release]`
+
+Adding `strip = true` does not shrink this crate — it **breaks the build**, with an error that
+points nowhere near the cause:
+
+```
+error: failed to generate catch wrappers
+caused by: externref table required for catch wrappers
+```
+
+`worker-build` invokes wasm-bindgen with `--force-enable-abort-handler`, which generates catch
+wrappers that need the externref table; stripping removes the symbols wasm-bindgen uses to find
+it. The message names neither `strip` nor `Cargo.toml`, and reads like a toolchain
+incompatibility — it was misdiagnosed as one for weeks.
+
+Bisected by holding everything else fixed:
+
+| `lto` | `strip` | Build |
+|---|---|---|
+| true | true | fails |
+| false | true | fails |
+| false | none | **succeeds** |
+| true | none | **succeeds** |
+
+LTO was never involved. Keep `lto = true`; never add `strip`.

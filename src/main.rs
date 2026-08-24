@@ -73,7 +73,14 @@ fn parse_args() -> Result<Cmd> {
                     print_help();
                     std::process::exit(0);
                 }
-                _ => {}
+                "-V" | "--version" => {
+                    print_version();
+                    std::process::exit(0);
+                }
+                // Reject unknown flags rather than ignoring them, matching `doctor` and `init`.
+                // A typo like `--targt vercel` must not silently emit the default `_headers`
+                // target and report success.
+                other => anyhow::bail!("unknown argument for `edgeguard generate`: {other}"),
             }
         }
         return Ok(Cmd::Generate {
@@ -91,6 +98,10 @@ fn parse_args() -> Result<Cmd> {
                 "--config" => config = Some(require_value(&mut it, "--config")?),
                 "-h" | "--help" => {
                     print_help();
+                    std::process::exit(0);
+                }
+                "-V" | "--version" => {
+                    print_version();
                     std::process::exit(0);
                 }
                 // Reject unknown flags rather than ignoring them: a typo like `--confg` must not
@@ -112,6 +123,10 @@ fn parse_args() -> Result<Cmd> {
                     print_help();
                     std::process::exit(0);
                 }
+                "-V" | "--version" => {
+                    print_version();
+                    std::process::exit(0);
+                }
                 other => anyhow::bail!("unknown argument for `edgeguard init`: {other}"),
             }
         }
@@ -129,7 +144,16 @@ fn parse_args() -> Result<Cmd> {
                 print_help();
                 std::process::exit(0);
             }
-            _ => {}
+            "-V" | "--version" => {
+                print_version();
+                std::process::exit(0);
+            }
+            // This catch-all used to be `_ => {}`, which meant every unrecognised argument was
+            // discarded in silence. `edgeguard --version` started a proxy instead of printing a
+            // version, and a typo such as `--wrpa "npm start"` started an unwrapped, unconfigured
+            // proxy that looked healthy. Fail loudly: a front door that ignores its instructions
+            // is worse than one that refuses to open.
+            other => anyhow::bail!("unknown argument: {other} (run `edgeguard --help` for usage)"),
         }
     }
     Ok(if hash {
@@ -148,12 +172,20 @@ fn require_value<'a, I: Iterator<Item = &'a String>>(it: &mut I, flag: &str) -> 
         .with_context(|| format!("{flag} requires a value"))
 }
 
+/// `edgeguard --version`. Read from the crate manifest at compile time, so the binary and the
+/// image tag cannot disagree about what they are. There was no way to ask a published image its
+/// version before 0.3.1 — `--version` fell through to the catch-all below and started a proxy.
+fn print_version() {
+    println!("edgeguard {}", env!("CARGO_PKG_VERSION"));
+}
+
 fn print_help() {
     eprintln!(
         "edgeguard [--wrap \"<start command>\"] [--config <path>]\n\
          edgeguard init [--force]               # scaffold edgeguard.toml + a wrap-your-app Dockerfile\n\
          edgeguard doctor [--config <path>]     # validate the config and warn on foot-guns\n\
          edgeguard --hash                       # read a password on stdin, print an argon2 hash\n\
+         edgeguard --version                    # print the version and exit\n\
          edgeguard generate [--target <t>] [--config <path>] [--out <path>]\n\
          \x20                                    # emit static-host / edge config from [headers]\n\
          \x20  targets: _headers (Netlify/CF Pages), vercel, vercel-middleware, netlify-edge\n\

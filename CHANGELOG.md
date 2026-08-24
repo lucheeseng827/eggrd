@@ -6,6 +6,47 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-08-24
+
+A patch release, but read the argument-parsing note before upgrading: it changes what happens to
+a command line the proxy previously accepted.
+
+Both fixes came from the same habit as 0.3.0 — running the thing rather than reading it. Both
+turned out to be the project being wrong about itself: one flag that silently did nothing, and
+one build failure blamed on the wrong component for weeks.
+
+### Added
+- **`edgeguard --version` / `-V`.** There was previously no way to ask a binary or a published
+  image what version it was — the flag fell through the parser's catch-all and started a proxy
+  instead. Works for the subcommands too (`edgeguard doctor --version`).
+
+### Fixed
+- **The WASM edge worker builds and runs — the toolchain was never the problem.** `worker-build`
+  failed with `externref table required for catch wrappers`, which was recorded as a pinned-
+  toolchain incompatibility and left the worker as the one unproven capability. It was actually
+  `strip = true` in the worker's own `[profile.release]`: `worker-build` invokes wasm-bindgen with
+  `--force-enable-abort-handler`, whose catch wrappers need the externref table, and stripping
+  removes the symbols used to find it. The error names neither `strip` nor the manifest.
+
+  Bisected by holding everything else constant — `lto = true` + no strip builds; `lto = false` +
+  strip fails. LTO, the usual suspect, was never involved.
+
+  With `strip` removed, `worker-build --release` emits the bundle (`index.js` +
+  a 415 KB `index_bg.wasm`), and it was **run on workerd**, the runtime Cloudflare runs in
+  production: `401` unauthenticated, `401` on a wrong password, `200` fetched from a live origin
+  carrying all six hardening headers with `Server` and `X-Powered-By` stripped. Deployment to a
+  Cloudflare account — routes, custom domains, secret bindings — remains untested.
+- **Unknown arguments are rejected instead of silently discarded.** The serve path and
+  `generate` ended in `_ => {}`, so any token the parser did not recognise was dropped without
+  a word. A typo such as `--wrpa "npm start"` started an unwrapped, unconfigured proxy that
+  looked healthy, and `generate --targt vercel` emitted the default `_headers` target and
+  reported success. Both now fail with the offending argument named, matching what `doctor` and
+  `init` already did. A front door that ignores its instructions is worse than one that refuses
+  to open.
+
+  This is a **behaviour change**: a deployment currently passing an argument that was being
+  ignored will now fail at startup rather than run with settings it did not ask for.
+
 ### Fixed (release tooling, no crate change)
 - **The 0.3.0 manifest assertion could never pass.** It grepped the raw manifest for
   `"architecture":"amd64"`, but `docker buildx imagetools inspect --raw` returns
@@ -410,7 +451,8 @@ unchanged). Ships the v0–v2.5 feature set below.
 - Added an optional `validation.max_response_body` cap so a huge upstream response can't
   OOM the proxy.
 
-[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/lucheeseng827/eggrd/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lucheeseng827/eggrd/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/lucheeseng827/eggrd/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/lucheeseng827/eggrd/compare/v0.2.0...v0.2.1

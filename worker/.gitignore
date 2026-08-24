@@ -3,3 +3,6 @@
 
 # worker-build / wrangler output
 /build
+
+# wrangler's local state + workerd cache, created by `wrangler dev`.
+/.wrangler

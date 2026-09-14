@@ -6,7 +6,9 @@
 //! rather than a reimplementation of it.
 
 pub mod access;
+pub mod accesslog;
 pub mod acme;
+pub mod acme_budget;
 pub mod alert;
 pub mod auth;
 pub mod budget;
@@ -19,10 +21,12 @@ pub mod generate;
 pub mod keyvault;
 pub mod limiter;
 pub mod llm;
+pub mod logship;
 pub mod metrics;
 pub mod proxy;
 pub mod reload;
 pub mod scaffold;
+pub mod selfsigned;
 pub mod supervisor;
 pub mod telemetry;
 pub mod tls;

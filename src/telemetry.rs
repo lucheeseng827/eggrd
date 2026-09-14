@@ -240,6 +240,159 @@ pub fn build_export_json(r: &SpanRecord, service_name: &str) -> Value {
     })
 }
 
+/// Whether a trace id falls in the sampled fraction, as a free function so the HTTP server span and
+/// the LLM client span reach the SAME verdict for one request. Deterministic per trace: folding both
+/// 64-bit halves together is the uniform draw, so a trace is sampled consistently wherever it is
+/// evaluated and a trace is never half-recorded.
+pub fn trace_sampled(sample_rate: f64, trace_id: &[u8; 16]) -> bool {
+    if sample_rate >= 1.0 {
+        return true;
+    }
+    if sample_rate <= 0.0 {
+        return false;
+    }
+    let hi = u64::from_be_bytes(trace_id[0..8].try_into().unwrap_or([0; 8]));
+    let lo = u64::from_be_bytes(trace_id[8..16].try_into().unwrap_or([0; 8]));
+    ((hi ^ lo) as f64 / u64::MAX as f64) < sample_rate
+}
+
+/// Render a [`TraceContext`] as the W3C `traceparent` header value to send upstream.
+///
+/// `01` in the flags means sampled. This is only ever built for a span we are recording, so the
+/// upstream is told the trace is sampled — which is what makes the app's own spans join this trace
+/// instead of being dropped by its sampler.
+pub fn traceparent_header(ctx: &TraceContext) -> String {
+    format!("00-{}-{}-01", hex(&ctx.trace_id), hex(&ctx.span_id))
+}
+
+/// One proxied HTTP request, rendered as an OpenTelemetry **SERVER** span.
+///
+/// Attribute names follow the current stable HTTP semantic conventions, which renamed nearly all of
+/// them (`http.method` became `http.request.method`, `http.url` became `url.*`). Getting these wrong
+/// is not cosmetic: every backend normalizes on the stable names, so an old-name span is dropped
+/// from latency and error panels rather than being merely oddly labelled.
+#[derive(Clone, Debug)]
+pub struct ServerSpan {
+    pub ctx: TraceContext,
+    /// The method, or `_OTHER` when it is not one of the known set (semconv requires that).
+    pub method: String,
+    /// Set only when `method` was replaced by `_OTHER`.
+    pub method_original: Option<String>,
+    pub url_path: String,
+    /// The query string, **already sanitised** by [`crate::accesslog::sanitize_target`]. `None`
+    /// when the request carried none.
+    ///
+    /// This is the one place the HTTP semconv is deliberately not followed to the letter. The spec
+    /// wants the query as received; this proxy redacts credential-shaped values everywhere else it
+    /// writes them, and a span is shipped to the same class of destination as an access log. Sending
+    /// the raw query here would reintroduce, in traces, exactly the leak the access log was built to
+    /// prevent.
+    pub url_query: Option<String>,
+    pub url_scheme: String,
+    pub status_code: u16,
+    pub client_address: Option<String>,
+    pub server_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub protocol_version: Option<String>,
+    /// EdgeGuard's own verdict (`proxied`, `rate_limited`, `waf_blocked`, …). Not a semconv
+    /// attribute, so it is namespaced — it says WHY a request ended as it did, which the status code
+    /// alone does not.
+    pub outcome: String,
+    pub request_id: String,
+    pub start_unix_nano: u128,
+    pub end_unix_nano: u128,
+}
+
+impl ServerSpan {
+    /// Methods the semantic conventions define. Anything else must be reported as `_OTHER` with the
+    /// original in `http.request.method_original`, so an attacker cannot create unbounded label
+    /// cardinality by inventing methods.
+    pub fn normalize_method(method: &str) -> (String, Option<String>) {
+        const KNOWN: [&str; 9] = [
+            "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+        ];
+        if KNOWN.contains(&method) {
+            (method.to_string(), None)
+        } else {
+            ("_OTHER".to_string(), Some(method.to_string()))
+        }
+    }
+}
+
+/// Build the OTLP-JSON for a batch of server spans — one POST body for many spans.
+///
+/// Batched because a proxy emits one span per request. One POST each would make the tracing backend
+/// the busiest thing the edge talks to and would put a network round trip in the path of every
+/// request's teardown.
+pub fn build_server_spans_json(spans: &[ServerSpan], service_name: &str) -> Value {
+    let rendered: Vec<Value> = spans.iter().map(render_server_span).collect();
+    json!({
+        "resourceSpans": [{
+            "resource": { "attributes": [ kv_str("service.name", service_name) ] },
+            "scopeSpans": [{
+                "scope": { "name": "edgeguard", "version": env!("CARGO_PKG_VERSION") },
+                "spans": rendered,
+            }],
+        }],
+    })
+}
+
+fn render_server_span(r: &ServerSpan) -> Value {
+    let mut attrs = vec![
+        // Required by the spec for a server span.
+        kv_str("http.request.method", &r.method),
+        kv_str("url.path", &r.url_path),
+        kv_str("url.scheme", &r.url_scheme),
+        // Conditionally required: a response was sent.
+        kv_int("http.response.status_code", r.status_code as u64),
+    ];
+    if let Some(orig) = &r.method_original {
+        attrs.push(kv_str("http.request.method_original", orig));
+    }
+    if let Some(q) = &r.url_query {
+        attrs.push(kv_str("url.query", q));
+    }
+    if let Some(c) = &r.client_address {
+        attrs.push(kv_str("client.address", c));
+    }
+    if let Some(sa) = &r.server_address {
+        attrs.push(kv_str("server.address", sa));
+    }
+    if let Some(ua) = &r.user_agent {
+        attrs.push(kv_str("user_agent.original", ua));
+    }
+    if let Some(v) = &r.protocol_version {
+        attrs.push(kv_str("network.protocol.version", v));
+    }
+    attrs.push(kv_str("edgeguard.outcome", &r.outcome));
+    attrs.push(kv_str("edgeguard.request_id", &r.request_id));
+
+    // Span status. The spec is explicit and counter-intuitive here: for a SERVER span a 4xx MUST be
+    // left unset, because the server handled the request correctly — the client sent a bad one.
+    // Only 5xx (and uninterpreted failures) are Error. Marking 4xx as Error is the common mistake
+    // and it makes every error-rate panel read a 404 storm as an outage.
+    let mut span = json!({
+        "traceId": hex(&r.ctx.trace_id),
+        "spanId": hex(&r.ctx.span_id),
+        "name": r.method,   // `{method}` — a proxy has no route template to name
+        "kind": 2,          // SERVER
+        "startTimeUnixNano": r.start_unix_nano.to_string(),
+        "endTimeUnixNano": r.end_unix_nano.to_string(),
+        "attributes": attrs,
+    });
+    if r.status_code >= 500 {
+        span["status"] = json!({ "code": 2 });
+        span["attributes"]
+            .as_array_mut()
+            .expect("attributes is an array")
+            .push(kv_str("error.type", &r.status_code.to_string()));
+    }
+    if let Some(parent) = &r.ctx.parent_span_id {
+        span["parentSpanId"] = Value::String(hex(parent));
+    }
+    span
+}
+
 fn kv_str(key: &str, value: &str) -> Value {
     json!({ "key": key, "value": { "stringValue": value } })
 }
@@ -307,6 +460,165 @@ fn rand8() -> [u8; 8] {
 
 #[cfg(test)]
 mod tests {
+
+    fn srv(status: u16) -> ServerSpan {
+        ServerSpan {
+            ctx: TraceContext {
+                trace_id: [1u8; 16],
+                span_id: [2u8; 8],
+                parent_span_id: None,
+            },
+            method: "GET".into(),
+            method_original: None,
+            url_path: "/api/thing".into(),
+            url_query: Some("page=2".into()),
+            url_scheme: "https".into(),
+            status_code: status,
+            client_address: Some("203.0.113.7".into()),
+            server_address: Some("app.example.com".into()),
+            user_agent: Some("curl/8".into()),
+            protocol_version: Some("1.1".into()),
+            outcome: "proxied".into(),
+            request_id: "rid-1".into(),
+            start_unix_nano: 1_000,
+            end_unix_nano: 3_000,
+        }
+    }
+
+    fn attrs_of(v: &Value) -> std::collections::HashMap<String, Value> {
+        v["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| (a["key"].as_str().unwrap().to_string(), a["value"].clone()))
+            .collect()
+    }
+
+    #[test]
+    fn server_span_uses_the_current_stable_semconv_names() {
+        // The conventions RENAMED nearly all of these (http.method -> http.request.method,
+        // http.url -> url.*). An old-name span is not merely oddly labelled: every backend
+        // normalizes on the stable names, so it drops out of latency and error panels entirely.
+        let v = build_server_spans_json(&[srv(200)], "edgeguard");
+        let a = attrs_of(&v);
+        assert_eq!(a["http.request.method"]["stringValue"], "GET");
+        assert_eq!(a["url.path"]["stringValue"], "/api/thing");
+        assert_eq!(a["url.scheme"]["stringValue"], "https");
+        assert_eq!(a["url.query"]["stringValue"], "page=2");
+        // Conditionally required and the single most-used attribute in any HTTP dashboard. It was
+        // missing from the first draft of this design.
+        assert_eq!(a["http.response.status_code"]["intValue"], "200");
+        assert_eq!(a["client.address"]["stringValue"], "203.0.113.7");
+        assert_eq!(a["user_agent.original"]["stringValue"], "curl/8");
+        assert_eq!(a["network.protocol.version"]["stringValue"], "1.1");
+        // The old names must not appear at all.
+        for dead in ["http.method", "http.url", "http.status_code", "http.target"] {
+            assert!(
+                !a.contains_key(dead),
+                "obsolete semconv attribute {dead} emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_span_is_kind_server_and_named_for_the_method() {
+        // A proxy has no route template, and the spec says the span name is `{method}` alone when
+        // `http.route` is unavailable. Putting the PATH in the name is the common mistake and it
+        // makes span-name cardinality unbounded.
+        let v = build_server_spans_json(&[srv(200)], "edgeguard");
+        let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["kind"], 2, "SERVER");
+        assert_eq!(span["name"], "GET");
+    }
+
+    #[test]
+    fn only_5xx_sets_span_status_to_error() {
+        // The spec is explicit and counter-intuitive: for a SERVER span a 4xx MUST be left unset,
+        // because the server handled a bad request correctly. Marking 4xx as Error makes every
+        // error-rate panel read a 404 storm as an outage.
+        for ok in [200u16, 301, 404, 429, 499] {
+            let v = build_server_spans_json(&[srv(ok)], "edgeguard");
+            let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+            assert!(span.get("status").is_none(), "{ok} must leave status unset");
+            assert!(
+                !attrs_of(&v).contains_key("error.type"),
+                "{ok} is not an error"
+            );
+        }
+        for bad in [500u16, 502, 503] {
+            let v = build_server_spans_json(&[srv(bad)], "edgeguard");
+            let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+            assert_eq!(span["status"]["code"], 2, "{bad} must be Error");
+            assert_eq!(attrs_of(&v)["error.type"]["stringValue"], bad.to_string());
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_is_bucketed_rather_than_labelled() {
+        // Otherwise a caller invents methods and creates unbounded span-name cardinality.
+        let (m, orig) = ServerSpan::normalize_method("FROBNICATE");
+        assert_eq!(m, "_OTHER");
+        assert_eq!(orig.as_deref(), Some("FROBNICATE"));
+        let (m, orig) = ServerSpan::normalize_method("PATCH");
+        assert_eq!(m, "PATCH");
+        assert!(orig.is_none());
+    }
+
+    #[test]
+    fn one_batch_is_one_payload_with_many_spans() {
+        // A proxy emits a span per request; one POST each would make the trace backend the busiest
+        // thing the edge talks to.
+        let v = build_server_spans_json(&[srv(200), srv(500), srv(404)], "edgeguard");
+        let spans = v["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            v["resourceSpans"][0]["resource"]["attributes"][0]["value"]["stringValue"],
+            "edgeguard"
+        );
+    }
+
+    #[test]
+    fn sampling_is_deterministic_per_trace_and_respects_the_bounds() {
+        let a = [7u8; 16];
+        let b = [9u8; 16];
+        assert!(trace_sampled(1.0, &a) && trace_sampled(1.0, &b));
+        assert!(!trace_sampled(0.0, &a) && !trace_sampled(0.0, &b));
+        // Same trace, same verdict, every time — this is what stops a half-recorded trace.
+        for _ in 0..100 {
+            assert_eq!(trace_sampled(0.5, &a), trace_sampled(0.5, &a));
+        }
+    }
+
+    #[test]
+    fn the_outbound_traceparent_names_our_span_and_says_sampled() {
+        // The upstream must become a CHILD of the edge's span, and must be told the trace is
+        // sampled — otherwise its own sampler drops the other half of the trace.
+        let ctx = TraceContext {
+            trace_id: [0xab; 16],
+            span_id: [0xcd; 8],
+            parent_span_id: None,
+        };
+        let h = traceparent_header(&ctx);
+        assert_eq!(h, format!("00-{}-{}-01", "ab".repeat(16), "cd".repeat(8)));
+        // And it round-trips: a downstream parsing it sees our trace and our span as its parent.
+        let back = TraceContext::from_traceparent(Some(&h));
+        assert_eq!(back.trace_id, ctx.trace_id);
+        assert_eq!(back.parent_span_id, Some(ctx.span_id));
+    }
+
+    #[test]
+    fn an_inbound_traceparent_makes_the_server_span_a_child() {
+        let inbound = format!("00-{}-{}-01", "11".repeat(16), "22".repeat(8));
+        let ctx = TraceContext::from_traceparent(Some(&inbound));
+        let mut s = srv(200);
+        s.ctx = ctx;
+        let v = build_server_spans_json(&[s], "edgeguard");
+        let span = &v["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["traceId"], "11".repeat(16));
+        assert_eq!(span["parentSpanId"], "22".repeat(8));
+    }
     use super::*;
 
     fn record() -> SpanRecord {
@@ -519,5 +831,154 @@ mod tests {
         assert!(s.starts_with("abc"));
         assert!(s.contains("truncated"));
         assert_eq!(prepare_content("hi".as_bytes(), 8), "hi");
+    }
+}
+
+// ─── span shipping ────────────────────────────────────────────────────────────────────────────
+
+/// Bounded queue + background task that batches server spans into OTLP-JSON POSTs.
+///
+/// Same discipline as [`crate::logship`], for the same reason: this is fed from the response path of
+/// every request. `record` is one non-blocking `try_send` and returns; a slow or absent collector
+/// costs dropped spans, never request latency. Traces are telemetry, so the loss is bounded and
+/// counted rather than buffered without limit — an unbounded buffer on a proxy turns a collector
+/// outage into a proxy outage.
+#[derive(Clone)]
+pub struct SpanShipper {
+    tx: tokio::sync::mpsc::Sender<ServerSpan>,
+    stats: std::sync::Arc<SpanShipStats>,
+}
+
+/// Counters for the span shipper. A trace pipeline that drops silently reads, at the destination,
+/// as an absence of traffic.
+#[derive(Debug, Default)]
+pub struct SpanShipStats {
+    pub sent: std::sync::atomic::AtomicU64,
+    pub dropped_queue_full: std::sync::atomic::AtomicU64,
+    pub dropped_send_failed: std::sync::atomic::AtomicU64,
+}
+
+impl SpanShipper {
+    pub fn stats(&self) -> &std::sync::Arc<SpanShipStats> {
+        &self.stats
+    }
+
+    /// Hand a span to the shipper. Never blocks, never awaits, never fails the caller.
+    pub fn record(&self, span: ServerSpan) {
+        if self.tx.try_send(span).is_err() {
+            self.stats
+                .dropped_queue_full
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Build the shipper and spawn its background task. `None` when tracing is off or unconfigured.
+pub fn spawn_span_shipper(
+    cfg: &crate::config::TracingCfg,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<SpanShipper> {
+    if !cfg.enabled || cfg.endpoint.trim().is_empty() {
+        return None;
+    }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(cfg.timeout_ms.max(100)))
+        .build()
+        .ok()?;
+    let stats = std::sync::Arc::new(SpanShipStats::default());
+    let (tx, rx) = tokio::sync::mpsc::channel(cfg.queue_size.max(1));
+    let task = SpanShipTask {
+        http,
+        endpoint: cfg.endpoint.clone(),
+        service_name: cfg.service_name.clone(),
+        batch: cfg.batch.max(1),
+        interval: std::time::Duration::from_secs(cfg.interval_secs.max(1)),
+        stats: std::sync::Arc::clone(&stats),
+    };
+    tracing::info!(endpoint = %cfg.endpoint, batch = task.batch, "request tracing enabled");
+    tokio::spawn(task.run(rx, shutdown));
+    Some(SpanShipper { tx, stats })
+}
+
+struct SpanShipTask {
+    http: reqwest::Client,
+    endpoint: String,
+    service_name: String,
+    batch: usize,
+    interval: std::time::Duration,
+    stats: std::sync::Arc<SpanShipStats>,
+}
+
+impl SpanShipTask {
+    async fn run(
+        self,
+        mut rx: tokio::sync::mpsc::Receiver<ServerSpan>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut buf: Vec<ServerSpan> = Vec::with_capacity(self.batch);
+        let mut tick = tokio::time::interval(self.interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval`'s first tick completes immediately; consume it so the configured interval means
+        // what it says and the first batch of a process is not a batch of one.
+        tick.tick().await;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => { if *shutdown.borrow() { break } }
+                got = rx.recv() => match got {
+                    Some(s) => {
+                        buf.push(s);
+                        if buf.len() >= self.batch {
+                            self.flush(&mut buf).await;
+                        }
+                    }
+                    None => break,
+                },
+                _ = tick.tick() => {
+                    if !buf.is_empty() {
+                        self.flush(&mut buf).await;
+                    }
+                }
+            }
+        }
+        // Drain on the way out: the spans around a restart are the ones most likely to explain it.
+        while let Ok(s) = rx.try_recv() {
+            buf.push(s);
+            if buf.len() >= self.batch {
+                self.flush(&mut buf).await;
+            }
+        }
+        if !buf.is_empty() {
+            self.flush(&mut buf).await;
+        }
+    }
+
+    async fn flush(&self, buf: &mut Vec<ServerSpan>) {
+        let n = buf.len() as u64;
+        let body = build_server_spans_json(buf, &self.service_name);
+        buf.clear();
+        match self.http.post(&self.endpoint).json(&body).send().await {
+            Ok(r) if r.status().is_success() => {
+                self.stats
+                    .sent
+                    .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+            // No retry, unlike the log shipper's single retry. Spans are the most disposable
+            // telemetry here and the highest volume; a retry queue behind a failing collector just
+            // converts collector downtime into request-path drops sooner.
+            Ok(r) => {
+                tracing::debug!(status = %r.status(), spans = n, "trace collector rejected a batch");
+                self.stats
+                    .dropped_send_failed
+                    .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, spans = n, "shipping a span batch failed");
+                self.stats
+                    .dropped_send_failed
+                    .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 }

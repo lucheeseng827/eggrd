@@ -88,11 +88,50 @@ becomes the public listener and forwards to it.** Four ways to wire that:
 > process; those are a separate surface — now implemented in Phase 5 as `edgeguard generate`
 > (config generation) and the Rust→WASM Worker (`../worker/`), not this binary.
 
-## TLS — bring your own certificate
+## TLS — three ways to get a certificate
 
 EdgeGuard terminates TLS with `rustls` and serves **whatever certificate chain + key you give it**
 — it doesn't validate who issued them, so a cert from a public CA, an internal/corporate CA, or a
 self-signed cert all work the same way.
+
+| | needs a public domain | needs inbound `:80` | publicly trusted | use for |
+|---|---|---|---|---|
+| `[tls] self_signed = true` | no | no | **no** | localhost, private network, staging |
+| `[tls.acme]` | **yes** | **yes** | yes | a public site |
+| your own PEM files (below) | no | no | depends on issuer | corporate/internal CA |
+
+### Option A — let EdgeGuard generate one (`self_signed`)
+
+Nothing to prepare: set `self_signed = true` and it writes a certificate to `cert_path`/`key_path`
+on first boot (key mode `0600`), then serves it. Generation is skipped once the files exist.
+
+```toml
+[server]
+port = 8443
+
+[tls]
+enabled     = true
+cert_path   = "/etc/edgeguard/tls/cert.pem"
+key_path    = "/etc/edgeguard/tls/key.pem"
+self_signed = true
+self_signed_hosts = ["app.internal", "10.0.0.5"]   # empty = localhost/127.0.0.1/::1
+```
+
+To make the files ahead of time (a Docker build stage, a compose init container, a config-management
+run), use the standalone subcommand — it needs no config file and starts no listener:
+
+```bash
+edgeguard cert --host app.internal --days 90 --cert-out ./tls/cert.pem --key-out ./tls/key.pem
+```
+
+Mount a writable volume at the certificate directory if you rely on first-boot generation; a
+read-only mount means the proxy cannot write what it is about to serve. This is the option to reach
+for when TLS is *within* your perimeter — a sidecar hop, a service mesh leg, a staging box behind a
+VPN — where you control the clients and can trust the certificate explicitly
+(`curl --cacert cert.pem …`). It is **not** the option for a public site: browsers will show an
+interstitial. Use ACME there.
+
+### Option B — bring your own certificate
 
 1. **Prepare two PEM files.**
    - **Certificate chain** (`fullchain.pem`) — **leaf first**, then any intermediates. The
@@ -135,3 +174,44 @@ self-signed cert all work the same way.
   gate callers with Basic / API-key / JWT instead.
 - Prefer **automatic certificates** instead? Set `[tls.acme]` (Let's Encrypt, HTTP-01) — it obtains
   and renews the cert for you (staging directory by default).
+
+## Catch plaintext traffic — HTTP → HTTPS redirect
+
+Terminating TLS protects only the traffic that *reaches* the TLS port. A visitor who types a bare
+hostname, a `curl` in someone's runbook, an old bookmark, a webhook configured years ago — all try
+`:80` first. With nothing listening there they get a connection error; with the app still bound
+there they get plaintext. `tls.redirect_port` closes that gap with a second, tiny listener:
+
+```toml
+[server]
+port = 443
+
+[tls]
+enabled         = true
+redirect_port   = 80                     # 0 (default) = off; also settable via REDIRECT_PORT
+redirect_status = 308                    # preserves method + body; 301 for the older convention
+redirect_hosts  = ["app.example.com"]    # empty = reflect any syntactically valid Host
+```
+
+```bash
+docker run -p 80:80 -p 443:443 \
+  -v "$PWD/tls:/etc/edgeguard/tls" \
+  -v "$PWD/edgeguard.toml:/etc/edgeguard/edgeguard.toml:ro" \
+  mancube/eggrd:latest --config /etc/edgeguard/edgeguard.toml
+```
+
+**Notes & limits.**
+- `308` is the default rather than `301` so a `POST` that lands on the plaintext port is replayed
+  over TLS instead of being silently downgraded to a `GET`.
+- Binding `:80` needs privilege or `CAP_NET_BIND_SERVICE`. On Kubernetes, prefer a Service that
+  maps `:80` to a high port and set `redirect_port` to that instead of running as root.
+- The `Host` header is attacker-controlled. A malformed host (spaces, CR/LF, userinfo, over-long)
+  is always answered `400` rather than reflected into `Location`; set `redirect_hosts` to pin
+  redirects to the names you serve, which is what stops a forged `Host` from producing a redirect
+  that appears to come from your domain.
+- `/.well-known/acme-challenge/` is answered `404`, never redirected — a CA must read the HTTP-01
+  token in plaintext, and bouncing it to the port whose certificate is being issued would deadlock
+  the order. With `[tls.acme]` on, issuance runs first and the redirect listener binds `:80`
+  afterwards, so the two never contend for the port.
+- Leave this off when a load balancer or platform edge already redirects; two hops are wasteful,
+  not harmful.

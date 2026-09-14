@@ -181,13 +181,154 @@ pub async fn handle(
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // Request-tracing inputs, captured before `handle_inner` consumes the request. Only gathered
+    // when a shipper actually exists: with tracing off this is one Option check, not a trace-id mint
+    // and a pile of header reads on every request.
+    let mut req = req;
+    let span_pre = state
+        .metrics
+        .span_shipper()
+        .is_some()
+        .then(|| ServerSpanPre::capture(&req, &rt, peer));
+    // Hand the context to the forward path so it can rewrite `traceparent` for the upstream. Only
+    // when recording: an unsampled request forwards the client's headers untouched.
+    if let Some(pre) = &span_pre {
+        if pre.sampled {
+            req.extensions_mut().insert(pre.ctx);
+        }
+    }
+
     let mut resp = handle_inner(&state, &rt, peer, req).await;
     if let Some(origin) = &origin {
         if let Some(cors) = &rt.cors {
             cors.decorate_origin(origin, &mut resp);
         }
     }
+
+    // Emit the span AFTER CORS decoration, so what is recorded is the response the client receives.
+    if let Some(pre) = span_pre {
+        // The sampling verdict was fixed from the trace id before any work, so a trace is wholly
+        // recorded or wholly not — a half-recorded trace reads in a backend as a missing service.
+        if pre.sampled {
+            if let (Some(shipper), Some(info)) = (
+                state.metrics.span_shipper(),
+                resp.extensions().get::<FinishInfo>().cloned(),
+            ) {
+                shipper.record(pre.finish(&info));
+            }
+        }
+    }
     resp
+}
+
+/// Everything a server span needs from the request, taken before the body is consumed.
+///
+/// Sampling is decided here, once, from the trace id — so the decision is fixed before any work and
+/// a trace is wholly recorded or wholly not.
+struct ServerSpanPre {
+    ctx: crate::telemetry::TraceContext,
+    method: String,
+    method_original: Option<String>,
+    url_path: String,
+    url_query: Option<String>,
+    url_scheme: String,
+    client_address: Option<String>,
+    server_address: Option<String>,
+    user_agent: Option<String>,
+    protocol_version: Option<String>,
+    start_unix_nano: u128,
+    sampled: bool,
+}
+
+impl ServerSpanPre {
+    fn capture(req: &Request<Body>, rt: &Runtime, peer: SocketAddr) -> ServerSpanPre {
+        let inbound = req
+            .headers()
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok());
+        // One context for the whole request: an inbound traceparent makes this span a child of the
+        // caller's, otherwise a fresh root trace.
+        let ctx = crate::telemetry::TraceContext::from_traceparent(inbound);
+        let sampled = crate::telemetry::trace_sampled(rt.cfg.tracing.sample_rate, &ctx.trace_id);
+
+        let (method, method_original) =
+            crate::telemetry::ServerSpan::normalize_method(req.method().as_str());
+
+        let (path, query) = match req.uri().path_and_query() {
+            Some(pq) => (pq.path().to_string(), pq.query().map(str::to_owned)),
+            None => (req.uri().path().to_string(), None),
+        };
+        // The query is sanitised with the SAME policy as the access log. A span goes to the same
+        // class of destination, so leaving credentials in it would reintroduce in traces exactly the
+        // leak the access log exists to prevent.
+        let url_query = query.map(|q| {
+            crate::accesslog::sanitize_target(
+                &format!("/?{q}"),
+                rt.cfg.log.query,
+                &rt.cfg.log.redact_params,
+            )
+            .split_once('?')
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default()
+        });
+
+        ServerSpanPre {
+            ctx,
+            method,
+            method_original,
+            url_path: path,
+            url_query,
+            url_scheme: if rt.cfg.tls.enabled { "https" } else { "http" }.to_string(),
+            client_address: Some(peer.ip().to_string()),
+            server_address: req
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            user_agent: req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            protocol_version: match req.version() {
+                hyper::Version::HTTP_10 => Some("1.0".into()),
+                hyper::Version::HTTP_11 => Some("1.1".into()),
+                hyper::Version::HTTP_2 => Some("2".into()),
+                hyper::Version::HTTP_3 => Some("3".into()),
+                _ => None,
+            },
+            start_unix_nano: unix_nanos(),
+            sampled,
+        }
+    }
+
+    fn finish(self, info: &FinishInfo) -> crate::telemetry::ServerSpan {
+        crate::telemetry::ServerSpan {
+            ctx: self.ctx,
+            method: self.method,
+            method_original: self.method_original,
+            url_path: self.url_path,
+            url_query: self.url_query,
+            url_scheme: self.url_scheme,
+            status_code: info.status,
+            client_address: self.client_address,
+            server_address: self.server_address,
+            user_agent: self.user_agent,
+            protocol_version: self.protocol_version,
+            outcome: info.outcome.clone(),
+            request_id: info.request_id.clone(),
+            start_unix_nano: self.start_unix_nano,
+            end_unix_nano: self.start_unix_nano + info.elapsed.as_nanos(),
+        }
+    }
+}
+
+/// Wall-clock nanoseconds since the Unix epoch, for span timestamps.
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 async fn handle_inner(
@@ -200,11 +341,22 @@ async fn handle_inner(
     let m = &state.metrics;
 
     let method = req.method().clone();
-    let path = req
+    // Two forms of the request target, and the distinction is load-bearing.
+    //
+    // `raw_path` is what the request actually asked for: it routes, it picks the upstream, it is
+    // what the WAF inspects, and it is forwarded verbatim. Redacting any of that would break
+    // routing and blind the security pipeline.
+    //
+    // `path` is the form that reaches a log line, with credential-shaped query values removed. The
+    // query string is where password-reset links, OAuth `?code=`, presigned URLs and `?api_key=`
+    // live, and an access log is the most-copied artifact this proxy produces. See `accesslog`.
+    let raw_path = req
         .uri()
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
+    let path =
+        crate::accesslog::sanitize_target(&raw_path, rt.cfg.log.query, &rt.cfg.log.redact_params);
 
     let ip = client_ip(req.headers(), peer, rt.cfg.server.trust_forwarded_for);
     // Request id for correlation: reuse a well-formed inbound one, else generate. Echoed on the
@@ -290,7 +442,7 @@ async fn handle_inner(
     //    store error it fails closed (`503`) unless `ratelimit.fail_open` is set.
     if rt.cfg.ratelimit.enabled {
         if let Some(d) = &rt.distributed {
-            match d.check_ip_route(ip, &path).await {
+            match d.check_ip_route(ip, &raw_path).await {
                 Admit::Allowed => {}
                 Admit::Limited(scope) => {
                     m.record_ratelimit_hit(scope);
@@ -319,7 +471,7 @@ async fn handle_inner(
                 }
             }
         } else {
-            let (limiter, scope) = match longest_route(&rt.route_limiters, &path) {
+            let (limiter, scope) = match longest_route(&rt.route_limiters, &raw_path) {
                 Some(r) => (Some(r.limiter.as_ref()), "route"),
                 None => (rt.ip_limiter.as_deref(), "ip"),
             };
@@ -505,7 +657,7 @@ async fn handle_inner(
                 }
             }
         }
-        return proxy_upgrade(state, rt, req, &rid, &method, &path, ip, started).await;
+        return proxy_upgrade(state, rt, req, &rid, &method, &raw_path, &path, ip, started).await;
     }
 
     // 5) Buffer the body up to the configured limit.
@@ -549,7 +701,7 @@ async fn handle_inner(
     //    already buffered above, so inspecting it adds no extra read. On a match: `block` mode
     //    returns 403; `report` mode logs + counts and forwards. Both record the hit so a
     //    report-only rollout shows up in `edgeguard_waf_hits_total`.
-    if let Some(hit) = rt.waf.evaluate(&path, &parts.headers, &body_bytes) {
+    if let Some(hit) = rt.waf.evaluate(&raw_path, &parts.headers, &body_bytes) {
         m.record_waf_hit(hit.class);
         match rt.waf.mode() {
             WafMode::Block => {
@@ -847,7 +999,14 @@ async fn handle_inner(
     }
 
     // 7) Build the upstream request (the per-path upstream override, or the default).
-    let uri = format!("{}{}", rt.pick_upstream(&path), path);
+    // Two forms again, and for the same reason as `raw_path`/`path` above: `uri` is forwarded and
+    // must carry the client's query verbatim, `log_uri` is what a timeout or a connection error
+    // writes to the log. Redacting the access log and then printing the same `?api_key=` in a
+    // `warn!` on the failure path would leak exactly the credentials this is meant to keep out — and
+    // on the path an operator is most likely to be reading.
+    let upstream_base = rt.pick_upstream(&raw_path);
+    let uri = format!("{upstream_base}{raw_path}");
+    let log_uri = format!("{upstream_base}{path}");
     let mut up = Request::builder().method(parts.method.clone()).uri(&uri);
     {
         let headers = up.headers_mut().expect("builder headers");
@@ -876,6 +1035,24 @@ async fn handle_inner(
         // Forward the (resolved/generated) request id so the upstream logs the same correlation id.
         if let Ok(v) = HeaderValue::from_str(&rid) {
             headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), v);
+        }
+        // W3C trace context, outbound. Without this the app behind the proxy starts its own trace
+        // and the edge's span is an orphan — the request appears twice in the backend with nothing
+        // connecting them, which is the failure that makes proxy tracing worth less than none.
+        //
+        // The flags are `01` (sampled), because this is only reached when we are recording; that is
+        // what stops the app's own sampler dropping the other half of the trace.
+        if let Some(ctx) = parts
+            .extensions
+            .get::<crate::telemetry::TraceContext>()
+            .copied()
+        {
+            if let Ok(v) = HeaderValue::from_str(&crate::telemetry::traceparent_header(&ctx)) {
+                headers.insert(HeaderName::from_static("traceparent"), v);
+            }
+            // `tracestate` belongs to the caller's traceparent. Having replaced that, a forwarded
+            // tracestate refers to a span id no longer in the header and is worse than absent.
+            headers.remove("tracestate");
         }
         // L2 key vault: replace the client's `Authorization` (which carried the virtual key) with the
         // mapped provider key. The provider secret only ever travels edge→upstream — never back to
@@ -914,14 +1091,14 @@ async fn handle_inner(
     //    can't pin this task. `None` => no timeout (validation.upstream_timeout = "0").
     let deadline = rt.upstream_timeout.map(|d| tokio::time::Instant::now() + d);
     let timed_out = || {
-        warn!(upstream = %uri, "upstream timed out");
+        warn!(upstream = %log_uri, "upstream timed out");
         text(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout")
     };
 
     let upstream_resp = match within(deadline, state.client.request(upstream_req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            warn!(error = %e, upstream = %uri, "upstream unreachable");
+            warn!(error = %e, upstream = %log_uri, "upstream unreachable");
             return finish(
                 m,
                 &rid,
@@ -1421,6 +1598,9 @@ async fn proxy_upgrade(
     mut req: Request<Body>,
     request_id: &str,
     method: &Method,
+    // `raw_path` routes and is forwarded verbatim; `path` is the redacted form that reaches a log
+    // line. See the note where they are derived in `handle_inner`.
+    raw_path: &str,
     path: &str,
     ip: IpAddr,
     started: Instant,
@@ -1433,7 +1613,10 @@ async fn proxy_upgrade(
 
     // Build the upstream request: copy end-to-end headers AND the upgrade/connection headers
     // (the handshake needs them), add the forwarding headers, send an empty body.
-    let uri = format!("{}{}", rt.pick_upstream(path), path);
+    let upstream_base = rt.pick_upstream(raw_path);
+    let uri = format!("{upstream_base}{raw_path}");
+    // The redacted form, for the failure logs below. See the note in `handle_inner`.
+    let log_uri = format!("{upstream_base}{path}");
     let mut up = Request::builder().method(req.method().clone()).uri(&uri);
     {
         let headers = up.headers_mut().expect("builder headers");
@@ -1485,7 +1668,7 @@ async fn proxy_upgrade(
     // upstream can't pin this task (a `None` deadline means no timeout).
     let deadline = rt.upstream_timeout.map(|d| tokio::time::Instant::now() + d);
     let timed_out = || {
-        warn!(upstream = %uri, "upstream timed out (upgrade)");
+        warn!(upstream = %log_uri, "upstream timed out (upgrade)");
         finish(
             m,
             request_id,
@@ -1501,7 +1684,7 @@ async fn proxy_upgrade(
     let mut up_resp = match within(deadline, state.client.request(upstream_req)).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            warn!(error = %e, upstream = %uri, "upstream unreachable (upgrade)");
+            warn!(error = %e, upstream = %log_uri, "upstream unreachable (upgrade)");
             return finish(
                 m,
                 request_id,
@@ -2296,6 +2479,59 @@ fn text(status: StatusCode, msg: &str) -> Response<Body> {
     resp
 }
 
+/// What `finish()` decided about a request, carried back on the response.
+///
+/// Threading a span handle through `finish` would mean editing all 38 of its call sites, and the one
+/// that gets missed is always the interesting one. `finish` is the single convergence point every
+/// terminal path already goes through, so it stamps its verdict into the response extensions and
+/// `handle()` — which is the only place that has both the request and the finished response —
+/// builds the span. One producer, one consumer.
+#[derive(Clone, Debug)]
+struct FinishInfo {
+    outcome: String,
+    status: u16,
+    elapsed: Duration,
+    request_id: String,
+}
+
+/// RFC3339 UTC, to the second, without pulling in a date-time crate.
+///
+/// A collector needs to order records from many edges, and arrival order will not do it — batching
+/// means a record can arrive seconds after one from another box that happened later. Second
+/// resolution is enough for that: the access log already reports latency separately, and sub-second
+/// ordering within one edge is what `request_id` is for.
+fn rfc3339_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    rfc3339(secs)
+}
+
+/// The conversion itself, split out from [`rfc3339_now`] so it is testable against known
+/// timestamps. A hand-rolled date conversion that is only ever called with "now" is a conversion
+/// nobody has checked.
+fn rfc3339(secs: i64) -> String {
+    // Civil-time conversion from a Unix timestamp (days since epoch -> y/m/d), the standard
+    // algorithm. Cheaper than a dependency for one format, and it has no local-timezone concept to
+    // get wrong: this is UTC by construction.
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, mi, sec) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z")
+}
+
 /// Emit a structured access-log line, record metrics, stamp the response with `X-Request-Id`,
 /// and return it.
 // All args are part of the access-log/identity tuple for one request; bundling them in a struct
@@ -2329,6 +2565,33 @@ fn finish(
     );
     metrics.record_request(outcome);
     metrics.observe_latency(elapsed);
+    // For `handle()` to build the server span. `outcome` is a &'static str from a fixed set, so this
+    // clone is one String (the request id) per request and nothing else.
+    let status = resp.status().as_u16();
+    resp.extensions_mut().insert(FinishInfo {
+        outcome: outcome.to_string(),
+        status,
+        elapsed,
+        request_id: request_id.to_string(),
+    });
+    // Ship the same line off-box, when `[log.ship]` is configured. `record` is a single non-blocking
+    // `try_send` onto a bounded queue — it never awaits and never touches the network, so a slow or
+    // absent collector costs dropped telemetry rather than request latency. `path` is already
+    // sanitised by `accesslog::sanitize_target` at the call sites, so credentials in the query
+    // string do not travel to the collector either.
+    if let Some(shipper) = metrics.log_shipper() {
+        shipper.record(crate::logship::AccessRecord {
+            ts: rfc3339_now(),
+            request_id: request_id.to_string(),
+            method: method.to_string(),
+            target: path.to_string(),
+            client_ip: ip.to_string(),
+            status: resp.status().as_u16(),
+            outcome: outcome.to_string(),
+            latency_ms: elapsed.as_millis() as u64,
+            edge_id: shipper.edge_id().to_string(),
+        });
+    }
     // Managed mode: count every finished request (proxied or rejected) toward the usage delta, and
     // — when the edge denied it — the drainable `blocked` figure. Cheap (relaxed atomic adds) and
     // inert unless a control plane drains it for reporting.
@@ -2344,6 +2607,42 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(name, HeaderValue::from_str(value).unwrap());
         h
+    }
+
+    #[test]
+    fn rfc3339_matches_known_timestamps() {
+        // A hand-rolled civil-time conversion is exactly the kind of code that is subtly wrong for
+        // years because it is only ever called with "now" and nobody checks the answer.
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1), "1970-01-01T00:00:01Z");
+        // A leap day, and the year-2000 leap (divisible by 400, so it IS a leap year — the case
+        // the naive every-four-years rule gets right and the every-century rule gets wrong).
+        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+        // 2100 is NOT a leap year (divisible by 100, not by 400).
+        assert_eq!(rfc3339(4_107_542_400), "2100-03-01T00:00:00Z");
+        assert_eq!(rfc3339(1_234_567_890), "2009-02-13T23:31:30Z");
+        // End of a day, and the first second of the next.
+        assert_eq!(rfc3339(1_767_225_599), "2025-12-31T23:59:59Z");
+        assert_eq!(rfc3339(1_767_225_600), "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn rfc3339_is_always_a_fixed_width_sortable_string() {
+        // A collector orders records lexically. Any field that is not zero-padded sorts wrongly the
+        // moment it crosses a digit boundary, which would show up as records interleaving on the
+        // 10th of a month and not before.
+        for t in [
+            0i64,
+            1,
+            951_782_400,
+            1_234_567_890,
+            1_767_225_600,
+            4_107_542_400,
+        ] {
+            let s = rfc3339(t);
+            assert_eq!(s.len(), 20, "{s}");
+            assert!(s.ends_with('Z'), "{s}");
+        }
     }
 
     #[test]

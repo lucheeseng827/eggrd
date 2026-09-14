@@ -47,6 +47,29 @@ pub struct UsageDelta {
     pub waf_custom: u64,
 }
 
+/// The body of a usage report: the metered delta plus this edge's heartbeat.
+///
+/// One flat object, because the control plane parses the delta and the heartbeat from the SAME
+/// body. That is deliberate on both sides — the heartbeat rides on a request the edge already
+/// makes on a timer, so the fleet registry costs no extra endpoint, no extra interval and no extra
+/// round trip.
+///
+/// Every heartbeat field is `#[serde(default)]` on the control plane, so an older control plane
+/// ignores them and an older edge that sends none of them is simply absent from the fleet view.
+#[derive(Debug, Serialize)]
+struct UsageReport<'a> {
+    #[serde(flatten)]
+    delta: &'a UsageDelta,
+    edge_id: &'a str,
+    agent_version: &'a str,
+    /// The ETag of the policy this edge currently has loaded, or `None` when it is running on local
+    /// configuration. The control plane compares it against what it serves to detect drift, so
+    /// "running local config" and "running a stale pull" must stay distinguishable — hence
+    /// `Option`, not an empty string.
+    policy_etag: Option<String>,
+    uptime_secs: u64,
+}
+
 /// The subset of the control plane's `PolicyDocument` the edge needs.
 #[derive(Debug, Deserialize)]
 struct PolicyResp {
@@ -60,6 +83,40 @@ struct QuotaResp {
     over_quota: bool,
     #[serde(default)]
     reset_epoch: i64,
+}
+
+/// The control plane's answer to a lease request, flattened for the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseVerdict {
+    /// The fleet has budget; the shared buckets are already debited. Report the outcome against
+    /// `lease_id` when the order finishes.
+    Granted { lease_id: String },
+    /// A shared CA bucket is spent. Nothing was debited and the order must not be sent.
+    Deferred {
+        bucket: String,
+        key: String,
+        retry_at_unix: i64,
+    },
+    /// The control plane keeps no books for this CA (or is too old to know about leases). The local
+    /// per-edge budget is the only guard, which is where things stood before leases existed.
+    Unmanaged,
+}
+
+/// The control plane's `POST /v3/edge/{id}/acme-lease` response.
+///
+/// Every field past `decision` is optional because the three decisions carry different payloads,
+/// and an edge must not fail to parse a shape a newer control plane grew a field on.
+#[derive(Debug, Deserialize)]
+struct LeaseResp {
+    decision: String,
+    #[serde(default)]
+    lease_id: Option<String>,
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    retry_at_unix: Option<i64>,
 }
 
 /// Shared, hot-reload-surviving quota verdict the proxy enforces. The [`quota_loop`] writes it from
@@ -104,6 +161,41 @@ pub struct CpClient {
     /// `{base}/v3/edge/{tenant}` prefix, already trimmed.
     edge_base: String,
     token: String,
+    /// Stable identifier for this edge process, reported on every usage POST.
+    edge_id: String,
+    /// When this process started, for the reported uptime. Uptime is what distinguishes "quiet
+    /// because idle" from "quiet because it keeps restarting" — a distinction `last_seen` alone
+    /// cannot make, because a crash-looping edge reports just as recently as a healthy one.
+    started_at: std::time::Instant,
+    /// The ETag of the policy currently applied. Written by [`poll_loop`] when it applies a new
+    /// policy, read by [`report_loop`] when it reports — the two run as independent tasks on
+    /// different intervals, so this is the seam between them.
+    policy_etag: arc_swap::ArcSwapOption<String>,
+}
+
+/// This edge's identity in the fleet view.
+///
+/// The hostname, because it is the name an operator already uses for the box and is stable across
+/// restarts for a VM or a StatefulSet pod. For a rolling Deployment each replacement is a new name
+/// and therefore a new row, with the old one ageing out — which is the honest answer: a rolled
+/// Deployment genuinely is a different set of processes.
+///
+/// Falls back to the pid rather than to a random value: a random id would make every restart a
+/// permanently distinct edge, and the fleet view would fill with ghosts.
+fn default_edge_id() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        let h = h.trim();
+        if !h.is_empty() {
+            return h.to_string();
+        }
+    }
+    if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
+        let h = h.trim();
+        if !h.is_empty() {
+            return h.to_string();
+        }
+    }
+    format!("edge-{}", std::process::id())
 }
 
 impl CpClient {
@@ -134,10 +226,19 @@ impl CpClient {
             cfg.url.trim_end_matches('/'),
             cfg.tenant_id
         );
+        let edge_id = if cfg.edge_id.trim().is_empty() {
+            default_edge_id()
+        } else {
+            cfg.edge_id.trim().to_string()
+        };
+        info!(edge_id, "control-plane managed mode enabled");
         Ok(Some(Arc::new(CpClient {
             http,
             edge_base,
             token: cfg.edge_token.clone(),
+            edge_id,
+            started_at: std::time::Instant::now(),
+            policy_etag: arc_swap::ArcSwapOption::empty(),
         })))
     }
 
@@ -164,12 +265,24 @@ impl CpClient {
         }
     }
 
-    /// Report a usage delta.
+    /// Record the ETag of the policy now applied, so the next usage report carries it.
+    pub fn set_policy_etag(&self, etag: &str) {
+        self.policy_etag.store(Some(Arc::new(etag.to_string())));
+    }
+
+    /// Report a usage delta, with this edge's heartbeat on the same body.
     pub async fn report_usage(&self, delta: &UsageDelta) -> Result<()> {
+        let report = UsageReport {
+            delta,
+            edge_id: &self.edge_id,
+            agent_version: env!("CARGO_PKG_VERSION"),
+            policy_etag: self.policy_etag.load().as_ref().map(|e| (**e).clone()),
+            uptime_secs: self.started_at.elapsed().as_secs(),
+        };
         self.http
             .post(format!("{}/usage", self.edge_base))
             .bearer_auth(&self.token)
-            .json(delta)
+            .json(&report)
             .send()
             .await
             .context("reporting usage")?
@@ -192,6 +305,79 @@ impl CpClient {
             .context("control plane rejected quota poll")?;
         let q: QuotaResp = resp.json().await.context("parsing quota verdict")?;
         Ok((q.over_quota, q.reset_epoch))
+    }
+
+    /// Ask the control plane for permission to order a certificate for `domains`.
+    ///
+    /// This is the fleet-wide half of the ACME budget. The local ledger in
+    /// [`crate::acme_budget`] can only account limits that are per-edge; the CA's
+    /// per-registered-domain limit is shared across every edge under that domain, and only
+    /// something all of them talk to can count it. That is the control plane.
+    ///
+    /// **The edge sends raw identifiers and nothing else.** It does not compute or send a bucket
+    /// key: the control plane derives those, so that an edge cannot — by accident or otherwise —
+    /// key itself into a private bucket and opt out of the shared limit.
+    ///
+    /// Any error here means the caller falls back to the local budget; see [`LeaseVerdict`].
+    pub async fn acme_lease(
+        &self,
+        directory_url: &str,
+        domains: &[String],
+    ) -> Result<LeaseVerdict> {
+        let resp = self
+            .http
+            .post(format!("{}/acme-lease", self.edge_base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "directory_url": directory_url,
+                "domains": domains,
+                "edge_id": self.edge_id,
+            }))
+            .send()
+            .await
+            .context("requesting an ACME issuance lease")?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // A control plane older than this feature. Not an error worth logging on every renewal
+            // — it simply does not keep fleet books, which is the state everything was in before.
+            return Ok(LeaseVerdict::Unmanaged);
+        }
+        let resp = resp
+            .error_for_status()
+            .context("control plane rejected the lease request")?;
+        let body: LeaseResp = resp.json().await.context("parsing the lease decision")?;
+        Ok(match body.decision.as_str() {
+            "granted" => LeaseVerdict::Granted {
+                lease_id: body.lease_id.unwrap_or_default(),
+            },
+            "deferred" => LeaseVerdict::Deferred {
+                bucket: body.bucket.unwrap_or_else(|| "unknown".into()),
+                key: body.key.unwrap_or_default(),
+                retry_at_unix: body.retry_at_unix.unwrap_or(0),
+            },
+            // Including a decision word a newer control plane invented: an edge must not stop
+            // issuing certificates because it did not recognise a string.
+            _ => LeaseVerdict::Unmanaged,
+        })
+    }
+
+    /// Tell the control plane how a leased order ended. Best-effort: the lease is already debited
+    /// and is never refunded, so a lost report costs observability, not correctness. An unreported
+    /// lease is closed as consumed by the control plane once it expires.
+    pub async fn acme_lease_outcome(&self, lease_id: &str, outcome: &str) {
+        if lease_id.is_empty() {
+            return;
+        }
+        let res = self
+            .http
+            .post(format!("{}/acme-lease/{lease_id}/outcome", self.edge_base))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "outcome": outcome }))
+            .send()
+            .await;
+        if let Err(e) = res {
+            warn!(error = %e, lease_id, "reporting the ACME lease outcome failed");
+        }
     }
 
     /// Forward a raw CSP report body (best-effort; errors are logged, never surfaced).
@@ -235,6 +421,12 @@ pub async fn poll_loop(
             Ok(PullResult::Policy { body, etag: new }) => {
                 match apply_policy(&base, &body, &runtime) {
                     Ok(()) => {
+                        // Publish to the report loop BEFORE updating our own cursor, so the next
+                        // usage report cannot claim an ETag this edge failed to apply. On the error
+                        // branch below neither is touched — an edge that rejected a policy must
+                        // keep reporting the one it is actually serving, or the drift figure would
+                        // say the fleet is current when it is not.
+                        client.set_policy_etag(&new);
                         etag = Some(new);
                         info!("applied policy from control plane");
                     }
@@ -364,6 +556,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct Stub {
         last_usage: Arc<StdMutex<Option<serde_json::Value>>>,
+        /// The body of the last lease request, so a test can prove the edge asked at all — and
+        /// that it sent raw identifiers rather than a key it computed itself.
+        last_lease: Arc<StdMutex<Option<serde_json::Value>>>,
     }
 
     async fn policy(headers: HeaderMap) -> axum::response::Response {
@@ -390,6 +585,22 @@ mod tests {
         StatusCode::ACCEPTED
     }
 
+    /// Always defers, so a test can tell "the edge asked" from "the edge ordered anyway".
+    async fn acme_lease(
+        State(s): State<Stub>,
+        body: axum::body::Bytes,
+    ) -> axum::response::Response {
+        *s.last_lease.lock().unwrap() = serde_json::from_slice(&body).ok();
+        Json(serde_json::json!({
+            "decision": "deferred",
+            "ca": "letsencrypt",
+            "bucket": "registered_domain",
+            "key": "example.com",
+            "retry_at_unix": 1_800_000_000_i64
+        }))
+        .into_response()
+    }
+
     async fn quota() -> axum::response::Response {
         // A trimmed QuotaStatus: the edge only reads over_quota + reset_epoch.
         Json(serde_json::json!({
@@ -404,6 +615,7 @@ mod tests {
             .route("/v3/edge/t1/policy", get(policy))
             .route("/v3/edge/t1/usage", post(usage))
             .route("/v3/edge/t1/quota", get(quota))
+            .route("/v3/edge/t1/acme-lease", post(acme_lease))
             .with_state(stub.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -423,6 +635,68 @@ mod tests {
         })
         .unwrap()
         .unwrap()
+    }
+
+    /// **A per-edge flag must not buy an exemption from a fleet-wide limit.**
+    ///
+    /// `tls.acme.budget_enabled` switches off this edge's own ledger. It must NOT also skip the
+    /// control plane's lease: the CA's per-registered-domain allowance is shared with every other
+    /// edge under that domain, so one box turning the flag off could otherwise spend the whole
+    /// fleet's week. Reported by CodeRabbit on PR #1014.
+    #[tokio::test]
+    async fn budget_enabled_false_still_takes_the_fleet_lease() {
+        use crate::acme::{DeferSource, Issuance};
+        use crate::config::{AcmeCfg, TlsCfg};
+
+        let (addr, stub) = spawn_stub().await;
+        let acme = AcmeCfg {
+            enabled: true,
+            accept_tos: true,
+            domains: vec!["www.example.com".into()],
+            budget_enabled: false, // the local ledger is OFF
+            cache_dir: std::env::temp_dir()
+                .join(format!("eg-lease-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned(),
+            ..AcmeCfg::default()
+        };
+        let tls = TlsCfg {
+            enabled: true,
+            cert_path: "/nonexistent/cert.pem".into(),
+            key_path: "/nonexistent/key.pem".into(),
+            acme: acme.clone(),
+            ..TlsCfg::default()
+        };
+
+        let issuance = crate::acme::obtain_certificate(&acme, &tls, Some(&client(addr)))
+            .await
+            .expect("a deferral is not an error");
+
+        match issuance {
+            Issuance::Deferred { source, bucket, .. } => {
+                assert_eq!(
+                    source,
+                    DeferSource::Fleet,
+                    "the deferral must come from the fleet, not the local ledger"
+                );
+                assert_eq!(bucket, "registered_domain");
+            }
+            other => panic!("budget_enabled=false bypassed the fleet lease: {other:?}"),
+        }
+
+        // And it asked with raw identifiers — never a bucket key of its own devising, which would
+        // let an edge key itself out of the shared bucket.
+        let asked = stub
+            .last_lease
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("no lease request was sent");
+        assert_eq!(asked["domains"][0], "www.example.com");
+        assert!(
+            asked.get("group_key").is_none() && asked.get("set_key").is_none(),
+            "the edge must not send a computed bucket key: {asked}"
+        );
     }
 
     #[test]
@@ -458,6 +732,58 @@ mod tests {
             c.pull_policy(Some(ETAG)).await.unwrap(),
             PullResult::NotModified
         ));
+    }
+
+    #[test]
+    fn the_report_body_carries_the_delta_and_the_heartbeat_in_one_flat_object() {
+        // The control plane parses UsageDelta and EdgeHeartbeat from the SAME body, so the two must
+        // serialize flat and side by side. A nested heartbeat would deserialize as an absent one on
+        // the control plane and the edge would silently never appear in the fleet view.
+        let delta = UsageDelta {
+            requests: 7,
+            egress_bytes: 11,
+            ..Default::default()
+        };
+        let report = UsageReport {
+            delta: &delta,
+            edge_id: "edge-a",
+            agent_version: "9.9.9",
+            policy_etag: Some("\"v2\"".into()),
+            uptime_secs: 42,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(v["requests"], 7, "the delta must be flattened, not nested");
+        assert_eq!(v["egress_bytes"], 11);
+        assert_eq!(v["edge_id"], "edge-a");
+        assert_eq!(v["agent_version"], "9.9.9");
+        assert_eq!(v["policy_etag"], "\"v2\"");
+        assert_eq!(v["uptime_secs"], 42);
+    }
+
+    #[test]
+    fn an_edge_that_has_applied_no_policy_reports_a_null_etag() {
+        // Null and "" are not interchangeable here: the control plane treats a reported ETag as
+        // "pulled, possibly behind" and its absence as "running local config". Sending an empty
+        // string would make every locally-configured edge look drifted.
+        let delta = UsageDelta::default();
+        let report = UsageReport {
+            delta: &delta,
+            edge_id: "edge-a",
+            agent_version: "9.9.9",
+            policy_etag: None,
+            uptime_secs: 1,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert!(v["policy_etag"].is_null());
+    }
+
+    #[test]
+    fn an_auto_detected_edge_id_is_never_empty() {
+        // An empty id makes the heartbeat unreportable on the control-plane side, so the edge would
+        // vanish from the fleet view with nothing anywhere saying why.
+        assert!(!default_edge_id().trim().is_empty());
     }
 
     #[tokio::test]

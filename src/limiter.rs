@@ -75,6 +75,49 @@ pub struct Gcra {
 }
 
 impl Gcra {
+    /// Build directly from a count, a period and a burst.
+    ///
+    /// `from_rate` parses a `"N/unit"` string whose grammar stops at `hour`, which cannot express
+    /// the CA issuance limits in [`crate::acme_budget`] — those are per 3 hours and per 7 days. This
+    /// is the same arithmetic without the string, so all GCRA maths stays in this one file rather
+    /// than being reimplemented next to the thing that needs a longer window.
+    pub fn from_parts(count: u64, period: std::time::Duration, burst: u64) -> Result<Gcra> {
+        anyhow::ensure!(count > 0, "rate count must be > 0");
+        anyhow::ensure!(burst > 0, "burst must be > 0");
+        let period_us = period.as_micros() as u64;
+        let emission_interval = period_us / count;
+        anyhow::ensure!(emission_interval > 0, "rate is too high to represent");
+        Ok(Gcra {
+            emission_interval,
+            tolerance: emission_interval.saturating_mul(burst),
+        })
+    }
+
+    /// The earliest time (µs) at which this bucket would admit, given its stored TAT.
+    ///
+    /// GCRA admits when `now >= tat + emission_interval - tolerance`. Deriving that at the call site
+    /// is easy to get wrong by exactly one emission interval — which yields a retry instant in the
+    /// past and turns a deferral into a hot loop against the CA. It lives here, next to
+    /// `gcra_admit`, so the two cannot disagree.
+    pub fn next_admit_at(&self, stored_tat: Option<u64>, now: u64) -> u64 {
+        let tat = stored_tat.unwrap_or(now).max(now);
+        tat.saturating_add(self.emission_interval)
+            .saturating_sub(self.tolerance)
+    }
+
+    /// How many more admissions the bucket currently allows, for reporting.
+    ///
+    /// Derived rather than stored: `tolerance / emission_interval` is the burst, and the distance
+    /// between now and the stored TAT says how much of it has been spent. Used for the
+    /// `remaining`/`consumed_ratio` metrics, so an operator sees the budget draining before it is
+    /// gone rather than after.
+    pub fn remaining(&self, stored_tat: Option<u64>, now: u64) -> u64 {
+        let burst = self.tolerance / self.emission_interval.max(1);
+        let tat = stored_tat.unwrap_or(now).max(now);
+        let spent = (tat - now) / self.emission_interval.max(1);
+        burst.saturating_sub(spent)
+    }
+
     /// Derive GCRA timings from a `rate`/`burst` policy, rejecting the same degenerate input as
     /// the local limiter (zero rate/burst, or a rate so high the interval underflows to 0µs).
     pub fn from_rate(rate: &str, burst: u32) -> Result<Gcra> {
@@ -100,7 +143,7 @@ impl Gcra {
 /// persist when the request is admitted, or `None` when it must be rejected (the stored TAT is
 /// deliberately *not* advanced on rejection, so a flood of blocked requests doesn't extend the
 /// penalty window). Shared by every [`Store`] so all backends agree bit-for-bit.
-fn gcra_admit(stored_tat: Option<u64>, now: u64, g: &Gcra) -> Option<u64> {
+pub(crate) fn gcra_admit(stored_tat: Option<u64>, now: u64, g: &Gcra) -> Option<u64> {
     // A TAT in the past means the bucket has drained; clamp it forward to now.
     let tat = stored_tat.unwrap_or(now).max(now);
     let new_tat = tat + g.emission_interval;

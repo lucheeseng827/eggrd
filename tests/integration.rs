@@ -49,6 +49,26 @@ async fn spawn_upstream() -> SocketAddr {
     addr
 }
 
+/// An upstream that echoes back the request target it received, so a test can assert what the
+/// proxy actually forwarded rather than what it logged.
+async fn spawn_echo_target_upstream() -> SocketAddr {
+    async fn handler(req: Request<Body>) -> Response<Body> {
+        Response::new(Body::from(
+            req.uri()
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default(),
+        ))
+    }
+    let app = Router::new().fallback(any(handler));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
 /// Spawn EdgeGuard with `cfg`; return its bound address.
 async fn spawn_proxy(cfg: Config) -> SocketAddr {
     let state = build_state(Arc::new(cfg)).unwrap();
@@ -2948,4 +2968,106 @@ async fn limiter_store_outage_fails_closed_and_never_reaches_the_upstream() {
         "an unreachable limiter store must fail closed"
     );
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// Access-log redaction must be **log-only**: the upstream still receives the exact target the
+/// client sent, query string and all.
+///
+/// This is the regression that would matter most — redacting the forwarded URI would silently strip
+/// query parameters from every proxied request, and would do it in a way that looks like an
+/// application bug rather than a proxy one.
+#[tokio::test]
+async fn redacted_logging_does_not_change_what_is_forwarded() {
+    let upstream = spawn_echo_target_upstream().await;
+    let cfg = base_cfg(format!("http://{upstream}"));
+    // The default log mode is `redact`; the test asserts forwarding is unaffected by it.
+    assert_eq!(cfg.log.query, edgeguard::accesslog::QueryLogMode::Redact);
+    let proxy = spawn_proxy(cfg).await;
+
+    let target = "/items?api_key=supersecret123&page=2&token=eyJhbGciOiJIUzI1NiJ9.e30.sig";
+    let resp = send(
+        proxy,
+        "GET",
+        target,
+        Some(&basic("admin", "secret")),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(
+        resp.body, target,
+        "the upstream must receive the client's target verbatim"
+    );
+}
+
+/// Route-scoped features key off the **real** path, not the redacted one — a WAF or a per-route
+/// limiter that saw `<redacted>` instead of the request would be blind exactly where it matters.
+#[tokio::test]
+async fn the_waf_still_inspects_the_real_query_string() {
+    let upstream = spawn_upstream().await;
+    let mut cfg = base_cfg(format!("http://{upstream}"));
+    cfg.waf = WafCfg {
+        mode: "block".into(),
+        sqli: true,
+        inspect_path: true,
+        ..Default::default()
+    };
+    let proxy = spawn_proxy(cfg).await;
+
+    // An SQLi payload in a parameter whose *name* is on the redaction list. If the WAF were handed
+    // the logged form, this would sail through as `code=<redacted>`.
+    let resp = send(
+        proxy,
+        "GET",
+        "/search?code=1%20UNION%20SELECT%20password%20FROM%20users",
+        Some(&basic("admin", "secret")),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(
+        resp.status,
+        StatusCode::FORBIDDEN,
+        "the WAF must see the raw query, not the redacted one"
+    );
+}
+
+/// The upstream-failure logs must not print what the access log just redacted.
+///
+/// Redacting the request line and then writing `?api_key=…` into a `warn!` when the upstream times
+/// out leaks the same credential on the path an operator is most likely to be reading. The forwarded
+/// URI still has to be verbatim, so the two forms are built separately — this proves forwarding is
+/// unaffected and that an unreachable upstream still fails the way it did.
+#[tokio::test]
+async fn an_unreachable_upstream_still_fails_cleanly_with_a_credential_in_the_query() {
+    // Port 1 with nothing on it: the connection fails, taking the `upstream unreachable` branch.
+    let cfg = base_cfg("http://127.0.0.1:1".to_string());
+    let proxy = spawn_proxy(cfg).await;
+    let resp = send(
+        proxy,
+        "GET",
+        "/items?api_key=supersecret123",
+        Some(&basic("admin", "secret")),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::BAD_GATEWAY);
+}
+
+/// Forwarding is unchanged by splitting the logged URI from the forwarded one.
+#[tokio::test]
+async fn the_forwarded_uri_is_still_verbatim_after_the_log_split() {
+    let upstream = spawn_echo_target_upstream().await;
+    let cfg = base_cfg(format!("http://{upstream}"));
+    let proxy = spawn_proxy(cfg).await;
+    let target = "/items?api_key=supersecret123&page=2";
+    let resp = send(
+        proxy,
+        "GET",
+        target,
+        Some(&basic("admin", "secret")),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.body, target);
 }

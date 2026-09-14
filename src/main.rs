@@ -24,9 +24,11 @@ use tracing_subscriber::EnvFilter;
 
 use edgeguard::config::{parse_duration, Config};
 use edgeguard::generate::{generate, Target};
+use edgeguard::logship;
+use edgeguard::telemetry;
 use edgeguard::{
     acme, build_admin_router, build_public_router, build_router, build_runtime, build_state, cp,
-    doctor, hash_password, reload, scaffold, supervisor, tls,
+    doctor, hash_password, reload, scaffold, selfsigned, supervisor, tls,
 };
 
 /// The selected mode of operation. `serve` is the default; `hash` and `generate` are standalone
@@ -48,6 +50,16 @@ enum Cmd {
     Doctor { config: Option<String> },
     /// `edgeguard init`: scaffold a starter `edgeguard.toml` (+ a wrap-your-app Dockerfile).
     Init { force: bool },
+    /// `edgeguard cert`: write a self-signed certificate + key. Standalone utility — it makes
+    /// files and exits, so a certificate can be produced before (or without) running the proxy,
+    /// e.g. in a Dockerfile build stage or a compose init step.
+    Cert {
+        hosts: Vec<String>,
+        days: u32,
+        cert_out: String,
+        key_out: String,
+        force: bool,
+    },
 }
 
 fn parse_args() -> Result<Cmd> {
@@ -110,6 +122,60 @@ fn parse_args() -> Result<Cmd> {
             }
         }
         return Ok(Cmd::Doctor { config });
+    }
+
+    // `cert`: emit a self-signed certificate/key pair. Flag-only after the subcommand word.
+    if argv.first().map(String::as_str) == Some("cert") {
+        let mut hosts: Vec<String> = Vec::new();
+        let mut days = 90u32;
+        let mut cert_out = "./tls/cert.pem".to_string();
+        let mut key_out = "./tls/key.pem".to_string();
+        let mut force = false;
+        let mut it = argv.iter().skip(1);
+        while let Some(arg) = it.next() {
+            match arg.as_str() {
+                // Repeatable, and comma-separated, so both `--host a --host b` and
+                // `--host a,b` do the obvious thing.
+                "--host" => hosts.extend(
+                    require_value(&mut it, "--host")?
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                ),
+                "--days" => {
+                    let v = require_value(&mut it, "--days")?;
+                    days = v
+                        .parse()
+                        .with_context(|| format!("--days expects a number of days, got {v:?}"))?;
+                }
+                "--cert-out" => cert_out = require_value(&mut it, "--cert-out")?,
+                "--key-out" => key_out = require_value(&mut it, "--key-out")?,
+                "--force" | "-f" => force = true,
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                "-V" | "--version" => {
+                    print_version();
+                    std::process::exit(0);
+                }
+                other => anyhow::bail!("unknown argument for `edgeguard cert`: {other}"),
+            }
+        }
+        if hosts.is_empty() {
+            hosts = selfsigned::DEFAULT_HOSTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
+        return Ok(Cmd::Cert {
+            hosts,
+            days,
+            cert_out,
+            key_out,
+            force,
+        });
     }
 
     // `init`: scaffold a starter config (+ Dockerfile). Refuses to clobber an existing
@@ -184,12 +250,14 @@ fn print_help() {
         "edgeguard [--wrap \"<start command>\"] [--config <path>]\n\
          edgeguard init [--force]               # scaffold edgeguard.toml + a wrap-your-app Dockerfile\n\
          edgeguard doctor [--config <path>]     # validate the config and warn on foot-guns\n\
+         edgeguard cert [--host <h>]... [--days <n>] [--cert-out <p>] [--key-out <p>] [--force]\n\
+         \x20                                    # write a self-signed certificate + key (dev/internal use)\n\
          edgeguard --hash                       # read a password on stdin, print an argon2 hash\n\
          edgeguard --version                    # print the version and exit\n\
          edgeguard generate [--target <t>] [--config <path>] [--out <path>]\n\
          \x20                                    # emit static-host / edge config from [headers]\n\
          \x20  targets: _headers (Netlify/CF Pages), vercel, vercel-middleware, netlify-edge\n\
-         env: PORT, APP_PORT, UPSTREAM, WRAP_CMD, EDGEGUARD_CONFIG,\n\
+         env: PORT, APP_PORT, ADMIN_PORT, REDIRECT_PORT, UPSTREAM, WRAP_CMD, EDGEGUARD_CONFIG,\n\
          \x20    EDGEGUARD_JWT_SECRET, EDGEGUARD_API_KEYS"
     );
 }
@@ -207,6 +275,34 @@ fn run_generate(config: Option<String>, target: &str, out: Option<String>) -> Re
         }
         None => print!("{content}"),
     }
+    Ok(())
+}
+
+/// Write a self-signed certificate + key (the `cert` subcommand). Like `--hash` and `generate`,
+/// a standalone utility: no logging setup, no listener, no config file needed.
+fn run_cert(hosts: &[String], days: u32, cert_out: &str, key_out: &str, force: bool) -> Result<()> {
+    // Overwriting a certificate is not recoverable — the previous key is gone, and anything that
+    // pinned or trusted it breaks — so refuse unless the operator said so, matching `init`.
+    if !force {
+        for path in [cert_out, key_out] {
+            anyhow::ensure!(
+                !selfsigned::path_present(path),
+                "{path} already exists (pass --force to overwrite it)"
+            );
+        }
+    }
+    selfsigned::write_to(hosts, days, cert_out, key_out)?;
+    eprintln!(
+        "wrote {cert_out} and {key_out} ({}, {days} days)",
+        hosts.join(", ")
+    );
+    eprintln!(
+        "This certificate is self-signed: it encrypts traffic but proves no identity, so \
+         browsers will warn and strict clients will refuse it. Trust it explicitly \
+         (curl --cacert {cert_out}) for local/internal use, or use [tls.acme] for a publicly \
+         trusted certificate."
+    );
+    eprintln!("Point [tls] at it:\n  [tls]\n  enabled   = true\n  cert_path = \"{cert_out}\"\n  key_path  = \"{key_out}\"");
     Ok(())
 }
 
@@ -330,6 +426,13 @@ async fn main() -> Result<()> {
         } => return run_generate(config, &target, out),
         Cmd::Doctor { config } => return run_doctor(config),
         Cmd::Init { force } => return run_init(force),
+        Cmd::Cert {
+            hosts,
+            days,
+            cert_out,
+            key_out,
+            force,
+        } => return run_cert(&hosts, days, &cert_out, &key_out, force),
         Cmd::Serve { wrap, config } => (wrap, config),
     };
 
@@ -364,8 +467,15 @@ async fn main() -> Result<()> {
     let runtime = state.runtime.clone();
     // Clones for the managed-mode background loops (grabbed before `state` is moved into the router).
     let cp_client = state.cp.clone();
+    // The ACME order below runs before the managed-mode loops take ownership of `cp_client`, and it
+    // needs the same client: in managed mode the CA's SHARED rate limits are held by the control
+    // plane, not by this box's local ledger. See `acme::check_budget`.
+    let acme_cp = state.cp.clone();
     let cp_runtime = state.runtime.clone();
     let cp_metrics = state.metrics.clone();
+    // Also grabbed here, before `state` moves into the router below: the access-log shipper is
+    // installed on the same registry the response path already holds.
+    let log_metrics = state.metrics.clone();
     let cp_quota = state.quota.clone();
 
     // Hard quota needs the managed-mode client to poll verdicts; without it the gate would stay
@@ -411,6 +521,46 @@ async fn main() -> Result<()> {
                 warn!(error = format!("{e:#}"), "config watcher stopped");
             }
         });
+    }
+
+    // Access-log shipping: stream the structured request log to a collector.
+    //
+    // Started independently of managed mode on purpose. Centralized logs are useful to an operator
+    // running one edge with no control plane at all, and coupling the two would mean a self-hosted
+    // user could not have logs without also enrolling in a hosted control plane.
+    if cfg.log.ship.enabled {
+        // The same identity the fleet registry uses, so a log line and a fleet row can be joined by
+        // `edge_id`. Two different identifiers for one process would make that join impossible
+        // exactly when someone is trying to correlate a bad edge's logs with its version.
+        let edge_id = if cfg.control_plane.edge_id.trim().is_empty() {
+            std::env::var("HOSTNAME")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| format!("edge-{}", std::process::id()))
+        } else {
+            cfg.control_plane.edge_id.trim().to_string()
+        };
+        match logship::spawn(&cfg.log.ship, edge_id, shutdown_rx.clone()) {
+            Some(shipper) => {
+                log_metrics.set_log_shipper(shipper);
+            }
+            None => warn!("[log.ship] is enabled but produced no shipper; check log.ship.url"),
+        }
+    }
+
+    // Request tracing: one OTLP SERVER span per proxied request, batched off-box.
+    //
+    // Independent of managed mode and of `[llm.telemetry]`, deliberately. A plain reverse-proxy
+    // install — the majority — emitted no traces at all, because the only span this proxy produced
+    // was the LLM client span.
+    if cfg.tracing.enabled {
+        match telemetry::spawn_span_shipper(&cfg.tracing, shutdown_rx.clone()) {
+            Some(shipper) => {
+                log_metrics.set_span_shipper(shipper);
+            }
+            None => warn!("[tracing] is enabled but produced no shipper; check tracing.endpoint"),
+        }
     }
 
     // Managed mode: poll the control plane for policy (hot-reloading it) and report usage deltas.
@@ -459,19 +609,118 @@ async fn main() -> Result<()> {
 
     if cfg.tls.enabled {
         tls::init_crypto();
+        // Fail on a bad `redirect_status` here, before anything binds. The check also lives in
+        // `serve_redirect`, but that runs inside a spawned task whose error only warns — the
+        // listener would then be closed with the proxy still serving HTTPS, so a bare hostname
+        // got "connection refused" from a config mistake that should not have started at all.
+        if cfg.tls.redirect_port != 0 {
+            tls::parse_redirect_status(cfg.tls.redirect_status)?;
+        }
+        // ACME runs FIRST. It must: both paths write to the same cert_path, and the ACME branch
+        // below skips issuance when a certificate is already there — so generating a self-signed
+        // one first would make it silently win over the publicly trusted certificate the
+        // operator actually asked for, on the public domain where that matters most. Ordering it
+        // this way keeps `self_signed` the floor it is documented to be ("never fail to start
+        // for want of a certificate"): after a successful order `ensure` finds the file and does
+        // nothing, and a failed order propagates below rather than falling back to an untrusted
+        // certificate on a public name.
         if cfg.tls.acme.enabled {
             // Only order a certificate when one isn't already on disk; re-ordering on every
             // boot would burn ACME issuance rate limits. (Renewal before expiry is future
             // work — see docs/ROADMAP.md.)
-            if std::path::Path::new(&cfg.tls.cert_path).exists() {
+            // BOTH files, not just the certificate. A cert without its key is not a usable
+            // pair: skipping issuance there used to hand the half-pair to `selfsigned::ensure`
+            // below, which regenerates both — quietly serving a self-signed certificate on the
+            // domain ACME was configured for. Missing either file means order one.
+            if selfsigned::path_present(&cfg.tls.cert_path)
+                && selfsigned::path_present(&cfg.tls.key_path)
+            {
                 info!(cert = %cfg.tls.cert_path, "ACME: using existing certificate (skipping issuance)");
             } else {
-                acme::obtain_certificate(&cfg.tls.acme, &cfg.tls)
+                match acme::obtain_certificate(&cfg.tls.acme, &cfg.tls, acme_cp.as_deref())
                     .await
-                    .context("ACME certificate provisioning")?;
+                    .context("ACME certificate provisioning")?
+                {
+                    acme::Issuance::Issued => {}
+                    // The budget refused, so no order was sent and no certificate arrived. Falling
+                    // through to `selfsigned::ensure` below would put an untrusted certificate on
+                    // the public domain ACME was configured for — the exact substitution the
+                    // ordering above exists to prevent, and every browser reaching this edge would
+                    // see an interstitial.
+                    //
+                    // There is nothing on disk (the branch above already established that), so
+                    // there is also nothing to keep serving. Refusing to start is the honest
+                    // outcome: it is loud, it names the bucket and the retry instant, and it leaves
+                    // the previous replica serving in any rollout that has one.
+                    acme::Issuance::Deferred {
+                        bucket,
+                        key,
+                        retry_at_unix,
+                        source,
+                    } => {
+                        // `source` decides what the operator should do, so it leads the message. A
+                        // FLEET refusal means another edge under the same key spent the allowance
+                        // and nothing about this box will change that; a LOCAL one usually means
+                        // this box's certificate cache is not durable, which is fixable here.
+                        anyhow::bail!(
+                            "ACME issuance is rate-limited by the {} budget ({} limit{}) and no \
+                             certificate is on disk; it next admits at unix {}. Refusing to start \
+                             rather than serving a self-signed certificate on {:?}. {}",
+                            source.label(),
+                            bucket,
+                            if key.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" for {key:?}")
+                            },
+                            retry_at_unix,
+                            cfg.tls.acme.domains,
+                            match source {
+                                acme::DeferSource::Fleet =>
+                                    "Another edge under the same key has spent the fleet's \
+                                     allowance; check GET /v3/acme/budget on the control plane.",
+                                acme::DeferSource::Local =>
+                                    "Restore the certificate cache from a durable volume, or wait.",
+                            }
+                        );
+                    }
+                }
             }
         }
+        if cfg.tls.self_signed {
+            selfsigned::ensure(
+                &cfg.tls.self_signed_host_list(),
+                cfg.tls.self_signed_days,
+                &cfg.tls.cert_path,
+                &cfg.tls.key_path,
+            )
+            .context("generating a self-signed certificate")?;
+        }
         let server_config = tls::load_server_config(&cfg.tls.cert_path, &cfg.tls.key_path)?;
+
+        // HTTP→HTTPS redirect on a second, plaintext port. Bound after any ACME order above has
+        // finished and dropped its own `:80` listener, so the two never contend for the port.
+        if cfg.tls.redirect_port != 0 {
+            let redirect_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, cfg.tls.redirect_port));
+            let redirect_listener = TcpListener::bind(redirect_addr).await.with_context(|| {
+                format!(
+                    "binding HTTP→HTTPS redirect listener on {redirect_addr}                      (ports below 1024 need privilege or CAP_NET_BIND_SERVICE)"
+                )
+            })?;
+            let tls_port = cfg.server.port;
+            let status = cfg.tls.redirect_status;
+            let hosts = cfg.tls.redirect_hosts.clone();
+            let redirect_rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    tls::serve_redirect(redirect_listener, tls_port, status, hosts, redirect_rx)
+                        .await
+                {
+                    warn!(error = %e, "HTTP→HTTPS redirect listener stopped");
+                }
+            });
+        }
+
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding public TLS listener on {addr}"))?;
@@ -483,6 +732,7 @@ async fn main() -> Result<()> {
             store = %cfg.ratelimit.store,
             waf = %cfg.waf.mode,
             tls = true,
+            redirect_port = cfg.tls.redirect_port,
             "EdgeGuard listening (HTTPS)"
         );
         tls::serve(listener, server_config, app, shutdown_rx.clone())

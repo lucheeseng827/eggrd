@@ -88,3 +88,41 @@ groups:
         annotations:
           summary: "EdgeGuard: rate-limiter store errors"
           description: "The distributed limiter is returning 503 (store unreachable) for 5m+. Check Redis connectivity; with fail_open=false this is rejecting traffic."
+
+  # ACME issuance budget. The point of these is to fire while there is still time to act: a CA
+  # rate limit, once hit, is a week-long wait with no certificate — there is no fast remedy, so an
+  # alert at the moment of exhaustion is an alert about an outage that has already started.
+  - name: edgeguard-acme-budget
+    rules:
+      # A ratio, not an absolute. The buckets differ by an order of magnitude (5 per identifier set
+      # against 50 per registered domain), so one absolute threshold is either far too early on the
+      # large bucket or far too late on the small one.
+      - alert: EdgeGuardAcmeBudgetLow
+        expr: |
+          min by (ca, bucket, key) (edgeguard_acme_budget_remaining)
+            / on (ca, bucket) group_left() (
+              max by (ca, bucket) (edgeguard_acme_budget_remaining > 0)
+            ) < 0.4
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ACME issuance budget below 40% for {{ $labels.bucket }}"
+          description: >-
+            The certificate authority's rate limit for this bucket is being consumed. Nothing is
+            broken yet. The usual cause is an edge re-ordering on every start because its
+            certificate cache is not on a durable volume — check that before the budget runs out,
+            because once it does the wait is measured in days and there is no way to shorten it.
+
+      - alert: EdgeGuardAcmeBudgetExhausted
+        expr: min by (ca, bucket, key) (edgeguard_acme_budget_remaining) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ACME issuance budget exhausted for {{ $labels.bucket }}"
+          description: >-
+            No further certificates can be issued for this bucket until it refills. Edges keep
+            serving the certificates they already hold and no self-signed certificate is
+            substituted, so this is not yet a serving outage — it becomes one when an existing
+            certificate expires before the bucket refills. Check certificate expiry dates now.

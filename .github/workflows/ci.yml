@@ -9,6 +9,7 @@
 #   cargo clippy --all-targets -- -D warnings
 #   cargo test --all-targets
 #   cargo build --release
+#   bash scripts/check-crypto-provider.sh
 name: CI
 
 on:
@@ -39,5 +40,13 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all-targets
+      # ring must stay the ONLY linked crypto provider. A second one puts the aws-lc-sys C build
+      # back on the critical path and makes `rustls::ClientConfig::builder()` panic in any crate
+      # that resolves its provider from crate features (the `rediss://` limiter path). Neither
+      # shows up as a test failure, and this crate ships without a lock of its own, so the cut
+      # resolves fresh every time.
+      - name: Crypto provider (no aws-lc in the graph)
+        shell: bash
+        run: bash scripts/check-crypto-provider.sh
       - name: Build (release)
         run: cargo build --release

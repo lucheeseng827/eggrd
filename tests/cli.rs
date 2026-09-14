@@ -92,6 +92,7 @@ fn unknown_arguments_are_rejected_by_every_subcommand() {
         (vec!["generate", "--targt", "vercel"], "generate"),
         (vec!["doctor", "--confg", "x.toml"], "doctor"),
         (vec!["init", "--forse"], "init"),
+        (vec!["cert", "--hosts", "a"], "cert"),
     ] {
         let out = bin().args(&args).output().expect("failed to run edgeguard");
         assert!(
@@ -103,7 +104,7 @@ fn unknown_arguments_are_rejected_by_every_subcommand() {
 
 #[test]
 fn version_works_for_subcommands_too() {
-    for sub in ["generate", "doctor", "init"] {
+    for sub in ["generate", "doctor", "init", "cert"] {
         let out = bin()
             .args([sub, "--version"])
             .output()
@@ -114,4 +115,163 @@ fn version_works_for_subcommands_too() {
             format!("edgeguard {}", env!("CARGO_PKG_VERSION"))
         );
     }
+}
+
+/// A scratch directory unique to this test, removed on drop so a failure doesn't leak files.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> TempDir {
+        let dir = std::env::temp_dir().join(format!(
+            "eg-cli-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("creating the scratch directory");
+        TempDir(dir)
+    }
+    fn path(&self, name: &str) -> String {
+        self.0.join(name).to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn cert_writes_a_usable_pair_and_says_what_it_is_not() {
+    let dir = TempDir::new("cert");
+    let (cert, key) = (dir.path("cert.pem"), dir.path("key.pem"));
+
+    let out = bin()
+        .args([
+            "cert",
+            "--host",
+            "app.example.com,127.0.0.1",
+            "--days",
+            "30",
+            "--cert-out",
+            &cert,
+            "--key-out",
+            &key,
+        ])
+        .output()
+        .expect("failed to run edgeguard");
+    assert!(out.status.success(), "`edgeguard cert` failed: {out:?}");
+
+    let pem = std::fs::read_to_string(&cert).expect("certificate written");
+    assert!(
+        pem.starts_with("-----BEGIN CERTIFICATE-----"),
+        "not a PEM chain"
+    );
+    assert!(
+        std::fs::read_to_string(&key)
+            .expect("key written")
+            .contains("PRIVATE KEY"),
+        "not a PEM private key"
+    );
+
+    // The warning is the point: a user who does not know what self-signed means must not be left
+    // believing they now have a publicly trusted certificate.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("self-signed") && stderr.contains("proves no identity"),
+        "cert did not say what it is not: {stderr}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "private key mode was {mode:o}, expected 600");
+    }
+}
+
+#[test]
+fn cert_refuses_to_clobber_without_force() {
+    let dir = TempDir::new("clobber");
+    let (cert, key) = (dir.path("cert.pem"), dir.path("key.pem"));
+    let args = ["cert", "--cert-out", &cert, "--key-out", &key];
+
+    assert!(
+        bin().args(args).output().unwrap().status.success(),
+        "first write should succeed"
+    );
+    let first = std::fs::read_to_string(&cert).unwrap();
+
+    // Overwriting is not recoverable: the previous key is gone and anything that trusted the old
+    // certificate breaks. So it must take an explicit --force.
+    assert!(
+        !bin().args(args).output().unwrap().status.success(),
+        "a second `cert` without --force should fail"
+    );
+    assert_eq!(
+        first,
+        std::fs::read_to_string(&cert).unwrap(),
+        "the file was overwritten anyway"
+    );
+
+    assert!(
+        bin()
+            .args(args)
+            .arg("--force")
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "--force should overwrite"
+    );
+    assert_ne!(
+        first,
+        std::fs::read_to_string(&cert).unwrap(),
+        "--force did not replace it"
+    );
+}
+
+#[test]
+fn cert_rejects_a_non_numeric_days_value() {
+    let dir = TempDir::new("days");
+    let out = bin()
+        .args([
+            "cert",
+            "--days",
+            "ninety",
+            "--cert-out",
+            &dir.path("c.pem"),
+            "--key-out",
+            &dir.path("k.pem"),
+        ])
+        .output()
+        .expect("failed to run edgeguard");
+    assert!(
+        !out.status.success(),
+        "`--days ninety` should be rejected, not defaulted"
+    );
+}
+
+#[test]
+fn doctor_errors_when_tls_is_on_with_no_certificate_source() {
+    let dir = TempDir::new("doctor");
+    let cfg = dir.path("edgeguard.toml");
+    // TLS on, no cert paths, no ACME, no self_signed: the proxy cannot start, so this has to be
+    // an error exit and not a warning the operator scrolls past.
+    std::fs::write(&cfg, "[tls]\nenabled = true\n").unwrap();
+
+    let out = bin()
+        .args(["doctor", "--config", &cfg])
+        .output()
+        .expect("failed to run edgeguard");
+    assert!(
+        !out.status.success(),
+        "doctor should exit non-zero on a config that cannot start"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        (stderr.clone() + stdout).contains("no certificate to serve"),
+        "doctor did not name the problem: {stderr}"
+    );
 }

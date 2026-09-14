@@ -173,6 +173,22 @@ struct PerModelCounters {
 /// Process-wide metric registry. All methods take `&self` and use relaxed atomics — metrics
 /// are monotonic counters/observations where exact inter-thread ordering doesn't matter.
 pub struct Metrics {
+    /// Off-box access-log shipping, when `[log.ship]` is enabled.
+    ///
+    /// It lives here because `Metrics` is already the telemetry sink threaded to every response
+    /// path — `finish()` in proxy.rs takes it and has 40 call sites. Giving the shipper its own
+    /// parameter would mean touching all forty to carry a value that is `None` in the default
+    /// configuration, for no gain in clarity: an access log IS telemetry, and this is where the
+    /// telemetry object lives.
+    ///
+    /// `OnceLock` because the shipper needs a Tokio runtime to spawn its task, so it cannot be
+    /// built in `Metrics::new()` — it is installed once, at startup, after the runtime exists.
+    log_shipper: std::sync::OnceLock<crate::logship::LogShipper>,
+    /// Request-tracing span shipper, when `[tracing]` is enabled. Same `OnceLock`-installed-at-boot
+    /// shape and the same reason as `log_shipper`: it needs a Tokio runtime to spawn its task, and
+    /// it rides the object the response path already holds rather than a parameter added to
+    /// `finish`'s 38 call sites.
+    span_shipper: std::sync::OnceLock<crate::telemetry::SpanShipper>,
     /// One counter per [`OUTCOMES`] entry (parallel index).
     requests: Vec<AtomicU64>,
     /// One counter per [`RL_SCOPES`] entry (parallel index).
@@ -263,6 +279,8 @@ pub struct Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Metrics {
+            log_shipper: std::sync::OnceLock::new(),
+            span_shipper: std::sync::OnceLock::new(),
             requests: OUTCOMES.iter().map(|_| AtomicU64::new(0)).collect(),
             ratelimit_hits: RL_SCOPES.iter().map(|_| AtomicU64::new(0)).collect(),
             waf_hits: WAF_RULES.iter().map(|_| AtomicU64::new(0)).collect(),
@@ -410,6 +428,30 @@ fn accumulate_bounded(map: &Mutex<BTreeMap<String, PerModelCounters>>, key: &str
 impl Metrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the access-log shipper. Called once at startup, after the Tokio runtime exists.
+    ///
+    /// Returns whether it took: a second call is ignored rather than replacing a live shipper,
+    /// which would leak the first one's background task and its queued records.
+    pub fn set_log_shipper(&self, s: crate::logship::LogShipper) -> bool {
+        self.log_shipper.set(s).is_ok()
+    }
+
+    /// The shipper, if `[log.ship]` is enabled.
+    pub fn log_shipper(&self) -> Option<&crate::logship::LogShipper> {
+        self.log_shipper.get()
+    }
+
+    /// Install the span shipper. Called once at startup, after the Tokio runtime exists.
+    pub fn set_span_shipper(&self, s: crate::telemetry::SpanShipper) -> bool {
+        self.span_shipper.set(s).is_ok()
+    }
+
+    /// The span shipper, if `[tracing]` is enabled. `None` is also the cheap gate on the request
+    /// path: with tracing off, nothing about a span is computed.
+    pub fn span_shipper(&self) -> Option<&crate::telemetry::SpanShipper> {
+        self.span_shipper.get()
     }
 
     /// Count one finished request under its `outcome` label.
@@ -703,6 +745,66 @@ impl Metrics {
             "edgeguard_csp_reports_total {}\n",
             self.csp_reports.load(Ordering::Relaxed)
         ));
+
+        // Access-log shipping. `dropped` is the important one: a log pipeline that silently drops
+        // is worse than no pipeline, because the gap is invisible in the destination and the
+        // absence of records reads as an absence of traffic. Alert on it.
+        if let Some(shipper) = self.log_shipper.get() {
+            let (sent, dropped_q, dropped_send, batches, failed) = shipper.stats().snapshot();
+            out.push_str(
+                "# HELP edgeguard_logship_sent_total Access-log records delivered to the collector.\n\
+                 # TYPE edgeguard_logship_sent_total counter\n",
+            );
+            out.push_str(&format!("edgeguard_logship_sent_total {sent}\n"));
+            out.push_str(
+                "# HELP edgeguard_logship_dropped_total Access-log records dropped, by reason.\n\
+                 # TYPE edgeguard_logship_dropped_total counter\n",
+            );
+            // Two reasons, kept apart because they call for different responses: `queue_full`
+            // means the edge is producing faster than the collector accepts (raise queue_size, or
+            // find out why the collector is slow); `send_failed` means the collector rejected or
+            // was unreachable.
+            out.push_str(&format!(
+                "edgeguard_logship_dropped_total{{reason=\"queue_full\"}} {dropped_q}\n"
+            ));
+            out.push_str(&format!(
+                "edgeguard_logship_dropped_total{{reason=\"send_failed\"}} {dropped_send}\n"
+            ));
+            out.push_str(
+                "# HELP edgeguard_logship_batches_total Access-log batches POSTed, by outcome.\n\
+                 # TYPE edgeguard_logship_batches_total counter\n",
+            );
+            out.push_str(&format!(
+                "edgeguard_logship_batches_total{{outcome=\"sent\"}} {batches}\n"
+            ));
+            out.push_str(&format!(
+                "edgeguard_logship_batches_total{{outcome=\"failed\"}} {failed}\n"
+            ));
+        }
+
+        // Span shipping. Same reasoning as the log shipper's counters: a trace pipeline that drops
+        // silently reads, at the destination, as an absence of traffic.
+        if let Some(sh) = self.span_shipper.get() {
+            let st = sh.stats();
+            let sent = st.sent.load(Ordering::Relaxed);
+            let dq = st.dropped_queue_full.load(Ordering::Relaxed);
+            let df = st.dropped_send_failed.load(Ordering::Relaxed);
+            out.push_str(
+                "# HELP edgeguard_spans_sent_total Request spans delivered to the trace collector.\n\
+                 # TYPE edgeguard_spans_sent_total counter\n",
+            );
+            out.push_str(&format!("edgeguard_spans_sent_total {sent}\n"));
+            out.push_str(
+                "# HELP edgeguard_spans_dropped_total Request spans dropped, by reason.\n\
+                 # TYPE edgeguard_spans_dropped_total counter\n",
+            );
+            out.push_str(&format!(
+                "edgeguard_spans_dropped_total{{reason=\"queue_full\"}} {dq}\n"
+            ));
+            out.push_str(&format!(
+                "edgeguard_spans_dropped_total{{reason=\"send_failed\"}} {df}\n"
+            ));
+        }
 
         out.push_str(
             "# HELP edgeguard_request_duration_seconds Request handling latency in seconds.\n",

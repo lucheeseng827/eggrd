@@ -52,9 +52,196 @@ use crate::config::{AcmeCfg, TlsCfg};
 /// The TCP port the ACME CA connects to for an HTTP-01 challenge. Fixed by RFC 8555 §8.3.
 const HTTP01_PORT: u16 = 80;
 
+/// Which set of books refused an order. The remedies are different, so the distinction is worth
+/// carrying all the way to the operator's log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferSource {
+    /// The **fleet's** shared budget, held by the control plane. Some other edge under the same
+    /// registered domain spent the allowance; nothing about this box will change that, and waiting
+    /// (or reducing how often the fleet re-orders) is the only remedy.
+    Fleet,
+    /// This edge's **own** ledger. Usually a certificate cache that is not durable, so every
+    /// restart re-orders — fixable here, by making the ACME cache directory survive a restart.
+    Local,
+}
+
+impl DeferSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            DeferSource::Fleet => "fleet",
+            DeferSource::Local => "local",
+        }
+    }
+}
+
+/// The outcome of an issuance attempt.
+#[derive(Debug)]
+pub enum Issuance {
+    /// A certificate and key are on disk.
+    Issued,
+    /// The CA's rate limit for `bucket` is spent, so the order was not sent. `retry_at_unix` is when
+    /// that bucket next admits.
+    ///
+    /// Deliberately not an `Err`: the caller must be able to tell "we chose not to ask" from "the
+    /// order failed", because the correct response differs. A failure propagates; a deferral keeps
+    /// serving whatever certificate is already on disk.
+    Deferred {
+        /// The CA limit that refused: `orders` | `registered_domain` | `identifier_set`. A string
+        /// rather than the local enum because the refusal may have come from the control plane,
+        /// whose bucket set is its own — and an edge must not fail to report a deferral because it
+        /// did not recognise a word.
+        bucket: String,
+        /// The bucket key, when the refusal names one (the control plane always does). Says *which*
+        /// registered domain or identifier set is exhausted, which is the difference between an
+        /// actionable log line and a shrug.
+        key: String,
+        retry_at_unix: i64,
+        source: DeferSource,
+    },
+}
+
+/// Decide whether to send this order, against the fleet's books first and this edge's own second.
+///
+/// # Two tiers, and why both
+///
+/// The local ledger (`acme_budget`) covers what one edge can see: the per-identifier-set limit, the
+/// one a restart loop burns. It **cannot** cover the CA's per-registered-domain limit, which is
+/// shared — fifty edges under `example.com` each hold a private ledger, each correctly believe they
+/// have the full allowance, and between them they spend it. Only something all of them talk to can
+/// count that, which is the control plane.
+///
+/// So in managed mode the control plane decides, and holds the fleet's books. Unmanaged, or when
+/// the control plane cannot answer, the local ledger decides.
+///
+/// # A control plane that is down must not stop certificate issuance
+///
+/// Any failure reaching the control plane — unreachable, timing out, 5xx, a control plane too old
+/// to have the endpoint — falls through to the local budget. That degrades fleet-wide coordination
+/// to per-edge coordination, which is exactly where things stood before leases existed. Failing
+/// closed instead would turn a control-plane outage into fleet-wide certificate expiry, a far worse
+/// failure than the one being guarded against.
+///
+/// # Only one set of books is debited
+///
+/// A granted lease means the fleet already debited its buckets, so the local ledger is deliberately
+/// **not** also debited: doing both would count one order twice and exhaust the local guard at a
+/// fifth of the real rate. The local ledger is the fallback authority, not a second toll booth.
+///
+/// `Err(Issuance::Deferred)` is the refusal path — the caller returns it unchanged. `Ok` carries the
+/// local ledger to debit (when it is the deciding authority) and the granted lease id (when the
+/// fleet is).
+type BudgetCheck = (Option<crate::acme_budget::IssuanceBudget>, Option<String>);
+
+async fn check_budget(
+    acme: &AcmeCfg,
+    cp: Option<&crate::cp::CpClient>,
+) -> std::result::Result<BudgetCheck, Issuance> {
+    use crate::cp::LeaseVerdict;
+
+    // NOTE the ordering: the fleet lease is taken BEFORE `budget_enabled` is consulted.
+    //
+    // `budget_enabled` is a per-edge switch over a per-edge ledger, and the fleet's books are not
+    // this edge's to opt out of. One edge setting it false could otherwise spend the shared
+    // registered-domain allowance and leave every other edge under that domain unable to renew —
+    // which is precisely the failure this whole mechanism exists to prevent, re-introduced through
+    // a config flag. So the flag disables the LOCAL ledger below; it does not buy an exemption from
+    // a limit the CA applies to everyone.
+    if let Some(client) = cp {
+        match client.acme_lease(&acme.directory_url, &acme.domains).await {
+            Ok(LeaseVerdict::Granted { lease_id }) => {
+                info!(
+                    lease_id,
+                    domains = ?acme.domains,
+                    "ACME issuance leased from the control plane (fleet-wide budget)"
+                );
+                return Ok((None, Some(lease_id)));
+            }
+            Ok(LeaseVerdict::Deferred {
+                bucket,
+                key,
+                retry_at_unix,
+            }) => {
+                warn!(
+                    source = DeferSource::Fleet.label(),
+                    bucket = %bucket,
+                    key = %key,
+                    retry_at_unix,
+                    domains = ?acme.domains,
+                    "ACME issuance deferred: the FLEET's budget for this CA limit is exhausted — \
+                     another edge under the same key has spent it. The existing certificate (if \
+                     any) keeps serving; no self-signed certificate is substituted on a public \
+                     name."
+                );
+                return Err(Issuance::Deferred {
+                    bucket,
+                    key,
+                    retry_at_unix,
+                    source: DeferSource::Fleet,
+                });
+            }
+            // The control plane keeps no books for this CA, so there is nothing fleet-wide to
+            // apply and the local ledger below is the only guard there is.
+            Ok(LeaseVerdict::Unmanaged) => {}
+            Err(e) => {
+                // Logged at warn, not error: issuance still proceeds under the local budget. It is
+                // worth seeing because while this is happening the fleet-wide limit is unguarded.
+                warn!(
+                    error = %e,
+                    "could not obtain a fleet ACME lease; falling back to this edge's local budget. \
+                     The CA's per-registered-domain limit is uncoordinated until the control plane \
+                     is reachable again."
+                );
+            }
+        }
+    }
+
+    // Past here is the local ledger, and this is what `budget_enabled = false` actually turns off.
+    if !acme.budget_enabled {
+        return Ok((None, None));
+    }
+
+    let mut budget = crate::acme_budget::IssuanceBudget::load(&acme.directory_url, &acme.cache_dir);
+    if let Some(b) = &budget {
+        let now = crate::acme_budget::now_unix();
+        if let crate::acme_budget::Decision::Defer {
+            bucket,
+            retry_at_unix,
+        } = b.check(&acme.domains, now)
+        {
+            crate::acme_budget::warn_deferred(bucket, retry_at_unix, &acme.domains);
+            return Err(Issuance::Deferred {
+                bucket: bucket.label().to_string(),
+                key: String::new(),
+                retry_at_unix,
+                source: DeferSource::Local,
+            });
+        }
+    }
+    // Debit BEFORE the order is sent, and never refund. An order that reaches the CA may have been
+    // counted by it even when the response never arrives, so debiting on success would let a
+    // failing loop spend the real allowance while the local ledger showed it untouched — the exact
+    // situation the budget exists to prevent.
+    if let Some(b) = &mut budget {
+        if let Err(e) = b.debit(&acme.domains, crate::acme_budget::now_unix()) {
+            // A ledger we cannot persist is a budget that resets on restart, which is no budget.
+            // Loud, and not fatal: refusing to serve because a bookkeeping file is unwritable would
+            // be a worse outage than the one being guarded against.
+            warn!(error = %e, "could not persist the ACME issuance ledger; the budget will not survive a restart");
+        }
+    }
+    Ok((budget, None))
+}
+
 /// Obtain (or renew) a certificate for the configured domains and write it to the TLS
 /// cert/key paths. Returns once the certificate chain and key are on disk.
-pub async fn obtain_certificate(acme: &AcmeCfg, tls: &TlsCfg) -> Result<()> {
+///
+/// `cp` is the managed-mode control-plane client, when the edge has one. Its presence changes which
+/// books decide: see [`check_budget`].
+pub async fn obtain_certificate(
+    acme: &AcmeCfg,
+    tls: &TlsCfg,
+    cp: Option<&crate::cp::CpClient>,
+) -> Result<Issuance> {
     anyhow::ensure!(
         !acme.domains.is_empty(),
         "tls.acme.domains must list at least one domain"
@@ -68,6 +255,40 @@ pub async fn obtain_certificate(acme: &AcmeCfg, tls: &TlsCfg) -> Result<()> {
         "tls.cert_path and tls.key_path must be set so the issued certificate can be stored"
     );
 
+    // Ask the budget before asking the CA. A CA that refuses an order still counts it, so the only
+    // place this check is worth anything is before the request leaves.
+    let (budget, lease) = match check_budget(acme, cp).await {
+        Ok(ok) => ok,
+        Err(deferred) => return Ok(deferred),
+    };
+
+    let result = run_order(acme, tls, budget.as_ref()).await;
+
+    // Tell the control plane how the leased order ended, on EVERY path out of `run_order`.
+    //
+    // It settles nothing about the budget — the lease was debited at grant and is never refunded —
+    // but it is what turns an exhausted bucket from a bare number into "these forty orders were
+    // granted and only thirty-one produced a certificate", which is how an operator sees an edge
+    // burning fleet budget on orders that keep failing. An unreported lease is closed as consumed
+    // by the control plane once it expires, so a lost report costs observability, not correctness.
+    if let (Some(client), Some(lease_id)) = (cp, lease.as_deref()) {
+        let outcome = if result.is_ok() { "issued" } else { "failed" };
+        client.acme_lease_outcome(lease_id, outcome).await;
+    }
+    result?;
+
+    Ok(Issuance::Issued)
+}
+
+/// The ACME order itself: account, authorizations, challenges, finalize, and writing the pair to
+/// disk. Split out of [`obtain_certificate`] purely so that every failure path is a single `?` the
+/// caller can observe — the lease outcome has to be reported whether this succeeds or not, and a
+/// dozen inline `?`s would each have needed their own reporting.
+async fn run_order(
+    acme: &AcmeCfg,
+    tls: &TlsCfg,
+    budget: Option<&crate::acme_budget::IssuanceBudget>,
+) -> Result<()> {
     info!(domains = ?acme.domains, directory = %acme.directory_url, "starting ACME order");
 
     let account = account(acme).await?;
@@ -134,6 +355,17 @@ pub async fn obtain_certificate(acme: &AcmeCfg, tls: &TlsCfg) -> Result<()> {
     write_pem(&tls.cert_path, &cert_chain_pem)?;
     write_key_pem(&tls.key_path, &key_pem)?;
     info!(cert = %tls.cert_path, key = %tls.key_path, "ACME certificate stored");
+    if let Some(b) = budget {
+        for (bucket, key, left) in b.remaining(&acme.domains, crate::acme_budget::now_unix()) {
+            info!(
+                ca = b.ca_name(),
+                bucket = bucket.label(),
+                key = %key,
+                remaining = left,
+                "ACME issuance budget after this order"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -320,15 +552,23 @@ mod tests {
             directory_url,
             cache_dir: base.to_string_lossy().into_owned(),
             accept_tos: true,
+            // `..default()` so a new AcmeCfg field does not break this test literal. The budget is
+            // on (its default) and inert here on purpose: Pebble's directory URL is not a
+            // recognised CA, so `CaProfile::for_directory` returns None and no bucket is charged.
+            // That is what stops this test failing on its sixth run against a rate limit Pebble
+            // does not have.
+            ..AcmeCfg::default()
         };
         let tls = TlsCfg {
             enabled: true,
             cert_path: cert_path.clone(),
             key_path: key_path.clone(),
             acme: acme.clone(),
+            ..TlsCfg::default()
         };
 
-        obtain_certificate(&acme, &tls)
+        // `None`: this test drives an unmanaged edge, so the local budget is the only authority.
+        obtain_certificate(&acme, &tls, None)
             .await
             .expect("ACME HTTP-01 issuance against Pebble");
 

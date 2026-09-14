@@ -12,6 +12,8 @@ ARG TARGETARCH
 # ring (rustls crypto provider) compiles C/asm — needs a musl C toolchain.
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /src
+# `COPY . .` brings Cargo.lock with it; the build below passes `--locked` so a drifted lock is a
+# build failure rather than a silent re-resolve.
 COPY . .
 # Map TARGETARCH (injected by docker buildx) → Rust musl triple; stage binary at a fixed path.
 RUN case "${TARGETARCH}" in \
@@ -19,7 +21,7 @@ RUN case "${TARGETARCH}" in \
       *)     RUST_TARGET=x86_64-unknown-linux-musl ;; \
     esac && \
     rustup target add "${RUST_TARGET}" && \
-    cargo build --release --bin edgeguard --target "${RUST_TARGET}" && \
+    cargo build --release --locked --bin edgeguard --target "${RUST_TARGET}" && \
     cp "/src/target/${RUST_TARGET}/release/edgeguard" /edgeguard
 
 # distroless/static: ~2 MB, no shell, runs as nonroot, ships CA roots — ideal for a static binary.

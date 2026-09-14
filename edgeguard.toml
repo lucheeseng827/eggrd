@@ -189,6 +189,29 @@ inspect_body = false    # inspect the (size-capped) request body — opt in
 # "only these may connect". Both empty (the default) = allow all. A bad entry fails at startup.
 # NB: keys on the resolved client IP — behind a trusted proxy/LB, set server.trust_forwarded_for
 # so this sees the real client rather than the proxy.
+[log]
+# What the access log records. The request line is the most useful field in an access log and the
+# easiest place to leak a secret: password-reset links, OAuth `?code=`, presigned URLs and
+# `?api_key=` all travel in the query string, and access logs are scraped, shipped to a SIEM,
+# retained for months and read by people who were never meant to hold the credential.
+#
+#   query = "redact"  (default) redact values that are sensitive by NAME (api_key, token, code,
+#                     email, …) or by SHAPE (a JWT, a long high-entropy token). Ordinary values —
+#                     page numbers, slugs, dates, search terms — stay readable.
+#   query = "drop"    log the path only; the query becomes `?<dropped>`.
+#   query = "full"    verbatim. Opt-in, for a deployment that has decided its logs are as sensitive
+#                     as its traffic and protects them accordingly.
+#
+# Only the LOG is affected. The upstream, the WAF, per-route limits and routing all see the request
+# exactly as it arrived — redacting those would break routing and blind the security pipeline.
+# Path segments are not redacted: `/reset/<token>` cannot be told from `/users/<id>` without knowing
+# the application's routes. Use `drop` if secrets ride in path segments.
+query = "redact"
+
+# Extra parameter names to treat as sensitive, on top of the built-in list. Matched
+# case-insensitively as substrings.
+redact_params = []
+
 [access]
 allow = []   # e.g. ["10.0.0.0/8", "203.0.113.7"]  — lock the app to an office/VPN range
 deny = []    # e.g. ["198.51.100.0/24"]            — drop an abusive subnet (wins over allow)
@@ -224,6 +247,41 @@ max_age = "600s"
 enabled = false
 cert_path = ""   # PEM certificate chain (leaf first)
 key_path = ""    # PEM private key (PKCS#8/PKCS#1/SEC1)
+
+# --- Self-signed certificate (no certificate needed to turn TLS on) ---
+# Generates a certificate at cert_path/key_path when none is there yet, so `enabled = true` does
+# not first require you to obtain one. It ENCRYPTS the connection — which is what makes HSTS,
+# Secure cookies and the hardening headers mean anything — but it proves NO IDENTITY: browsers
+# show an interstitial and strict clients refuse it. Right for localhost, a private network, a
+# sidecar hop or staging; for a public domain use [tls.acme] below instead.
+# Skipped once a certificate exists, so restarts keep serving the same one. Generate one ahead of
+# time with: edgeguard cert --host app.internal --days 90
+self_signed = false
+# SANs; empty = ["localhost", "127.0.0.1", "::1"]. Add the name you actually browse to. An entry
+# that parses as an IP becomes an IP SAN; anything else must be a valid ASCII DNS name, and one
+# that is not fails generation rather than silently dropping it from the certificate.
+self_signed_hosts = []
+self_signed_days = 90    # deliberately short — a stopgap that expires beats one that never does
+# MULTI-REPLICA: generation is per-process. Several replicas booting at once against the SAME
+# writable cert_path can each see "no certificate" and generate, and the last writer wins — the
+# replicas then serve different certificates, or one fails to start on a mismatched pair. There
+# is no cross-process lock here. Generate once up front (`edgeguard cert`) and mount the result
+# read-only when you run more than one replica; first-boot generation is for a single instance.
+
+# --- HTTP → HTTPS redirect ---
+# Terminating TLS only protects traffic that REACHES the TLS port, and a browser given a bare
+# hostname tries :80 first — so without this, the first request of every visit is still plaintext
+# (or a connection error). Set redirect_port = 80 alongside [server] port = 443.
+# Ports below 1024 need privilege or CAP_NET_BIND_SERVICE. Overridden by REDIRECT_PORT.
+redirect_port = 0        # 0 = off; 80 = catch plaintext and upgrade it
+# 308 preserves the method and body, so a POST arriving on the plaintext port is replayed over
+# TLS rather than silently downgraded to a GET. 301 is the older browser-facing convention.
+redirect_status = 308
+# Hostnames the redirect will reflect into Location. Empty accepts any syntactically valid host
+# (the usual proxy behaviour). The Host header is attacker-controlled, so listing the names you
+# actually serve is what stops a forged Host producing a redirect that appears to come from your
+# domain. Malformed hosts (spaces, CR/LF, userinfo) are always refused with 400.
+redirect_hosts = []      # e.g. ["app.example.com"]
 
 # Automatic certificates via ACME / Let's Encrypt (HTTP-01 challenge on port 80). The issued
 # certificate is written to the cert_path/key_path above. NOTE: requires a public domain and

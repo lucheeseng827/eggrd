@@ -35,7 +35,7 @@ hardening) in a single static binary.
 ```bash
 cargo install eggrd && edgeguard init && edgeguard doctor
 # or
-docker run -p 8080:8080 mancube/eggrd:0.3.1
+docker run -p 8080:8080 mancube/eggrd:0.4.0
 ```
 
 ## Status
@@ -47,7 +47,10 @@ section used to overstate it.
 | Capability | State | How it was checked |
 |---|---|---|
 | Auth, rate limiting, WAF-lite, response hardening, validation | **proven** | Covered in-process; every gate is asserted to reject *before* the upstream is contacted, not merely to return the right status. |
+| Access-log query redaction | **proven** | A request carrying `?token=…`, `?api_key=…` or a bare JWT in the query string logs as `<redacted>`, on by default — while the same request reaches the upstream, the WAF, rate limiting and DLP unredacted. Covered by integration tests, including one whose SQLi payload sits in a parameter named `code`, which is on the redaction list. |
 | TLS termination | **proven** | TLS 1.3 negotiated, certificate verified, upstream response proxied back through it, plaintext refused on the TLS port, all six hardening headers present. |
+| Self-signed certificates | **proven** | `self_signed = true` generated a certificate on first boot, rustls loaded it, `curl --cacert` got `200` through it, and an untrusting client was refused — so it is real TLS, not a bypass. Key file mode asserted `0600`. |
+| HTTP→HTTPS redirect | **proven** | Plaintext `:8080` answered `308` to the TLS port with path and query intact; a `POST` followed the redirect and arrived upstream still a `POST` with its body; a forged `Host` outside `redirect_hosts` got `400` and no `Location`; `/.well-known/acme-challenge/` got `404`, not a redirect. |
 | Shared-store rate limiting | **proven** | Two replicas against one Redis: 5 allowed against a single key, where the per-replica store allowed 10. |
 | ACME issuance | **proven, and it was broken** | Not "untested and probably fine" — a two-year-old client could no longer read the CA's replies. Found by running it, fixed, and it now issues in about five seconds against Let's Encrypt staging. |
 | WASM edge worker | **runs, not deployed** | Builds a deployable bundle and serves requests on **workerd**, the runtime Cloudflare runs in production: 401 unauthenticated, 200 from the origin with all six hardening headers. It has *not* been deployed to a Cloudflare account, so routes, custom domains and secret bindings remain untested. |
@@ -192,8 +195,55 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
 - **Body-size limit** (`413`), **header-size limit** (`431`), and **method allowlist**
   (`405`).
 - **Env-first config** (`PORT` / `APP_PORT` / `UPSTREAM`) with an optional TOML overlay.
-- **Structured JSON access logs** and `/__edgeguard/health` + `/__edgeguard/ready`
-  endpoints.
+- **Structured JSON access logs**, with **credential-safe request lines by default**: query values
+  that are sensitive by name (`api_key`, `token`, OAuth `code`, `email`, …) or by shape (a JWT, a
+  long high-entropy token) are replaced with `<redacted>` before they reach a log line, while page
+  numbers, slugs and search terms stay readable. Only the log is affected — the upstream, the WAF
+  and per-route limits all see the request exactly as it arrived. Tune or disable with `[log]`.
+- **Off-box log shipping** (`[log.ship]`, off by default): stream that same access log as NDJSON to
+  any collector that accepts a POST — Vector, Loki, Splunk HEC, Datadog, an S3 writer, your own
+  receiver. One wire shape rather than an integration per vendor, and the request line is sanitised
+  before it leaves the box, so a proxy that advertises DLP is not the component that writes
+  credentials into your SIEM.
+
+  It is **best-effort and bounded**, deliberately. The request path does one non-blocking hand-off
+  to a fixed-size queue and returns; a slow or absent collector costs dropped records, never request
+  latency. Every drop is counted (`edgeguard_logship_dropped_total`), because a log pipeline that
+  drops silently is worse than none — the gap is invisible at the destination, and missing records
+  read as missing traffic.
+- **ACME issuance budget** (`[acme] budget_enabled`, on by default): refuse to send an order the
+  certificate authority's published rate limits would reject, instead of finding out by being
+  refused. Let's Encrypt allows five certificates per exact set of names per week, so an edge that
+  re-orders on every start — because its certificate cache is not on a durable volume — burns that
+  in five restarts and then has no certificate for a week. Modelled as the token buckets the CA
+  actually publishes, persisted alongside the ACME account key so it survives the restarts it exists
+  to guard against.
+
+  An exhausted budget is a **deferral, never a downgrade**: the existing certificate keeps serving
+  and no self-signed certificate is ever substituted on a public name. Only recognised CAs are
+  budgeted; an unknown directory URL gets no guard, because holding a private CA to somebody else's
+  numbers would refuse orders it would have accepted.
+
+  That ledger is **per-edge**, which covers the per-identifier-set limit above but cannot cover a
+  limit the CA counts across everyone: 50 certificates per registered domain per week. Fifty edges
+  under one domain each keep a private ledger, each correctly believe they hold the full allowance,
+  and between them spend it. In **managed mode** the control plane holds those shared buckets and
+  issues an issuance lease before each order, so the fleet is counted once. `budget_enabled = false`
+  turns off this edge's own ledger; it does not opt the edge out of the fleet's, because that
+  allowance is not one box's to spend. A control plane that cannot be reached falls back to the
+  local ledger rather than blocking renewals.
+- **Distributed request tracing** (`[tracing]`, off by default): one OpenTelemetry **SERVER** span
+  per proxied request, batched to any OTLP/HTTP `/v1/traces` receiver. Current stable HTTP semantic
+  conventions, W3C trace context in **and out** — an inbound `traceparent` makes the edge's span a
+  child of the caller's, and the edge rewrites it so the upstream app's spans nest under the edge's
+  rather than starting a disconnected trace. Deterministic per-trace sampling, so a trace is wholly
+  recorded or wholly not.
+
+  No OpenTelemetry SDK and no protobuf: the OTLP-JSON is built by hand and posted with the client
+  the crate already has, so it stays one static binary. The query string in `url.query` is redacted
+  by the same policy as the access log — a span goes to the same class of destination, and shipping
+  raw credentials there would reintroduce in traces the leak the access log exists to prevent.
+- `/__edgeguard/health` + `/__edgeguard/ready` endpoints.
 
 ## Two deployment modes
 
@@ -639,6 +689,73 @@ separately managed app) over `--wrap`.
 
 Set `tls.enabled = true` and point `tls.cert_path` / `tls.key_path` at a PEM certificate
 chain and private key to serve HTTPS directly (rustls; HTTP/1.1 via ALPN).
+
+There are three ways to get the certificate that goes there — pick by where the app runs:
+
+| | `[tls] self_signed` | `[tls.acme]` | your own `cert_path`/`key_path` |
+|---|---|---|---|
+| Needs a public domain | no | **yes** | no |
+| Needs inbound `:80` | no | **yes** | no |
+| Publicly trusted | no — browsers warn | yes | depends on the issuer |
+| Right for | localhost, private network, staging | a public site | corporate/internal CA |
+
+### Self-signed, out of the box
+
+`tls.self_signed = true` makes EdgeGuard write its own certificate to `cert_path`/`key_path`
+when none is there yet, so turning TLS on no longer requires obtaining a certificate first:
+
+```toml
+[server]
+port = 8443
+
+[tls]
+enabled     = true
+cert_path   = "./tls/cert.pem"
+key_path    = "./tls/key.pem"
+self_signed = true
+self_signed_hosts = ["localhost", "127.0.0.1"]   # SANs; empty = the loopback defaults
+```
+
+Or produce the files up front — in a Dockerfile stage, a compose init step, or by hand:
+
+```bash
+edgeguard cert --host app.internal --days 90 --cert-out ./tls/cert.pem --key-out ./tls/key.pem
+```
+
+The key is written `0600`; generation is skipped once a certificate exists, so restarts keep
+serving the same one. **Be clear about what this buys.** It encrypts the connection — which is
+what makes HSTS, `Secure` cookies and the hardening headers mean anything at all — but it
+proves no identity, so browsers show an interstitial and strict clients refuse it outright
+(`curl --cacert ./tls/cert.pem …` to trust it explicitly). `edgeguard doctor` says so out loud.
+For a public domain, use `[tls.acme]`.
+
+### HTTP → HTTPS redirect
+
+Terminating TLS only protects traffic that *reaches* the TLS port, and a browser handed a bare
+hostname tries `:80` first — so without a plaintext listener the first request of every visit is
+either unencrypted or a connection error. `tls.redirect_port` runs a second, tiny listener that
+upgrades it:
+
+```toml
+[server]
+port = 443
+
+[tls]
+enabled         = true
+redirect_port   = 80                      # 0 (default) = off; also settable via REDIRECT_PORT
+redirect_status = 308                     # preserves method + body; 301 for the older convention
+redirect_hosts  = ["app.example.com"]     # empty = reflect any syntactically valid Host
+```
+
+`308` rather than `301` is the default so a `POST` arriving on the plaintext port is replayed
+over TLS instead of being silently downgraded to a `GET`.
+
+The `Host` header is attacker-controlled, and a redirect listener that reflects it unchecked is
+an open redirect wearing your domain's name. So a malformed host (spaces, CR/LF, userinfo, an
+over-long name) always gets a `400` rather than a `Location`, and setting `redirect_hosts` pins
+redirects to the names you actually serve. `/.well-known/acme-challenge/` is answered `404`, never
+redirected, so ACME validation is not broken by it; ports below 1024 need privilege or
+`CAP_NET_BIND_SERVICE`.
 
 To get certificates automatically, enable `[tls.acme]` with your `domains`, contact `email`,
 and `accept_tos = true`. EdgeGuard runs the ACME **HTTP-01** challenge (it binds **port 80**

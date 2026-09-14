@@ -4,7 +4,7 @@
 # the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
 # crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
 name = "eggrd"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
 license = "Apache-2.0"
@@ -52,21 +52,44 @@ aho-corasick = "1"
 jsonwebtoken = "9"
 # JWKS fetch over HTTPS. `rustls-tls` avoids a system OpenSSL dependency; default features
 # (native-tls, gzip, …) are off — a plain GET is all the JWKS client needs.
+# Already ring-only, no change needed: `rustls-tls` => `rustls-tls-webpki-roots` => `__rustls-ring`,
+# and reqwest declares rustls/tokio-rustls/hyper-rustls with `default-features = false`.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # Distributed (shared-store) rate limiter for multi-replica deployments: a Redis-backed GCRA
 # store (`ratelimit.store = "redis"`). `tokio-comp` for async, `connection-manager` for
 # auto-reconnect, `tokio-rustls-comp` so `rediss://` TLS uses rustls (no system OpenSSL),
 # matching the rest of the crate. Only used when the distributed limiter is enabled.
+# Also already clean: `tls-rustls` only asks for `rustls/std`, and redis declares rustls and
+# tokio-rustls with `default-features = false` — it inherits whichever provider the graph picks.
 redis = { version = "1", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
 # Lock-free atomic swap of the live policy, so config hot-reload never blocks the request
 # path nor drops in-flight connections.
 arc-swap = "1"
 # Watch the config file for changes (hot-reload).
 notify = "6"
-# TLS termination. `ring` pins a single crypto provider so the rustls config is deterministic
-# regardless of which provider other crates pull in.
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
+# TLS termination. `ring` is the ONLY crypto provider this crate links, so the rustls config is
+# deterministic and `CryptoProvider::from_crate_features()` resolves unambiguously.
+#
+# `default-features = false` is load-bearing, not tidiness. rustls's default set is
+# ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"]; adding "ring" on top of it
+# links BOTH providers, which:
+#   * drags in aws-lc-sys — the graph's only cmake/bindgen C build, and by a wide margin its
+#     most expensive crate. It is also the part most likely to break on a new toolchain or a
+#     musl/cross target, i.e. exactly the static-binary/distroless promise. (Measurements in
+#     CHANGELOG.md under 0.3.1..Unreleased; they are not repeated here to drift.) And
+#   * makes `rustls::ClientConfig::builder()` PANIC ("Could not automatically determine the
+#     process-level CryptoProvider") in any crate that relies on feature-based provider
+#     selection, unless `tls::init_crypto()` has already run. It only runs when `[tls] enabled`,
+#     so `ratelimit.store = "redis"` over `rediss://` with TLS termination off used to abort the
+#     process on the first rate-limited request (the `redis` crate calls that builder).
+# So: keep every rustls-consuming dep below on an explicit ring path. `prefer-post-quantum` is
+# dropped because it *is* an aws_lc_rs alias; nothing is lost, since src/tls.rs already builds
+# the ServerConfig with an explicit ring provider and ring has no ML-KEM — the listener
+# negotiates the same TLS1.3 / X25519 / TLS_AES_256_GCM_SHA384 before and after.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# Same story: tokio-rustls's defaults are ["logging", "tls12", "aws_lc_rs"], and its `aws_lc_rs`
+# turns `rustls/aws_lc_rs` back on for the whole graph via feature unification.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2"
 # Adapt the axum router onto a manual hyper connection when terminating TLS ourselves.
 tower = { version = "0.5", features = ["util"] }
@@ -78,7 +101,23 @@ tower-http = { version = "0.6", features = ["compression-gzip"] }
 # `missing field \`token\`` — so ACME issuance was broken in the field. 0.8 also
 # generates the key + CSR in `finalize()`, which is why rcgen was dropped in 0.3.0:
 # nothing in this crate constructed a certificate itself any more.
-instant-acme = "0.8"
+# Its default features are ["aws-lc-rs", "hyper-rustls"], and `aws-lc-rs` also forces
+# `rcgen/aws_lc_rs` + `hyper-rustls/aws-lc-rs`. The `ring` feature is the drop-in swap for it
+# (`ring` => hyper-rustls?/ring + rcgen/ring); `hyper-rustls` is re-listed because it is a
+# default we still need for the ACME HTTP client. hyper-rustls and rustls-platform-verifier
+# come in transitively from here and need no entry of their own — this covers both.
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+# Self-signed certificate generation for `[tls] self_signed` / `edgeguard cert`, so TLS can be
+# turned on without obtaining a certificate first. The 0.3.0 notes say rcgen was "dropped" — true
+# of DIRECT use (instant-acme 0.8 builds its own key and CSR in `finalize()`), but instant-acme
+# depends on rcgen itself, so it was still compiled on every build. Declaring it here is a direct
+# edge to a node already in the graph: no new crate is compiled and no transitive dependency is
+# added. Default features are off — `x509-parser` and `aws_lc_rs` are not needed; `ring` matches
+# the provider the rest of the crate pins, and `pem` is the output format the TLS loader reads.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# Validity dates on the generated certificate. Already in the tree (rcgen and the ACME stack pull
+# it); named here because this crate uses it directly.
+time = { version = "0.3", default-features = false, features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 # Generate a request id (UUID v4) when an inbound request doesn't carry one, for end-to-end log
@@ -127,6 +166,28 @@ harness = false
 name = "response"
 harness = false
 
+# Release profile — GOVERNS EVERY BUILD THAT SHIPS, none of which is the monorepo workspace build.
+# eggrd is distributed as a standalone crate, and all three paths make this file the workspace root,
+# so all three get exactly the settings below:
+#   - `cargo install eggrd` — crates.io, the package is its own root;
+#   - `mancube/eggrd` — `Dockerfile`'s build context is this directory (`COPY . .`), so nothing
+#     above it is copied into the image;
+#   - the public `lucheeseng827/eggrd` mirror — `sync-eggrd-oss.yml` stages the cut OUTSIDE the
+#     monorepo checkout specifically "so the cut has no parent workspace", and gates on that tree.
+#
+# Only `cargo build --release` from the MONOREPO root differs: cargo profiles are workspace-global,
+# so there the root manifest wins (`opt-level = "z"`, `lto = true`, `codegen-units = 1`) and cargo
+# prints "profiles for the non root package will be ignored". That warning is about the monorepo
+# build, which ships nothing — it is not evidence this block is dead. Deleting it would silently
+# drop `lto = "thin"` and `strip` from the published crate, the image and the mirror, on a crate
+# whose pitch is a tiny static binary on distroless.
+#
+# One consequence worth knowing: `[profile.bench]` inherits `[profile.release]`, so running the
+# three benches above from the monorepo root measures `opt-level = "z"` + fat LTO — a configuration
+# nothing ships. Bench from a standalone cut (or the mirror) for numbers that describe the real
+# binary. No CI does this: no workflow runs `cargo bench`. Unlike `panic`, `opt-level` IS legal in a
+# `[profile.release.package.eggrd]` override at the monorepo root if the workspace-build gap ever
+# needs closing — though `lto` is not, so that would only narrow the difference, not remove it.
 [profile.release]
 opt-level = 3
 lto = "thin"

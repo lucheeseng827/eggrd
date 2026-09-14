@@ -153,8 +153,94 @@ fn lint_tls(cfg: &Config, f: &mut Vec<Finding>) {
         f.push(Finding::info(
             "tls.enabled = false: EdgeGuard serves plain HTTP. Fine when your platform terminates \
              TLS in front of it; on a VPS/front-proxy, enable [tls] (or [tls.acme]) so traffic \
-             isn't unencrypted.",
+             isn't unencrypted. `tls.self_signed = true` gets you an encrypted port immediately \
+             without obtaining a certificate first.",
         ));
+        // HSTS over plaintext is not merely useless, it is a trap: nothing sets it (browsers
+        // ignore the header on an http:// response), so the config reads as protected while
+        // every request is still in the clear.
+        if cfg.headers.hsts {
+            f.push(Finding::warn(
+                "headers.hsts = true but tls.enabled = false: browsers ignore \
+                 Strict-Transport-Security on a plain-HTTP response, so this setting is doing \
+                 nothing. Terminate TLS here, or make sure the proxy in front of you sets HSTS.",
+            ));
+        }
+        return;
+    }
+
+    if cfg.tls.self_signed {
+        f.push(Finding::warn(
+            "tls.self_signed = true: the certificate proves no identity, so browsers show an \
+             interstitial and strict clients refuse the connection. Correct for localhost, a \
+             private network or staging; for a public domain switch to [tls.acme].",
+        ));
+        if cfg.tls.self_signed_days > 825 {
+            f.push(Finding::warn(
+                "tls.self_signed_days is over 825: some clients reject certificates with a \
+                 lifetime that long outright. Keep it short and re-issue instead.",
+            ));
+        }
+    }
+
+    if !cfg.tls.self_signed
+        && !cfg.tls.acme.enabled
+        && (cfg.tls.cert_path.is_empty() || cfg.tls.key_path.is_empty())
+    {
+        f.push(Finding::error(
+            "tls.enabled = true but there is no certificate to serve: set cert_path/key_path, \
+             or enable tls.acme (public domain) or tls.self_signed (local/internal). EdgeGuard \
+             will refuse to start as configured.",
+        ));
+    }
+
+    if cfg.tls.self_signed && (cfg.tls.cert_path.is_empty() || cfg.tls.key_path.is_empty()) {
+        f.push(Finding::error(
+            "tls.self_signed = true needs tls.cert_path and tls.key_path — they are where the \
+             generated certificate is written, not only where an existing one is read from.",
+        ));
+    }
+
+    match cfg.tls.redirect_port {
+        // The whole point of the redirect listener is to catch the browser's first, bare-hostname
+        // request. Silence here is the single most common way TLS is enabled and still bypassed.
+        0 => f.push(Finding::info(
+            "tls.redirect_port = 0: nothing is listening on plain HTTP, so a visitor who types \
+             the bare hostname gets a connection error rather than being sent to HTTPS. Set \
+             tls.redirect_port = 80 to upgrade them instead.",
+        )),
+        p if p == cfg.server.port => f.push(Finding::error(format!(
+            "tls.redirect_port = {p} is the same as server.port: the redirect listener and the \
+             TLS listener cannot share a port, and EdgeGuard will fail to bind."
+        ))),
+        p if p == cfg.server.admin_port => f.push(Finding::error(format!(
+            "tls.redirect_port = {p} is the same as server.admin_port: the two listeners cannot \
+             share a port."
+        ))),
+        p => {
+            if !(300..400).contains(&cfg.tls.redirect_status) {
+                f.push(Finding::error(format!(
+                    "tls.redirect_status = {} is not a 3xx redirect status.",
+                    cfg.tls.redirect_status
+                )));
+            }
+            if cfg.tls.redirect_hosts.is_empty() {
+                f.push(Finding::info(
+                    "tls.redirect_hosts is empty: the redirect listener reflects whatever Host \
+                     header it is sent. That is the usual behaviour, but listing the hostnames \
+                     you actually serve stops a forged Host from producing a redirect that \
+                     appears to come from your domain.",
+                ));
+            }
+            if p == 80 && cfg.tls.acme.enabled {
+                f.push(Finding::info(
+                    "tls.redirect_port = 80 with ACME enabled: EdgeGuard orders the certificate \
+                     first and starts the redirect listener afterwards, so the two do not \
+                     contend for :80. The redirect listener answers 404 (not a redirect) on \
+                     /.well-known/acme-challenge/ so a future renewal is not broken by it.",
+                ));
+            }
+        }
     }
 }
 
@@ -280,6 +366,90 @@ mod tests {
         cfg.cors.allow_origins = vec!["*".into()];
         cfg.cors.allow_credentials = true;
         assert!(has_error(&lint(&cfg)));
+    }
+
+    #[test]
+    fn tls_enabled_without_any_certificate_source_is_an_error() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        assert!(
+            has_error(&lint(&cfg)),
+            "no cert, no ACME, no self-signed must be an error"
+        );
+
+        // Any one of the three ways to get a certificate clears it.
+        cfg.tls.self_signed = true;
+        cfg.tls.cert_path = "/tmp/c.pem".into();
+        cfg.tls.key_path = "/tmp/k.pem".into();
+        assert!(!has_error(&lint(&cfg)));
+    }
+
+    #[test]
+    fn self_signed_without_paths_is_an_error_and_with_them_only_warns() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.self_signed = true;
+        // The paths are the OUTPUT location, so omitting them is not a "we'll pick one" case.
+        assert!(has_error(&lint(&cfg)));
+
+        cfg.tls.cert_path = "/tmp/c.pem".into();
+        cfg.tls.key_path = "/tmp/k.pem".into();
+        let f = lint(&cfg);
+        assert!(!has_error(&f));
+        assert!(
+            f.iter().any(|x| x.message.contains("proves no identity")),
+            "self-signed must warn that it is not publicly trusted"
+        );
+    }
+
+    #[test]
+    fn redirect_port_colliding_with_another_listener_is_an_error() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.self_signed = true;
+        cfg.tls.cert_path = "/tmp/c.pem".into();
+        cfg.tls.key_path = "/tmp/k.pem".into();
+
+        cfg.tls.redirect_port = cfg.server.port;
+        assert!(
+            has_error(&lint(&cfg)),
+            "redirect port == server port must be an error"
+        );
+
+        cfg.server.admin_port = 9090;
+        cfg.tls.redirect_port = 9090;
+        assert!(
+            has_error(&lint(&cfg)),
+            "redirect port == admin port must be an error"
+        );
+
+        cfg.tls.redirect_port = 80;
+        assert!(!has_error(&lint(&cfg)));
+    }
+
+    #[test]
+    fn non_3xx_redirect_status_is_an_error() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.self_signed = true;
+        cfg.tls.cert_path = "/tmp/c.pem".into();
+        cfg.tls.key_path = "/tmp/k.pem".into();
+        cfg.tls.redirect_port = 80;
+        cfg.tls.redirect_status = 200;
+        assert!(has_error(&lint(&cfg)));
+    }
+
+    #[test]
+    fn hsts_without_tls_warns_that_it_does_nothing() {
+        let cfg = Config::default();
+        // The shipped default is hsts = true, tls.enabled = false — a combination that reads as
+        // protected and is not, which is exactly what doctor exists to say out loud.
+        assert!(cfg.headers.hsts && !cfg.tls.enabled);
+        let f = lint(&cfg);
+        assert!(f
+            .iter()
+            .any(|x| x.message.contains("Strict-Transport-Security")));
+        assert!(!has_error(&f), "it is a warning, not an error");
     }
 
     #[test]

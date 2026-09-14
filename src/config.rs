@@ -38,6 +38,11 @@ pub struct Config {
     /// Optional outbound alerting (gateway L4). Off by default; when enabled with a webhook, the
     /// gateway fires a Slack-compatible alert when a hard budget nears its limit. See [`AlertsCfg`].
     pub alerts: AlertsCfg,
+    /// What the access log records. Defaults to redacting credential-shaped query parameters —
+    /// see [`LogCfg`].
+    pub log: LogCfg,
+    /// One OTLP SERVER span per proxied request. Off by default. See [`TracingCfg`].
+    pub tracing: TracingCfg,
 }
 
 /// Outbound alerting (`[alerts]`). When `enabled` with a `webhook_url`, EdgeGuard POSTs a
@@ -412,6 +417,14 @@ pub struct ControlPlaneCfg {
     /// How often to poll the quota verdict, e.g. `"30s"`. A failed poll keeps the last verdict, so
     /// a control-plane blip neither over- nor under-enforces.
     pub quota_poll_interval: String,
+    /// This edge's identity in the control plane's fleet view. Empty (the default) auto-detects
+    /// from the hostname.
+    ///
+    /// Set it explicitly where the hostname is not stable and not meaningful — a rolling Deployment
+    /// replaces the pod name on every deploy, so each rollout would otherwise appear as a fresh set
+    /// of edges with the previous set ageing out. A value that survives the roll (the workload's
+    /// name plus an ordinal) makes the fleet view track the edge rather than the process.
+    pub edge_id: String,
 }
 
 impl Default for ControlPlaneCfg {
@@ -426,6 +439,7 @@ impl Default for ControlPlaneCfg {
             forward_csp: true,
             enforce_quota: false,
             quota_poll_interval: "30s".into(),
+            edge_id: String::new(),
         }
     }
 }
@@ -455,6 +469,135 @@ pub struct ServerCfg {
     /// `127.0.0.1` (same-host only — e.g. a sidecar scraper); set to `0.0.0.0` to expose it on
     /// a private network interface (rely on your network policy to keep it off the internet).
     pub admin_addr: String,
+}
+
+/// `[tracing]` — one OpenTelemetry **SERVER** span per proxied request.
+///
+/// Distinct from `[llm.telemetry]`, which emits a CLIENT span only for metered LLM requests. That
+/// covers the gateway deployment and leaves a plain reverse-proxy install — most of them — emitting
+/// no traces at all. This is the general one.
+///
+/// Off by default. When on, spans are batched to any OTLP/HTTP `/v1/traces` receiver over the
+/// crate's existing HTTP client: no OpenTelemetry SDK, no protobuf, still one static binary.
+///
+/// The request path never waits on it. A span is handed to a bounded queue and a background task
+/// does the rest, so a slow or absent collector costs dropped spans rather than latency.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TracingCfg {
+    pub enabled: bool,
+    /// OTLP/HTTP traces endpoint, e.g. `http://otel-collector:4318/v1/traces`. Empty disables
+    /// tracing regardless of `enabled` — an endpoint-less "enabled" would mint trace ids on every
+    /// request and throw them away.
+    pub endpoint: String,
+    /// Fraction of traces to record, `0.0`–`1.0`. Deterministic per trace id, so a trace is wholly
+    /// sampled or wholly not — a half-recorded trace is worse than none, because the gap looks like
+    /// a missing service.
+    pub sample_rate: f64,
+    /// `service.name` on emitted spans.
+    pub service_name: String,
+    /// Spans per POST.
+    pub batch: usize,
+    /// Flush a partial batch after this many seconds.
+    pub interval_secs: u64,
+    /// In-memory queue between the request path and the shipper. Past it, spans are dropped rather
+    /// than the request path blocking.
+    pub queue_size: usize,
+    /// Per-POST timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+impl Default for TracingCfg {
+    fn default() -> Self {
+        TracingCfg {
+            enabled: false,
+            endpoint: String::new(),
+            sample_rate: 1.0,
+            service_name: "edgeguard".into(),
+            batch: 200,
+            interval_secs: 5,
+            queue_size: 10_000,
+            timeout_ms: 2_000,
+        }
+    }
+}
+
+/// `[log]` — what the access log records.
+///
+/// Access logs are the most-copied artifact a service produces: scraped, shipped to a SIEM, retained
+/// for months, readable by people who were never meant to hold what is in them. The request line is
+/// where credentials end up (`?api_key=`, OAuth `?code=`, magic links, presigned URLs), so how it is
+/// rendered is a security setting, not a formatting one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LogCfg {
+    /// `"redact"` (default), `"drop"`, or `"full"` — see [`QueryLogMode`](crate::accesslog::QueryLogMode).
+    pub query: crate::accesslog::QueryLogMode,
+    /// Extra query-parameter names to treat as sensitive, on top of the built-in list. Matched
+    /// case-insensitively as substrings, so `"accountNumber"` also covers `account_number_v2`.
+    pub redact_params: Vec<String>,
+    /// Ship the access log to a collector. Off by default. See [`LogShipCfg`].
+    pub ship: LogShipCfg,
+}
+
+/// `[log.ship]` — stream the access log off the box to a collector.
+///
+/// The edge writes one structured line per request to stdout and, until this existed, nowhere else:
+/// an operator running a fleet had to collect logs per box with whatever their platform provided.
+///
+/// Any collector that accepts an NDJSON POST works — Vector, Loki, Splunk HEC, Datadog, an S3
+/// writer, your own receiver. One wire shape rather than an integration per vendor, matching the
+/// control plane's `[audit.ship]`.
+///
+/// **This is best-effort, and that is deliberate.** `[audit.ship]` is at-least-once with a cursor
+/// because the audit trail is evidence. Access logs are telemetry at three to five orders of
+/// magnitude more volume, and guaranteeing delivery would need an unbounded on-box buffer — whose
+/// failure mode is that a collector outage takes down the proxy. Records are dropped when the queue
+/// fills, and every drop is counted (`edgeguard_logship_dropped_total`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LogShipCfg {
+    pub enabled: bool,
+    /// Collector URL. Empty disables shipping regardless of `enabled`.
+    pub url: String,
+    /// Extra headers, typically the collector's API key: `Authorization: Splunk <token>`,
+    /// `DD-API-KEY: <key>`. A list of pairs rather than a map so the order is stable in config.
+    pub headers: Vec<(String, String)>,
+    /// Records per POST.
+    pub batch: usize,
+    /// Flush a partial batch after this many seconds, so a low-traffic edge does not hold its last
+    /// records indefinitely — a gap in the collector looks exactly like an outage.
+    pub interval_secs: u64,
+    /// In-memory queue between the request path and the shipper. This is the bound: past it,
+    /// records are dropped rather than the request path blocking.
+    ///
+    /// 10k at the measured request rates is a few seconds of buffer, which covers a collector
+    /// restart and not a collector outage. Raising it trades memory for a longer outage tolerated;
+    /// it does not make delivery guaranteed, and nothing here should be read as if it did.
+    pub queue_size: usize,
+}
+
+impl Default for LogShipCfg {
+    fn default() -> Self {
+        LogShipCfg {
+            enabled: false,
+            url: String::new(),
+            headers: Vec::new(),
+            batch: 500,
+            interval_secs: 5,
+            queue_size: 10_000,
+        }
+    }
+}
+
+impl Default for LogCfg {
+    fn default() -> Self {
+        LogCfg {
+            query: crate::accesslog::QueryLogMode::Redact,
+            redact_params: Vec::new(),
+            ship: LogShipCfg::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -770,8 +913,9 @@ impl Default for HeadersCfg {
 
 /// TLS termination. When `enabled`, EdgeGuard serves HTTPS on the public port using a
 /// certificate either loaded from `cert_path`/`key_path` or obtained automatically via ACME.
-/// All-default fields (disabled, empty paths, default ACME) so `Default` is derivable.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// `self_signed_days` and `redirect_status` need non-zero defaults (a zero-day certificate and
+/// a `0` status are both nonsense), so `Default` is written out rather than derived.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TlsCfg {
     /// Terminate TLS in EdgeGuard itself. Leave off when something upstream already does
@@ -782,8 +926,74 @@ pub struct TlsCfg {
     pub cert_path: String,
     /// PEM private key (PKCS#8/PKCS#1/SEC1).
     pub key_path: String,
+    /// Generate a self-signed certificate at `cert_path`/`key_path` when none is there yet,
+    /// instead of requiring one to exist before TLS can be enabled at all. It encrypts the
+    /// connection — which is what makes HSTS, `Secure` cookies and the hardening headers mean
+    /// anything — but proves no identity, so browsers warn and strict clients refuse. Right for
+    /// localhost, a private network, or a staging box; for the public internet use `[tls.acme]`.
+    /// Ignored once a certificate exists, so a restart keeps serving the same one.
+    pub self_signed: bool,
+    /// Hostnames/IPs to put in the generated certificate's subject-alternative names. Empty
+    /// means `localhost`, `127.0.0.1` and `::1` — a client is only satisfied by a name it finds
+    /// in here, so add the address you actually browse to.
+    pub self_signed_hosts: Vec<String>,
+    /// How long the generated certificate is valid, in days. The default is deliberately short:
+    /// a self-signed certificate is meant to be a stopgap, and an expiry that arrives is a
+    /// better reminder to move to `[tls.acme]` than a decade-long one nobody revisits.
+    pub self_signed_days: u32,
+    /// Plain-HTTP port to run an HTTP→HTTPS redirect listener on; `0` (default) disables it.
+    /// Terminating TLS only protects traffic that reaches the TLS port, and a browser given a
+    /// bare hostname tries `:80` first — so without this, the first request of every visit is
+    /// still plaintext. Set to `80` alongside a `[server] port = 443`. Overridden by
+    /// `REDIRECT_PORT`.
+    pub redirect_port: u16,
+    /// Status the redirect listener answers with. `308` (default) preserves the method and body,
+    /// so a `POST` arriving on the plaintext port is replayed over TLS rather than silently
+    /// downgraded to a `GET`; `301` is the older browser-facing convention. Must be 3xx.
+    pub redirect_status: u16,
+    /// Hostnames the redirect listener will reflect into `Location`. Empty (default) accepts any
+    /// syntactically valid host. `Host` is attacker-controlled, so pinning it to the names you
+    /// actually serve is what stops a request with a forged `Host` from turning this listener
+    /// into an open redirect that carries your domain's reputation to someone else's site.
+    pub redirect_hosts: Vec<String>,
     /// Automatic certificate issuance. See `[tls.acme]`.
     pub acme: AcmeCfg,
+}
+
+impl TlsCfg {
+    /// SAN list for a generated certificate: the configured hosts, or the loopback defaults.
+    pub fn self_signed_host_list(&self) -> Vec<String> {
+        if self.self_signed_hosts.is_empty() {
+            crate::selfsigned::DEFAULT_HOSTS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            self.self_signed_hosts.clone()
+        }
+    }
+}
+
+impl Default for TlsCfg {
+    fn default() -> Self {
+        TlsCfg {
+            enabled: false,
+            cert_path: String::new(),
+            key_path: String::new(),
+            self_signed: false,
+            self_signed_hosts: Vec::new(),
+            // 90 days, matching what a public CA issues — long enough not to be a nuisance in
+            // staging, short enough that "temporary" self-signed TLS cannot quietly become
+            // permanent.
+            self_signed_days: 90,
+            redirect_port: 0,
+            // 308 over 301: it preserves method and body, so an API client's POST is not turned
+            // into a GET by the upgrade.
+            redirect_status: 308,
+            redirect_hosts: Vec::new(),
+            acme: AcmeCfg::default(),
+        }
+    }
 }
 
 /// Automatic certificate management (ACME / Let's Encrypt) via the HTTP-01 challenge. The
@@ -809,6 +1019,19 @@ pub struct AcmeCfg {
     /// You must set this to `true` to signify acceptance of the ACME provider's Terms of
     /// Service; EdgeGuard refuses to register otherwise.
     pub accept_tos: bool,
+    /// Refuse to send an order the CA's published rate limits would reject, instead of finding out
+    /// by being refused. On by default. See [`crate::acme_budget`].
+    ///
+    /// Only recognised CAs are budgeted — an unknown directory URL gets no profile and no guard,
+    /// because holding a private CA to Let's Encrypt's numbers would refuse orders it would have
+    /// accepted. Turn this off only if the budget is wrong about your CA and you would rather have
+    /// the CA be the one that says no.
+    ///
+    /// This governs **this edge's own ledger only**. In managed mode the control plane still issues
+    /// the fleet-wide issuance lease, because limits the CA applies across every edge under one
+    /// registered domain are not this edge's to opt out of — one box turning this off would
+    /// otherwise be able to spend the whole fleet's weekly allowance.
+    pub budget_enabled: bool,
 }
 
 impl Default for AcmeCfg {
@@ -821,6 +1044,7 @@ impl Default for AcmeCfg {
             directory_url: "https://acme-staging-v02.api.letsencrypt.org/directory".into(),
             cache_dir: "./acme".into(),
             accept_tos: false,
+            budget_enabled: true,
         }
     }
 }
@@ -997,6 +1221,13 @@ impl Config {
                 cfg.server.admin_port = v;
             }
         }
+        // A platform that hands out ports by environment (and the Docker examples) can turn the
+        // redirect listener on without a config edit, matching PORT/ADMIN_PORT.
+        if let Ok(p) = env::var("REDIRECT_PORT") {
+            if let Ok(v) = p.parse() {
+                cfg.tls.redirect_port = v;
+            }
+        }
         if let Ok(u) = env::var("UPSTREAM") {
             if !u.is_empty() {
                 cfg.server.upstream = u;
@@ -1075,6 +1306,16 @@ impl Config {
             // Alerting is edge-local operational config (its webhook is a local secret/endpoint), not
             // fleet-pushed policy — carry it from the edge, like `server`/`tls`.
             alerts: self.alerts.clone(),
+            // Access-log redaction is edge-local and deliberately NOT pushable. A control plane
+            // able to flip an edge to `query = "full"` could turn that edge's own logs into an
+            // exfiltration channel for every credential its users put in a URL — without touching
+            // the edge's config file or leaving a trace anywhere the edge's operator looks.
+            log: self.log.clone(),
+            // Same reasoning as `log` above, and the stakes are identical: the tracing endpoint is
+            // where request metadata is sent. A control plane that could push `[tracing]` could
+            // redirect an edge's traces — path, query, client address, user agent — to a collector
+            // of its choosing. Edge-local, never pushed.
+            tracing: self.tracing.clone(),
         })
     }
 

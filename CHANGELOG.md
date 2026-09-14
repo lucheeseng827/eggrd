@@ -6,7 +6,160 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-14
+
+Three new hardening defaults, so this is a minor release per `docs/RELEASE.md`'s versioning
+policy, not a patch. Two ship new capability that stays off until configured (self-signed TLS,
+the `:80` redirect listener) — the third changes what a running deployment already does:
+**`[log] query` now defaults to `redact`.** A deployment that scrapes access logs expecting the
+full query string — a dashboard keyed on a `?campaign=` value, a SIEM rule matching on
+`?session=` — will see `<redacted>` there after upgrading. Set `[log] query = "full"` to keep the
+previous verbatim behaviour; nothing else about the request, routing or the upstream changes.
+
 ### Added
+- **HTTPS works without first obtaining a certificate, and plaintext traffic is upgraded rather
+  than dropped.** These were the two remaining places where "secure by default" required the
+  operator to already know something. `tls.enabled = true` used to be a promise you could not
+  keep until you had a PEM pair in hand, and even once TLS was up, nothing listened on `:80` — so
+  a visitor typing a bare hostname got a connection error, and an app still bound there answered
+  in the clear. The proxy was hardening a door people were walking past.
+
+  - `[tls] self_signed = true` generates a certificate at `cert_path`/`key_path` when none is
+    there yet, then serves it. The key is written `0600` — a private key that lands
+    world-readable is a worse outcome than the missing certificate it fixes. Generation is
+    skipped once the files exist, so a restart does not hand every client a new identity, and
+    ACME still wins when both are configured: `self_signed` is a floor ("never fail to start for
+    want of a certificate"), not a ceiling. `self_signed_hosts` sets the SANs (empty means
+    `localhost`/`127.0.0.1`/`::1`), with IP literals becoming IP SANs rather than DNS names,
+    because that is what clients actually match an address against.
+
+    **What it buys is stated plainly, in the docs and by `doctor`.** It encrypts the connection —
+    which is what makes HSTS, `Secure` cookies and the hardening headers mean anything at all —
+    and it proves no identity, so browsers warn and strict clients refuse. Right for localhost, a
+    private network, a sidecar hop or staging; wrong for a public domain, where `[tls.acme]` is
+    the answer. Selling it as more than that would be the same overstatement the Status table in
+    the README exists to prevent.
+
+  - `edgeguard cert [--host h]... [--days n] [--cert-out p] [--key-out p] [--force]` writes the
+    same pair as a standalone utility — no config file, no listener — for a Docker build stage or
+    a compose init step. It refuses to overwrite without `--force`: replacing a certificate is
+    not recoverable, since the previous key is gone and anything that trusted it breaks.
+
+  - `[tls] redirect_port` (also `REDIRECT_PORT`) runs a small plaintext listener that redirects to
+    HTTPS. The default status is **308, not 301**, so a `POST` that lands on the plaintext port is
+    replayed over TLS instead of being silently downgraded to a `GET`. The TLS port is carried
+    into the `Location`, so a proxy on `:8443` redirects there rather than to a `:443` nothing is
+    listening on.
+
+    **It does not ship the hole it exists to close.** The `Host` header is attacker-controlled, and
+    a redirect listener that reflects it unchecked is an open redirect wearing the site's own
+    name. A malformed host — spaces, CR/LF, userinfo, an over-long name — is answered `400`
+    rather than reflected, and `redirect_hosts` pins redirects to an allow-list.
+    `/.well-known/acme-challenge/` is answered `404` and never redirected: a CA must read the
+    HTTP-01 token in plaintext, and bouncing it to the port whose certificate is being issued
+    would deadlock the order. With ACME enabled, issuance runs first and the redirect listener
+    binds afterwards, so the two never contend for `:80`.
+
+  - `doctor` gained the checks that make the above discoverable rather than documented: TLS on
+    with no certificate source at all is an **error** (it will not start), `self_signed` warns
+    that it is not publicly trusted, a `redirect_port` colliding with `server.port` or
+    `admin_port` is an error, a non-3xx `redirect_status` is an error, and `redirect_port = 0`
+    is called out because TLS that nothing redirects to is the most common way it gets bypassed.
+    It also now flags **`headers.hsts = true` with `tls.enabled = false`** — the shipped default —
+    which reads as protected and is not, since browsers ignore HSTS on a plain-HTTP response.
+
+  **Review round.** Eight findings from the PR review bot, seven acted on. The one that
+  mattered: the code did the *opposite* of its own comment. `self_signed` generation ran before
+  ACME, wrote to the same `cert_path`, and the ACME branch skips issuance when a certificate is
+  already there — so with both enabled on a public domain, the untrusted self-signed certificate
+  silently won over the publicly trusted one the operator asked for. ACME now runs first, which
+  is also what makes `self_signed` the floor it was documented to be. Alongside it: `Host` is now
+  parsed as a whole authority rather than split on the first colon (`attacker.example:443@victim.example`
+  was reduced to `attacker.example` and redirected instead of refused — the strictness the docs
+  already claimed); `redirect_status` is validated before the listener binds, since failing inside
+  the spawned task left the port closed while HTTPS carried on, turning a typo into "connection
+  refused"; an out-of-range `--days` returns an error instead of panicking on `OffsetDateTime`
+  overflow; identical `cert_path`/`key_path` is refused rather than writing the key over the
+  certificate and reporting success; and both files are now staged and renamed into place, which
+  also fixes a real permissions hole — `OpenOptions::mode` only applies when it *creates* a file,
+  so regenerating over an existing `0644` key had been leaving new key material world-readable.
+  Not taken: a cross-process lock around generation — with the reasoning stated more carefully
+  than the first draft managed, because whether a lock helps depends on the storage. On **shared**
+  storage one would work: the first replica generates, the rest find a complete pair and reuse it,
+  and they converge on one identity. On **per-replica** storage it cannot — there is nothing to
+  coordinate through, so each replica necessarily holds a different self-signed identity. The
+  second case has no fix at this layer and the first is better solved by not generating at boot,
+  so the documented answer for either is to generate once with `edgeguard cert` and mount it
+  read-only, and `ensure` now says exactly that rather than dismissing locks outright.
+
+  A second round found four more, all taken. `is_redirection()` accepts the whole 3xx class, so
+  `redirect_status = 304` was allowed and would answer a cache validator with a `Location`,
+  leaving the client on plaintext — the exact failure the feature exists to prevent, reached
+  through a value we accepted; only 301/302/303/307/308 now pass. The ACME skip-issuance guard
+  tested `cert_path` alone, so a certificate whose key was missing skipped the order and handed
+  the half-pair to `ensure`, which regenerates both — the precedence bug again, through a
+  different door; both files must now be present to skip. And `Path::exists()` follows symlinks,
+  so a dangling one read as "absent" and let a no-force `edgeguard cert` replace the operator's
+  symlink with a regular file; presence is now tested with `symlink_metadata`.
+
+  A third round closed the pair-publication gap properly. The previous attempt staged and
+  renamed one file at a time while its own comment claimed it staged both first — the third
+  comment/code mismatch this change produced, and the reviewer was right that an ordinary I/O
+  error on the key (not just a crash) could therefore leave a new certificate live against the
+  old key. Both files are now staged before either live path moves, and the live certificate is
+  set aside first and put back if the key never lands, so **any** failure leaves the operator's
+  existing pair exactly as it was. Writing the test for that caught the remaining hole in the
+  fix: a `rename` fails on its own too (a directory in the way, a read-only mount), so staging
+  alone was not enough — hence the rollback.
+
+  **Build cost: none measurable.** `rcgen` is declared directly for the first time since 0.3.0, but
+  `instant-acme` already depends on it, so it was compiled on every build regardless: the graph
+  stays at **218 crates**, cold release build time is unchanged, and the stripped binary grows
+  **331 KiB (+1.9%)**, from 16.63 MiB to 16.96 MiB. Both features are always-on code paths with
+  no feature flag, because a security default behind an opt-in flag is not a default.
+
+- **Access logs no longer carry credentials.** The request line is the most useful field in an
+  access log and the easiest place to leak a secret: password-reset links, OAuth `?code=`,
+  presigned URLs and `?api_key=` all travel in the query string, and access logs are the
+  most-copied artifact a service produces — scraped, shipped to a SIEM, retained for months, read
+  by people who were never meant to hold the credential. EdgeGuard was logging
+  `path_and_query()` verbatim, which for a proxy that advertises DLP is the wrong component to be
+  writing them to disk.
+
+  Query values are now redacted on two independent signals: **by name** (a built-in list covering
+  `key`, `token`, `secret`, `password`, `auth`, `code`, `state`, `email`, … matched
+  case-insensitively as substrings, plus whatever `[log] redact_params` adds) and **by shape** (a
+  JWT, or a long high-entropy token — which catches `?t=eyJhbGciOi…` where the parameter name is
+  innocuous and a name list never would). Ordinary values — page numbers, slugs, dates, search
+  terms — stay readable, so the log keeps its debugging value. The replacement is a fixed
+  `<redacted>`, so neither the value nor its length leaks.
+
+  `[log] query` selects `redact` (default), `drop` (path only), or `full` (verbatim, opt-in).
+
+  **Only the log is affected.** The upstream receives the client's target byte-for-byte, and the
+  WAF, per-route rate limits, route-scoped DLP and upstream selection all still see the raw
+  request — redacting those would break routing and blind the security pipeline. Both properties
+  are covered by integration tests, including a WAF test whose SQLi payload sits in a parameter
+  named `code`, which is on the redaction list.
+
+  Path segments are *not* redacted: `/reset/<token>` cannot be distinguished from `/users/<id>`
+  without knowing the application's routes, and guessing would mangle ordinary paths. Use `drop`
+  where secrets ride in path segments.
+
+  **Encoded parameters do not slip past it.** Classification runs on the decoded form as well as the
+  raw text, so `?%74%6f%6b%65%6e=secret` (that is `?token=secret`) and a JWT whose dots are `%2E`
+  are both caught — otherwise redaction would have covered exactly the credentials nobody bothered
+  to obfuscate. Only classification decodes; the logged text keeps the original encoding, because
+  rewriting it would change what the request actually said.
+
+  **Upstream failure logs are covered too.** `upstream timed out` and `upstream unreachable` printed
+  the forwarded URI, query and all — redacting the access line and then leaking the same `?api_key=`
+  in a `warn!` would give it up on the path an operator is most likely to be reading. The forwarded
+  URI is still verbatim; only the logged one is sanitised.
+
+  The setting is deliberately **not** pushable from a control plane. A managed plane able to flip
+  an edge to `query = "full"` could turn that edge's own logs into an exfiltration channel for
+  every credential its users put in a URL, without touching the edge's config file.
 - **A documentation site at `eggrd.dev/docs`, so the reference is not the source.** The landing
   page's "Documentation" link pointed at the GitHub README, which meant every question about a
   configuration key ended in `config.rs`. There are now four pages: an overview, the CLI and
@@ -46,7 +199,68 @@ All notable changes to EdgeGuard are documented here. The format is based on
   Mutating the auth path to forward before rejecting makes
   `unauthenticated_request_never_reaches_the_upstream` fail the same way.
 
+### Changed
+- **`aws-lc-sys` is gone from the dependency graph.** It was the single most expensive crate in
+  the build — 54.8s of a 139s cold `cargo build --release --bin edgeguard` on 4 cores, 17.4% of
+  total unit-time — and nothing used it. `src/tls.rs` has always pinned `ring`: `init_crypto()`
+  installs the ring provider and `load_server_config()` builds the `ServerConfig` with an
+  explicit one. The aws-lc stack was in the graph purely by feature unification, because
+  `rustls = { features = ["ring"] }` adds `ring` *on top of* rustls's defaults rather than
+  replacing them, leaving `aws_lc_rs` on — and `tokio-rustls` and `instant-acme` each turned it
+  back on through their own defaults, so fixing only `rustls` was not enough.
+
+  All three now take an explicit ring path (`default-features = false` plus the features the
+  crate actually uses). `reqwest` and `redis` needed no change and are annotated as such in
+  `Cargo.toml`, so the next person does not re-derive it: reqwest's `rustls-tls` already implies
+  `__rustls-ring`, and redis declares rustls with `default-features = false`.
+
+  Measured on the same 4-core box, cold target and warm registry: **139s → 111s wall**, total
+  unit-time **314.7s → 255.7s**, 285 → 271 compilation units, and `cargo tree -i aws-lc-rs`
+  reports nothing under default, `--all-features` and `--features ner`. The stripped release
+  binary goes from **16.6 MiB to 7.5 MiB** — 54.7% smaller, since the whole of libcrypto was
+  being linked in unused. It also removes the build's only cmake/bindgen C dependency, which was
+  the piece most likely to break on a new toolchain or a musl/cross target — the thing the
+  single-static-binary and distroless claims rest on.
+
+  Nothing changes on the wire. rustls's `prefer-post-quantum` default is dropped along with the
+  rest (it is an `aws_lc_rs` alias), but it was already inert: the listener builds with an
+  explicit ring provider and ring has no ML-KEM. Before and after both negotiate
+  `TLSv1.3 / TLS_AES_256_GCM_SHA384 / X25519 / RSASSA-PSS`.
+
+- **The single-provider rule is now enforced, not just documented.**
+  `scripts/check-crypto-provider.sh` fails the build if `aws-lc-rs` or `aws-lc-sys` reappears
+  anywhere in the resolved graph, and names what pulled it in. It runs in CI and as `make deps`
+  (part of `make test-all`).
+
+  It has to be a graph check rather than a test, because neither consequence surfaces as a test
+  failure: the C build is a build-time and binary-size cost, and the provider ambiguity only
+  bites the `rediss://` path at runtime. A lockfile does not remove the need for it: a
+  `cargo update`, a new dependency, or a point release that flips a default feature anywhere
+  across rustls / tokio-rustls / instant-acme / hyper-rustls / rcgen can put aws-lc back, and in
+  a ~26k-line workspace lock diff the handful of changed edges is not something a reviewer
+  spots. The crate also ships without a lock of its own, so the OSS cut resolves fresh every
+  time.
+
+  The check reads `cargo tree`, not `Cargo.lock`, because the lock keeps entries for optional
+  dependencies that no enabled feature activates — `aws-lc-rs` is still listed there under
+  `rustls-webpki` — so grepping the lock would report a regression that is not one. Both package
+  names are matched: `rcgen` can pull `aws-lc-rs` without touching rustls's features, so neither
+  name implies the other.
+
 ### Fixed
+- **`ratelimit.store = "redis"` over `rediss://` aborted the process when TLS termination was
+  off.** Linking two rustls crypto providers makes `rustls::ClientConfig::builder()` panic —
+  *"Could not automatically determine the process-level CryptoProvider"* — unless a default has
+  been installed first. `tls::init_crypto()` installs one, but only runs under `[tls] enabled`,
+  and the `redis` crate calls that builder when it opens a `rediss://` connection. So an operator
+  terminating TLS at a load balancer (the documented deployment) and pointing the distributed
+  limiter at a TLS Redis lost the process on the first rate-limited request, with a panic
+  message about crate features rather than anything resembling their config.
+
+  With `ring` now the only provider linked, the lookup resolves from crate features and the path
+  behaves like every other store failure: the connection is attempted, and an unreachable store
+  fails closed with `503` and a `rate-limit store error` warning.
+
 - **`dead_addr()` in the integration tests was racy.** It bound an ephemeral port and dropped it,
   assuming nothing would claim it — but the OS is free to hand that port to the next listener, and
   with more concurrent tests it does. The "down" upstream then answered `200` and

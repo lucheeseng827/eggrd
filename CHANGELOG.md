@@ -6,6 +6,12 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- Windows CI: `clippy -D warnings` failed on `src/selfsigned.rs` (`unused variable: private`) —
+  the parameter is only read inside the `#[cfg(unix)]` chmod-0600 blocks, so it was genuinely
+  unused on the Windows build. No behavior change on any platform; the private-key file still
+  gets no permission restriction on Windows, which remains a known best-effort-platform gap.
+
 ## [0.4.0] — 2026-09-14
 
 Three new hardening defaults, so this is a minor release per `docs/RELEASE.md`'s versioning

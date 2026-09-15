@@ -210,6 +210,12 @@ pub fn write_to(
 /// regenerating half a pair) would have left the new key material world-readable. The mode is
 /// also set on the open handle, so it holds regardless of umask.
 fn stage(path: &str, contents: &str, private: bool) -> Result<String> {
+    // Only acted on via the `#[cfg(unix)]` blocks below — chmod 0600 has no Windows equivalent
+    // here, so the private key lands with default ACLs there (a real gap; Windows is
+    // documented as best-effort in docs/RELEASE.md, not the production TLS-termination target).
+    #[cfg(not(unix))]
+    let _ = private;
+
     let tmp = format!("{path}.tmp.{}", std::process::id());
     // A leftover temp file from a killed run must not block every future attempt.
     if Path::new(&tmp).exists() {

@@ -1,0 +1,6 @@
+# Blank issues stay enabled: the README's "open an issue with the enterprise label" link opens one.
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/lucheeseng827/eggrd/security/advisories/new
+    about: Privately, so it is fixed before it is public. Please do not open a public issue.

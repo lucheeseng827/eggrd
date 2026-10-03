@@ -19,8 +19,10 @@ bash scripts/acme-pebble-test.sh
 ```
 
 Starts Pebble, trusts its directory root, points the test domain at this host, allows binding
-`:80`, runs both Pebble tests (issuance, and renewal through the redirect listener) and fails if
-either skipped instead of running. Needs Docker and root or passwordless sudo. CI runs exactly this
+`:80`, runs the four Pebble tests (HTTP-01 issuance, renewal through the redirect listener, a DNS-01
+wildcard order that publishes its TXT records through challtestsrv, and an ARI window lookup
+followed by a renewal naming the replaced certificate) and fails if any of them
+skipped instead of running. Needs Docker and root or passwordless sudo. CI runs exactly this
 script, so a green run locally is the same check. Recipe A below is the same steps by hand, with
 the reasons each one is needed.
 

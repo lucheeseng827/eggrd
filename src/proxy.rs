@@ -23,7 +23,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode},
 };
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, RateLimiter};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioIo;
@@ -39,7 +39,9 @@ use crate::waf::{WafEngine, WafMode};
 pub type KeyedLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 /// Rate limiter keyed by the authenticated principal (per-key limiting).
 pub type StrLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
-pub type UpstreamClient = Client<HttpConnector, Full<Bytes>>;
+/// The upstream client. Its body type is axum's boxed [`Body`], so one client carries both a
+/// buffered request (`Body::from(bytes)`) and a streamed one ([`StreamedRequestBody`]).
+pub type UpstreamClient = Client<HttpConnector, Body>;
 
 /// Shared, cheaply-cloned handle the router hands to every request. Only the hot-swappable
 /// [`Runtime`] changes on reload; the client and metrics are stable.
@@ -75,7 +77,7 @@ pub struct Runtime {
     pub upstream_routes: Vec<(String, Arc<String>)>,
     pub auth: AuthEngine,
     /// WAF-lite input screener. Inert (`evaluate` returns `None`) when `waf.mode = "off"`.
-    pub waf: WafEngine,
+    pub waf: Arc<WafEngine>,
     /// Compiled CORS policy; `None` when `cors.enabled = false` (the proxy then skips CORS).
     pub cors: Option<crate::cors::CorsPolicy>,
     /// Compiled IP allow/deny policy; `None` when both lists are empty (no IP gating).
@@ -99,6 +101,15 @@ pub struct Runtime {
     /// Forward `text/event-stream` responses unbuffered (SSE passthrough). See
     /// [`crate::config::ValidationCfg::stream_passthrough`].
     pub stream_passthrough: bool,
+    /// Stream responses of any type when nothing needs the whole body. See
+    /// [`crate::config::ValidationCfg::stream_responses`] and [`streams_any_response`].
+    pub stream_responses: bool,
+    /// Stream request bodies when nothing needs the whole body. See
+    /// [`crate::config::ValidationCfg::stream_requests`] and [`streams_request`].
+    pub stream_requests: bool,
+    /// Routes whose streamed request body is inspected on a bounded window. See
+    /// [`crate::config::ValidationCfg::stream_inspect`] and [`crate::stream_inspect`].
+    pub stream_inspect: Vec<crate::stream_inspect::InspectWindow>,
     /// Tunnel WebSocket / `Upgrade` connections to the upstream. See
     /// [`crate::config::ValidationCfg::websocket_passthrough`].
     pub websocket_passthrough: bool,
@@ -137,7 +148,7 @@ impl Runtime {
 /// `str::starts_with` would route a sibling like `/apiary` to the `/api` upstream, so the match
 /// only succeeds when the prefix is followed by a real boundary: end of path, a `/`, or the query
 /// separator `?`. A trailing slash on the prefix is itself a boundary.
-fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+pub(crate) fn path_prefix_matches(path: &str, prefix: &str) -> bool {
     if prefix == "/" {
         return true;
     }
@@ -679,28 +690,126 @@ async fn handle_inner(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let mut body_bytes = match axum::body::to_bytes(body, rt.max_body).await {
-        Ok(b) => b,
-        Err(_) => {
-            return finish(
-                m,
-                &rid,
-                &method,
-                &path,
-                ip,
-                started,
-                "payload_too_large",
-                text(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
+    // 5a) Stream the body instead, when nothing below reads it (see `streams_request`). It is then
+    //     forwarded as it arrives, still capped at `max_body`; `body_bytes` stays empty, so the
+    //     inspection steps below see no body — which is exactly the set of steps that need none.
+    let stream_request = streams_request(
+        rt.stream_requests,
+        rt.waf.needs_body(),
+        rt.dlp.as_ref().is_some_and(|d| d.scan_request()),
+        rt.llm.enabled || rt.keyvault.is_some() || rt.budgets.is_some(),
+    );
+    let too_large = || {
+        finish(
+            m,
+            &rid,
+            &method,
+            &path,
+            ip,
+            started,
+            "payload_too_large",
+            text(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"),
+        )
+    };
+    // Request (ingress) size for managed-mode usage. Shared, because a streamed body is only
+    // counted as it flows — after this function has moved on.
+    let ingress = Arc::new(std::sync::atomic::AtomicUsize::new(header_bytes(
+        &parts.headers,
+    )));
+    // 5b) A route under `[[validation.stream_inspect]]` streams even though the WAF or inbound DLP
+    //     reads the body: they inspect the first `window` bytes below, as if that were the body,
+    //     and a `TailInspector` scans the rest as it is forwarded (see `crate::stream_inspect`).
+    let window = if stream_request {
+        None
+    } else {
+        crate::stream_inspect::InspectWindow::for_path(&rt.stream_inspect, &raw_path).filter(|_| {
+            crate::stream_inspect::inspects_window(
+                rt.stream_requests,
+                true,
+                rt.waf.needs_body(),
+                rt.dlp.as_ref().is_some_and(|d| d.scan_request()),
+                rt.dlp
+                    .as_ref()
+                    .is_some_and(|d| d.mode() == crate::dlp::DlpMode::Redact),
+                rt.llm.enabled || rt.keyvault.is_some() || rt.budgets.is_some(),
             )
+        })
+    };
+    let mut streamed_body: Option<StreamedRequestBody> = None;
+    // The window's inspection happens in the ordinary steps below; the tail inspector is built
+    // after them, so it knows whether the WAF already reported this request.
+    let mut window_rest: Option<(Body, usize)> = None;
+    let mut body_bytes = if let Some(w) = window {
+        let declared = parts
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if declared.is_some_and(|n| n > rt.max_body as u64) {
+            return too_large();
+        }
+        let mut body = body;
+        let mut head = bytes::BytesMut::new();
+        let mut ended = false;
+        while head.len() < w.window {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Some(d) = frame.data_ref() {
+                        head.extend_from_slice(d);
+                    }
+                }
+                Some(Err(_)) => return too_large(),
+                None => {
+                    ended = true;
+                    break;
+                }
+            }
+            if head.len() > rt.max_body {
+                return too_large();
+            }
+        }
+        let head = head.freeze();
+        ingress.fetch_add(head.len(), std::sync::atomic::Ordering::Relaxed);
+        if !ended && body.is_end_stream() {
+            ended = true;
+        }
+        if !ended {
+            window_rest = Some((body, w.overlap));
+        }
+        // A body that ended inside the window was read whole: it is inspected and forwarded like
+        // any buffered body.
+        head
+    } else if stream_request {
+        // A declared length over the cap is refused before a byte goes upstream.
+        let declared = parts
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if declared.is_some_and(|n| n > rt.max_body as u64) {
+            return too_large();
+        }
+        streamed_body = Some(StreamedRequestBody::new(
+            body,
+            rt.max_body,
+            Arc::clone(&ingress),
+        ));
+        Bytes::new()
+    } else {
+        match axum::body::to_bytes(body, rt.max_body).await {
+            Ok(b) => {
+                ingress.fetch_add(b.len(), std::sync::atomic::Ordering::Relaxed);
+                b
+            }
+            Err(_) => return too_large(),
         }
     };
-    // Request (ingress) size for managed-mode usage, captured before the body is forwarded upstream.
-    let ingress_bytes = header_bytes(&parts.headers).saturating_add(body_bytes.len());
 
     // 6) WAF-lite input inspection. A no-op unless `waf.mode` is report/block. The body is
     //    already buffered above, so inspecting it adds no extra read. On a match: `block` mode
     //    returns 403; `report` mode logs + counts and forwards. Both record the hit so a
     //    report-only rollout shows up in `edgeguard_waf_hits_total`.
+    let mut waf_reported = false;
     if let Some(hit) = rt.waf.evaluate(&raw_path, &parts.headers, &body_bytes) {
         m.record_waf_hit(hit.class);
         match rt.waf.mode() {
@@ -724,14 +833,17 @@ async fn handle_inner(
                     text(StatusCode::FORBIDDEN, "Forbidden"),
                 );
             }
-            WafMode::Report => warn!(
-                rule = %hit.rule_id,
-                class = hit.class,
-                location = hit.location,
-                client_ip = %ip,
-                path = %path,
-                "WAF rule matched (report-only)"
-            ),
+            WafMode::Report => {
+                waf_reported = true;
+                warn!(
+                    rule = %hit.rule_id,
+                    class = hit.class,
+                    location = hit.location,
+                    client_ip = %ip,
+                    path = %path,
+                    "WAF rule matched (report-only)"
+                )
+            }
             // `evaluate` returns `None` when off, so this arm is unreachable; kept for
             // exhaustiveness.
             WafMode::Off => {}
@@ -794,6 +906,25 @@ async fn handle_inner(
                 }
             }
         }
+    }
+
+    // The window passed: forward it, then the rest of the body through the tail inspector.
+    if let Some((rest, overlap)) = window_rest.take() {
+        let tail = crate::stream_inspect::TailInspector::new(
+            rt.waf.needs_body().then(|| Arc::clone(&rt.waf)),
+            rt.dlp.as_ref().filter(|d| d.scan_request()).cloned(),
+            Arc::clone(m),
+            overlap,
+            &body_bytes,
+            waf_reported,
+        );
+        streamed_body = Some(StreamedRequestBody::windowed(
+            std::mem::take(&mut body_bytes),
+            rest,
+            rt.max_body,
+            Arc::clone(&ingress),
+            tail,
+        ));
     }
 
     // LLM token metering (gateway L0): if enabled, note the request's `model` *before* the body is
@@ -1070,7 +1201,17 @@ async fn handle_inner(
     let telem_input: Option<String> = (rt.telemetry.enabled && rt.telemetry.capture_content)
         .then(|| capture_for_span(rt.dlp.as_ref(), &body_bytes, rt.telemetry.max_content_bytes));
 
-    let upstream_req = match up.body(Full::new(body_bytes)) {
+    // Watch the streamed body's cap: past it the upload is cut mid-request, and the client is owed a
+    // 413, not the 502 a cut request would otherwise read as.
+    let request_cut = streamed_body.as_ref().map(StreamedRequestBody::cut_flag);
+    let request_blocked = streamed_body
+        .as_ref()
+        .map(StreamedRequestBody::blocked_flag);
+    let upstream_body = match streamed_body {
+        Some(b) => Body::new(b),
+        None => Body::from(body_bytes),
+    };
+    let upstream_req = match up.body(upstream_body) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "failed to build upstream request");
@@ -1097,6 +1238,33 @@ async fn handle_inner(
 
     let upstream_resp = match within(deadline, state.client.request(upstream_req)).await {
         Ok(Ok(r)) => r,
+        Ok(Err(_))
+            if request_cut
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) =>
+        {
+            warn!(
+                limit = rt.max_body,
+                "streamed request body exceeded max_body; upload cut"
+            );
+            return too_large();
+        }
+        Ok(Err(_))
+            if request_blocked
+                .as_ref()
+                .is_some_and(|b| b.load(std::sync::atomic::Ordering::Relaxed)) =>
+        {
+            return finish(
+                m,
+                &rid,
+                &method,
+                &path,
+                ip,
+                started,
+                "forbidden",
+                text(StatusCode::FORBIDDEN, "Forbidden"),
+            );
+        }
         Ok(Err(e)) => {
             warn!(error = %e, upstream = %log_uri, "upstream unreachable");
             return finish(
@@ -1144,9 +1312,24 @@ async fn handle_inner(
         .dlp
         .as_ref()
         .is_some_and(|d| d.scan_response() && matches!(d.mode(), crate::dlp::DlpMode::Block));
-    if rt.stream_passthrough && is_event_stream(&resp_parts.headers) && !dlp_blocks_response {
+    let sse_stream =
+        rt.stream_passthrough && is_event_stream(&resp_parts.headers) && !dlp_blocks_response;
+    // 8b) Any other response streams too when `stream_responses` is on and nothing below needs the
+    //     whole body (see `streams_any_response`). Unlike SSE, `max_response_body` still holds —
+    //     enforced as the bytes flow — and the body passes through unmodified, so the upstream's
+    //     `Content-Length` stays (a download keeps its progress bar; a cut body is visibly short).
+    let whole_stream = !sse_stream
+        && streams_any_response(
+            rt.stream_responses,
+            llm_model.is_some(),
+            rt.dlp.as_ref().is_some_and(|d| d.reversible()),
+            rt.dlp.as_ref().is_some_and(|d| d.scan_response()),
+        );
+    if sse_stream || whole_stream {
         strip_hop_by_hop(&mut resp_parts.headers);
-        resp_parts.headers.remove(header::CONTENT_LENGTH);
+        if sse_stream {
+            resp_parts.headers.remove(header::CONTENT_LENGTH);
+        }
         let header_egress = header_bytes(&resp_parts.headers);
         // LLM metering on the streamed path: capture the stream tail so the terminal `usage` frame
         // can be parsed when the body finishes (see `CountingBody`'s `Drop`). The L1 budget
@@ -1208,15 +1391,29 @@ async fn handle_inner(
             map: std::mem::take(&mut mask_map),
             carry: Vec::new(),
         });
-        let body = Body::new(CountingBody::new(
-            resp_body,
-            Arc::clone(m),
-            ingress_bytes,
-            header_egress,
-            llm_meter,
-            dlp_scanner,
-            unmasker,
-        ));
+        let body = if whole_stream && rt.max_response_body > 0 {
+            // Over the cap, `Limited` errors the stream and the connection is cut: the headers are
+            // already out, so a short body is the only signal left to give.
+            Body::new(CountingBody::new(
+                Limited::new(resp_body, rt.max_response_body),
+                Arc::clone(m),
+                Arc::clone(&ingress),
+                header_egress,
+                llm_meter,
+                dlp_scanner,
+                unmasker,
+            ))
+        } else {
+            Body::new(CountingBody::new(
+                resp_body,
+                Arc::clone(m),
+                Arc::clone(&ingress),
+                header_egress,
+                llm_meter,
+                dlp_scanner,
+                unmasker,
+            ))
+        };
         let mut response = Response::from_parts(resp_parts, body);
         harden_response(&rt.cfg, &mut response);
         // CORS decoration happens centrally in `handle` (covers this and every error path).
@@ -1300,7 +1497,7 @@ async fn handle_inner(
     // Managed-mode usage: this is the proxied path, where both bodies are buffered, so the byte
     // counts are exact. (`add_usage_request` is recorded for every request in `finish`.)
     m.add_usage_bytes(
-        ingress_bytes,
+        ingress.load(std::sync::atomic::Ordering::Relaxed),
         header_bytes(&resp_parts.headers).saturating_add(resp_bytes.len()),
     );
 
@@ -1439,6 +1636,157 @@ async fn handle_inner(
     finish(m, &rid, &method, &path, ip, started, "ok", response)
 }
 
+/// Whether a request body may stream to the upstream when `validation.stream_requests` is on: only
+/// when nothing reads the whole body before it is forwarded. One argument per reader, as in
+/// [`streams_any_response`]:
+///
+/// * `waf_reads_body` — a WAF rule targets the body ([`WafEngine::needs_body`]);
+/// * `dlp_scans_request` — inbound DLP judges and may rewrite the body;
+/// * `llm_reads_body` — `[llm]` metering, the virtual-key vault and budgets parse the model (and
+///   `max_tokens`) out of the body before forwarding.
+pub(crate) fn streams_request(
+    enabled: bool,
+    waf_reads_body: bool,
+    dlp_scans_request: bool,
+    llm_reads_body: bool,
+) -> bool {
+    enabled && !waf_reads_body && !dlp_scans_request && !llm_reads_body
+}
+
+/// A request body forwarded as it arrives: capped at `max_body` (via [`Limited`]), counted into the
+/// shared ingress total, and flagging when the cap cut it so the caller can answer 413. A windowed
+/// body (`[[validation.stream_inspect]]`) first sends its already-inspected window, then runs every
+/// later frame through a [`TailInspector`](crate::stream_inspect::TailInspector) and cuts the
+/// upload on a block, flagging it so the caller answers 403.
+struct StreamedRequestBody {
+    inner: Limited<Body>,
+    ingress: Arc<std::sync::atomic::AtomicUsize>,
+    cut: Arc<std::sync::atomic::AtomicBool>,
+    head: Option<Bytes>,
+    tail: Option<crate::stream_inspect::TailInspector>,
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The error a windowed body ends with when its tail inspector blocks it.
+#[derive(Debug)]
+struct InspectionBlocked;
+
+impl std::fmt::Display for InspectionBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body blocked by inspection")
+    }
+}
+
+impl std::error::Error for InspectionBlocked {}
+
+impl StreamedRequestBody {
+    fn new(inner: Body, max: usize, ingress: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            inner: Limited::new(inner, max),
+            ingress,
+            cut: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            head: None,
+            tail: None,
+            blocked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// `head` was read, counted and inspected already; the cap on `rest` is what `max` leaves.
+    fn windowed(
+        head: Bytes,
+        rest: Body,
+        max: usize,
+        ingress: Arc<std::sync::atomic::AtomicUsize>,
+        tail: crate::stream_inspect::TailInspector,
+    ) -> Self {
+        let mut body = Self::new(rest, max.saturating_sub(head.len()), ingress);
+        body.head = Some(head);
+        body.tail = Some(tail);
+        body
+    }
+
+    /// Set once the body went past its cap.
+    fn cut_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.cut)
+    }
+
+    /// Set once the tail inspector blocked the body.
+    fn blocked_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.blocked)
+    }
+}
+
+impl HttpBody for StreamedRequestBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.as_mut().get_mut();
+        if let Some(head) = this.head.take() {
+            return Poll::Ready(Some(Ok(Frame::data(head))));
+        }
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.ingress
+                        .fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+                    if let Some(tail) = this.tail.as_mut() {
+                        if tail.check(data) == crate::stream_inspect::Verdict::Block {
+                            this.blocked
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            this.tail = None;
+                            return Poll::Ready(Some(Err(Box::new(InspectionBlocked))));
+                        }
+                    }
+                }
+            }
+            Poll::Ready(Some(Err(e))) if e.is::<http_body_util::LengthLimitError>() => {
+                this.cut.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.head.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let mut hint = self.inner.size_hint();
+        if let Some(head) = &self.head {
+            // Upper first: `set_lower` asserts lower <= upper.
+            let n = head.len() as u64;
+            if let Some(upper) = hint.upper() {
+                hint.set_upper(upper + n);
+            }
+            hint.set_lower(hint.lower() + n);
+        }
+        hint
+    }
+}
+
+/// Whether a response may stream when `validation.stream_responses` is on: only when nothing on
+/// the request needs the *whole* body. Each feature that reads the full response is one argument
+/// here, so adding such a feature means adding it to this list — and to its test — rather than
+/// silently reading half a body.
+///
+/// * `llm_route` — buffered LLM metering parses the upstream's `usage` object out of the full JSON;
+/// * `reversible_dlp` — unmasking restores placeholders across the whole body;
+/// * `dlp_scans_response` — outbound DLP judges (and may withhold or rewrite) the whole body.
+pub(crate) fn streams_any_response(
+    enabled: bool,
+    llm_route: bool,
+    reversible_dlp: bool,
+    dlp_scans_response: bool,
+) -> bool {
+    enabled && !llm_route && !reversible_dlp && !dlp_scans_response
+}
+
 /// Readiness probe. Returns `200` only if the upstream accepts a TCP connection, so a
 /// platform's readiness check reflects whether EdgeGuard can actually serve traffic — not
 /// merely that the process booted. `503` while the upstream is unreachable. (Liveness, i.e.
@@ -1478,7 +1826,22 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response<Body> {
 pub async fn tls_status(State(state): State<AppState>) -> Response<Body> {
     match state.metrics.cert_store() {
         Some(store) => {
-            let mut resp = Response::new(Body::from(store.status_json().to_string()));
+            let mut status = store.status_json();
+            // Extra `[[tls.certs]]` pairs, each with the hosts it is served for. Absent (not an
+            // empty list) when there are none, so a single-certificate edge reads as it did in 0.5.0.
+            let sni = state.metrics.sni_certs();
+            if !sni.is_empty() {
+                status["sni"] = serde_json::Value::Array(
+                    sni.iter()
+                        .map(|c| {
+                            let mut j = c.store.status_json();
+                            j["hosts"] = serde_json::json!(c.hosts);
+                            j
+                        })
+                        .collect(),
+                );
+            }
+            let mut resp = Response::new(Body::from(status.to_string()));
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
@@ -1668,7 +2031,7 @@ async fn proxy_upgrade(
             headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), v);
         }
     }
-    let upstream_req = match up.body(Full::new(Bytes::new())) {
+    let upstream_req = match up.body(Body::empty()) {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "failed to build upstream upgrade request");
@@ -1817,7 +2180,9 @@ async fn proxy_upgrade(
 struct CountingBody<B> {
     inner: B,
     metrics: Arc<Metrics>,
-    ingress: usize,
+    /// Request (ingress) bytes, read when the response finishes: a streamed request body may still
+    /// be counting while the response starts.
+    ingress: Arc<std::sync::atomic::AtomicUsize>,
     /// Running egress total: response header bytes, then each data frame as it passes.
     egress: usize,
     /// LLM token metering for a streamed response, when `[llm]` is on and this is an LLM request.
@@ -1997,7 +2362,7 @@ impl<B> CountingBody<B> {
     fn new(
         inner: B,
         metrics: Arc<Metrics>,
-        ingress: usize,
+        ingress: Arc<std::sync::atomic::AtomicUsize>,
         header_egress: usize,
         llm: Option<LlmStreamMeter>,
         dlp: Option<DlpStreamScanner>,
@@ -2165,7 +2530,10 @@ where
 
 impl<B> Drop for CountingBody<B> {
     fn drop(&mut self) {
-        self.metrics.add_usage_bytes(self.ingress, self.egress);
+        self.metrics.add_usage_bytes(
+            self.ingress.load(std::sync::atomic::Ordering::Relaxed),
+            self.egress,
+        );
         // LLM metering for the streamed body: parse the terminal `usage` frame from the tail. The
         // client gets usage only if it sent `stream_options.include_usage`; otherwise `no_usage`.
         if let Some(meter) = self.llm.as_mut() {
@@ -2623,6 +2991,42 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every feature that reads the whole response forces buffering on its own; with none of
+    /// them, the switch decides.
+    /// Every reader of the request body forces buffering on its own.
+    #[test]
+    fn a_request_streams_only_when_nothing_reads_its_body() {
+        assert!(streams_request(true, false, false, false));
+        assert!(
+            !streams_request(false, false, false, false),
+            "off by default"
+        );
+        assert!(!streams_request(true, true, false, false), "WAF body rule");
+        assert!(!streams_request(true, false, true, false), "inbound DLP");
+        assert!(!streams_request(true, false, false, true), "LLM features");
+    }
+
+    #[test]
+    fn a_response_streams_only_when_nothing_needs_the_whole_body() {
+        assert!(streams_any_response(true, false, false, false));
+        assert!(
+            !streams_any_response(false, false, false, false),
+            "off by default"
+        );
+        assert!(
+            !streams_any_response(true, true, false, false),
+            "LLM metering"
+        );
+        assert!(
+            !streams_any_response(true, false, true, false),
+            "reversible DLP"
+        );
+        assert!(
+            !streams_any_response(true, false, false, true),
+            "outbound DLP"
+        );
+    }
 
     fn headers_with(name: &'static str, value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();

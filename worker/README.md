@@ -98,7 +98,13 @@ cargo test          # native target: header set, auth decisions, cookie hardenin
 
 This crate is a **detached workspace** (note the empty `[workspace]` in `Cargo.toml`): it targets
 wasm and depends on the Cloudflare `worker` runtime, so it is intentionally excluded from the
-the parent workspace's native build and from this crate's CI. Build it only with `worker-build` / `wrangler`.
+parent workspace's native build. Build it only with `worker-build` / `wrangler`.
+
+CI runs `scripts/worker-check.sh` (from the crate root) on every change here: native tests, then
+`worker-build --release` from the committed `Cargo.lock`, then the bundle served on workerd with
+`wrangler dev --local` in front of a local origin, checking the same `401`/`401`/`200` and headers
+as the manual proof below. Run it yourself from the crate root (the parent of this directory) with
+`bash scripts/worker-check.sh`.
 
 ## Reproducing the proof
 

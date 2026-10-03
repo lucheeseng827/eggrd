@@ -55,7 +55,7 @@ section used to overstate it.
 | Certificate rotation | **proven** | A live TLS listener swapped certificates under concurrent traffic with zero failed requests, and new handshakes presented the new certificate. The file watcher picked up an atomic replace and a Kubernetes-style `..data` symlink flip; a certificate written without its key was refused while the old pair kept serving. The binary, started on an expired self-signed certificate, renewed it at boot with the same key. |
 | ACME renewal | **proven against Pebble** | Issued against Pebble, then renewed while the redirect listener held `:80` and answered the challenge from the shared token map; the live listener swapped to the renewed certificate with no restart. Runs in CI on every change (`scripts/acme-pebble-test.sh`), which fails if a test skipped instead of running. Not yet run against Let's Encrypt itself. |
 | ACME issuance | **proven, and it was broken** | Not "untested and probably fine" — a two-year-old client could no longer read the CA's replies. Found by running it, fixed, and it now issues in about five seconds against Let's Encrypt staging. |
-| WASM edge worker | **runs, not deployed** | Builds a deployable bundle and serves requests on **workerd**, the runtime Cloudflare runs in production: 401 unauthenticated, 200 from the origin with all six hardening headers. It has *not* been deployed to a Cloudflare account, so routes, custom domains and secret bindings remain untested. |
+| WASM edge worker | **runs, not deployed** | Builds a deployable bundle and serves requests on **workerd**, the runtime Cloudflare runs in production: 401 unauthenticated, 200 from the origin with all six hardening headers. CI rebuilds and re-checks it on every change to `worker/`. It has *not* been deployed to a Cloudflare account, so routes, custom domains and secret bindings remain untested. |
 
 The [revision block on the site](https://eggrd.dev/#revisions) carries the same list with the
 evidence attached. A row goes green there only after something has been run; nothing is marked
@@ -134,6 +134,14 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
   forward `text/event-stream` (SSE) responses **unbuffered, frame-by-frame** — so EdgeGuard fronts
   **streaming LLM backends** (OpenAI-compatible token streams) and any SSE app without collapsing
   time-to-first-byte. Egress bytes are still counted as frames flow.
+- **Streamed responses of any type** (`validation.stream_responses`, off by default): downloads
+  and large bodies are forwarded as they arrive instead of held in memory, whenever nothing on the
+  request needs the whole body. LLM metering and response-side DLP still buffer. `max_response_body`
+  is still enforced, as the bytes flow. `validation.stream_requests` does the same for uploads,
+  unless a WAF body rule, inbound DLP or an LLM feature needs to read them; `max_body` still holds.
+  A route listed under `[[validation.stream_inspect]]` streams past the WAF and DLP anyway: they
+  inspect a bounded window, then each later frame. This is weaker than whole-body inspection and
+  documented as such in `docs/CONFIG.md`.
 - **WebSocket / `Upgrade` passthrough** (`validation.websocket_passthrough`, off by default):
   forward an authenticated, rate-limited upgrade request intact and splice the connections into a
   raw bidirectional tunnel on the upstream's `101` — so EdgeGuard fronts WebSocket apps (chat,
@@ -322,6 +330,12 @@ Next steps:
      ...
 ```
 
+- **OTLP metrics** (`[metrics.otlp]`, off by default): every metric `/__edgeguard/metrics` serves —
+  requests, latency histogram, LLM, DLP, certificates — pushed to an OTLP/HTTP `/v1/metrics`
+  collector on an interval, for pipelines that collect with OpenTelemetry instead of scraping.
+  Converted from the Prometheus exposition itself, so the two always agree and a new metric needs
+  no second change: counters become cumulative Sums, gauges Gauges, the histogram a Histogram.
+  Like `[tracing]`, edge-local: a policy pushed by a control plane cannot repoint it.
 - **`edgeguard.toml`** — the annotated, secure-by-default config reference (the *same* one
   documented below, embedded into the binary so it can't drift).
 - **`Dockerfile.edgeguard`** — a wrap-your-app Dockerfile that copies the `edgeguard` binary from
@@ -771,6 +785,19 @@ The running proxy **renews** the certificate once two-thirds of its lifetime has
 `tls.redirect_port = 80` the redirect listener answers the renewal's HTTP-01 challenge itself, so
 nothing else has to free the port. A failed renewal keeps serving the current certificate and
 retries (5 minutes, doubling to 12 hours), leaving a month of attempts before anything expires.
+If the CA publishes renewal windows (ACME Renewal Information, RFC 9773; Let's Encrypt does), the
+proxy also asks it, so a CA that needs certificates replaced early, after an incident, gets them
+replaced early. Its window can only bring renewal forward, never push it past two-thirds
+(`tls.acme.ari`, on by default).
+
+**DNS-01 and wildcards.** With `tls.acme.challenge = "dns-01"` the order proves control by
+publishing a `_acme-challenge` TXT record instead of answering on port 80, which is the only way to
+get a wildcard (`*.example.com`) and works for hosts the CA cannot reach. Records are published
+through `[tls.acme.dns]` (**Cloudflare**: a zone id and an API token scoped to `Zone.DNS:Edit` on
+that zone, read from `$CLOUDFLARE_API_TOKEN` and never from the config file), and removed after the
+order whatever its outcome. `propagation_secs` (default 30) is the wait before the CA looks.
+Renewal uses the same challenge. `edgeguard doctor` reports a wildcard over HTTP-01, a missing
+provider or zone, and an unset token variable before any order is sent.
 
 > ⚠️ ACME requires a real public domain and inbound port 80, so it can't be exercised by the
 > default in-process test suite. Issuance and renewal are proven against **Pebble**, a real test
@@ -791,10 +818,34 @@ taken at boot:
 - **Renewed in-process.** ACME and self-signed certificates are renewed at two-thirds of their
   lifetime, as above. A file you provide is never overwritten by renewal.
 - **Visible.** `GET /__edgeguard/tls` (on the admin port in split mode) reports the source, serial,
-  validity, days left and the last renewal attempt with its error. `/__edgeguard/metrics` carries
+  validity, days left, the CA's suggested renewal point when it gives one (`ari_renew_at`), and the
+  last renewal attempt with its error. `/__edgeguard/metrics` carries
   `edgeguard_tls_cert_not_after_seconds`, `…_reloads_total` and `…_renewals_total`, and
   `monitoring/` ships expiry alerts and dashboard panels for them. `edgeguard doctor` reports the
   days left on the certificate at `cert_path`.
+
+#### Several certificates on one listener (SNI)
+
+Serve more than one certificate from the same port, chosen by the hostname the client asks for:
+
+```toml
+[[tls.certs]]
+cert_path = "/etc/eggrd/api.crt"
+key_path  = "/etc/eggrd/api.key"
+hosts     = ["api.example.com"]
+
+[[tls.certs]]
+cert_path = "/etc/eggrd/wildcard.crt"
+key_path  = "/etc/eggrd/wildcard.key"
+hosts     = ["*.example.org", "example.org"]
+```
+
+An exact name wins over a wildcard; `*.example.org` covers one label (`a.example.org`, not the apex
+or `a.b.example.org`). Any other name — and a client that sends none — gets the `[tls]` pair, which
+can still be self-signed or ACME. Each extra pair is watched, reloaded and swapped on its own, warned
+about as it nears expiry, and reported in `GET /__edgeguard/tls` (`sni`) and in the expiry metrics
+with a `cert="<first host>"` label. Nothing here renews the extra pairs: provide them from
+cert-manager, certbot or similar. `edgeguard doctor` checks their `hosts` and expiry.
 
 For several replicas sharing one certificate, let **one** process renew (or an external tool) and
 point the rest at the same files with `acme.renew = false` / `self_signed_renew = false`: they
@@ -1056,6 +1107,39 @@ deny  = ["198.51.100.0/24"]             # always rejected — wins over allow
 the **resolved** client IP — the same one rate limiting uses — so behind a trusted proxy set
 `server.trust_forwarded_for = true` for this to see the real client rather than the proxy. A bad
 CIDR fails at startup/reload.
+
+## Streaming
+
+By default EdgeGuard reads a whole request before forwarding it and a whole response before
+returning it, so it can cap sizes, inspect bodies and count bytes exactly. Large uploads and
+downloads then sit in memory, and a client sees nothing until the upstream has finished. Three
+switches change that, each off by default:
+
+```toml
+[validation]
+stream_passthrough = true   # text/event-stream (SSE, LLM token streams), frame by frame
+stream_responses = true     # every other response type
+stream_requests = true      # uploads
+```
+
+A body only streams when nothing on that request needs all of it. The WAF reading bodies, edge DLP
+and the LLM features (metering, key vault, budgets) keep their bodies buffered, so turning
+streaming on never silently weakens a check. `docs/CONFIG.md` has the full table of what streams
+and what buffers.
+
+The size caps still hold on a stream, enforced as the bytes flow. Because the status line has
+already been sent, going over a cap looks different:
+
+* **Upload over `max_body`.** A declared `Content-Length` over the cap is refused with `413`
+  before anything is sent. A body that grows past it is cut and the client gets `413`, but the
+  upstream has already seen the start of it.
+* **Response over `max_response_body`.** The connection is cut and the client sees a short body.
+  The upstream's `Content-Length` is kept, so a client can tell it was cut.
+
+To stream uploads on routes where the WAF or DLP reads the body, list those routes under
+`[[validation.stream_inspect]]`. The first `window` bytes are inspected before anything is
+forwarded, and every later chunk is scanned as it passes. This is weaker than inspecting the whole
+body, and `docs/CONFIG.md` says exactly how.
 
 ## WebSocket passthrough
 

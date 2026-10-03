@@ -1,0 +1,59 @@
+name: Bug report
+description: EdgeGuard did something it should not, or did not do something it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security issues do not go here.** A vulnerability reported in a public issue is disclosed
+        to everyone at once. Use [private vulnerability reporting](https://github.com/lucheeseng827/eggrd/security/advisories/new) instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `edgeguard --version`, or the image tag / commit.
+      placeholder: eggrd 0.5.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: How it runs
+      options:
+        - Binary on Linux
+        - Binary on macOS
+        - Binary on Windows
+        - Docker image
+        - Cloudflare Worker (worker/)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, including the status code and any log line.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: |
+        The smallest `edgeguard.toml` and request (a `curl` line is ideal) that show it.
+        Remove secrets first: API keys, passwords, tokens, private hostnames.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log output, with secrets removed.
+      render: text

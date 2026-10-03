@@ -105,6 +105,11 @@ impl Gcra {
             .saturating_sub(self.tolerance)
     }
 
+    /// The burst: how many admissions a fresh bucket allows (`tolerance / emission_interval`).
+    pub fn burst(&self) -> u64 {
+        self.tolerance / self.emission_interval.max(1)
+    }
+
     /// How many more admissions the bucket currently allows, for reporting.
     ///
     /// Derived rather than stored: `tolerance / emission_interval` is the burst, and the distance
@@ -112,7 +117,7 @@ impl Gcra {
     /// `remaining`/`consumed_ratio` metrics, so an operator sees the budget draining before it is
     /// gone rather than after.
     pub fn remaining(&self, stored_tat: Option<u64>, now: u64) -> u64 {
-        let burst = self.tolerance / self.emission_interval.max(1);
+        let burst = self.burst();
         let tat = stored_tat.unwrap_or(now).max(now);
         let spent = (tat - now) / self.emission_interval.max(1);
         burst.saturating_sub(spent)
@@ -569,6 +574,8 @@ mod tests {
     //
     //   docker run --rm -p 6379:6379 redis:7-alpine
     //   cargo test -p eggrd --lib redis_ -- --ignored
+    //
+    // CI runs all three live tests via scripts/redis-live-test.sh, which also fails if any skipped.
     //
     // `EDGEGUARD_TEST_REDIS_URL` overrides the default `redis://127.0.0.1:6379`. Each test uses a
     // unique key prefix so reruns don't inherit a stale GCRA state, and skips cleanly (no failure)

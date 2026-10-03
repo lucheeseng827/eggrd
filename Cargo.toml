@@ -106,7 +106,7 @@ tower-http = { version = "0.6", features = ["compression-gzip"] }
 # (`ring` => hyper-rustls?/ring + rcgen/ring); `hyper-rustls` is re-listed because it is a
 # default we still need for the ACME HTTP client. hyper-rustls and rustls-platform-verifier
 # come in transitively from here and need no entry of their own — this covers both.
-instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls"] }
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "time"] }
 # Self-signed certificate generation for `[tls] self_signed` / `edgeguard cert`, so TLS can be
 # turned on without obtaining a certificate first. The 0.3.0 notes say rcgen was "dropped" — true
 # of DIRECT use (instant-acme 0.8 builds its own key and CSR in `finalize()`), but instant-acme
@@ -185,7 +185,8 @@ harness = false
 # One consequence worth knowing: `[profile.bench]` inherits `[profile.release]`, so running the
 # three benches above from the monorepo root measures `opt-level = "z"` + fat LTO — a configuration
 # nothing ships. Bench from a standalone cut (or the mirror) for numbers that describe the real
-# binary. No CI does this: no workflow runs `cargo bench`. Unlike `panic`, `opt-level` IS legal in a
+# binary — which is what CI's benchmark gate does: it benches a standalone cut of the PR's merge base
+# and head in one job and fails on a regression. Unlike `panic`, `opt-level` IS legal in a
 # `[profile.release.package.eggrd]` override at the monorepo root if the workspace-build gap ever
 # needs closing — though `lto` is not, so that would only narrow the difference, not remove it.
 [profile.release]

@@ -149,7 +149,48 @@ fn lint_ratelimit(cfg: &Config, f: &mut Vec<Finding>) {
     }
 }
 
+/// `[tls.acme]` challenge settings that would fail an order: an unknown challenge, a wildcard over
+/// HTTP-01 (the CA cannot validate it), and a DNS-01 provider that cannot be built — no provider,
+/// no zone, or its token's environment variable unset. Checked against this process's
+/// environment, so run `doctor` where the proxy runs.
+fn lint_acme_challenge(cfg: &Config, f: &mut Vec<Finding>) {
+    let acme = &cfg.tls.acme;
+    if !acme.enabled {
+        return;
+    }
+    let dns01 = match acme.challenge.as_str() {
+        "http-01" | "" => false,
+        "dns-01" => true,
+        other => {
+            f.push(Finding::error(format!(
+                "tls.acme.challenge = {other:?} is not supported; use \"http-01\" or \"dns-01\""
+            )));
+            return;
+        }
+    };
+    for d in acme.domains.iter().filter(|d| d.trim().starts_with("*.")) {
+        if !dns01 {
+            f.push(Finding::error(format!(
+                "{d} is a wildcard; the CA only validates wildcards over DNS. Set \
+                 tls.acme.challenge = \"dns-01\" and configure [tls.acme.dns]."
+            )));
+        }
+    }
+    if dns01 {
+        if let Err(e) = crate::acme_dns::DnsProvider::from_cfg(&acme.dns) {
+            f.push(Finding::error(format!("{e:#}")));
+        }
+        if acme.dns.provider == "challtestsrv" {
+            f.push(Finding::warn(
+                "tls.acme.dns.provider = \"challtestsrv\" is Pebble's test DNS server; it cannot \
+                 publish records a real CA will see.",
+            ));
+        }
+    }
+}
+
 fn lint_tls(cfg: &Config, f: &mut Vec<Finding>) {
+    lint_acme_challenge(cfg, f);
     if !cfg.tls.enabled {
         f.push(Finding::info(
             "tls.enabled = false: EdgeGuard serves plain HTTP. Fine when your platform terminates \
@@ -267,6 +308,36 @@ fn lint_cert_expiry(cfg: &Config, f: &mut Vec<Finding>) {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     f.extend(cert_expiry_findings(&cfg.tls.cert_path, &info, plan, now));
+    // Extra `[[tls.certs]]` pairs: host patterns that would fail startup, and expiry. Nothing here
+    // renews them, so they get the "nothing renews it" thresholds.
+    for c in &cfg.tls.certs {
+        if c.hosts.is_empty() {
+            f.push(Finding::error(format!(
+                "[[tls.certs]] {}: `hosts` is empty; list the names this certificate is served for",
+                c.cert_path
+            )));
+        }
+        for h in &c.hosts {
+            if let Err(e) = crate::certstore::parse_sni_host(h) {
+                f.push(Finding::error(format!("{e:#}")));
+            }
+        }
+        let Ok(certs) = crate::tls::load_certs(&c.cert_path) else {
+            f.push(Finding::error(format!(
+                "[[tls.certs]] {}: the certificate cannot be read; the proxy will not start",
+                c.cert_path
+            )));
+            continue;
+        };
+        if let Ok(info) = crate::certstore::CertInfo::from_der(&certs[0]) {
+            f.extend(cert_expiry_findings(
+                &c.cert_path,
+                &info,
+                crate::certstore::RenewPlan::None,
+                now,
+            ));
+        }
+    }
     if cfg.tls.acme.enabled && !cfg.tls.acme.renew {
         f.push(Finding::warn(
             "tls.acme.renew = false: the ACME certificate is issued once and never renewed, so it \
@@ -553,6 +624,157 @@ mod tests {
         std::env::remove_var("EDGEGUARD_JWT_SECRET");
     }
 
+    /// An expired certificate written to a temp dir; returns (dir, cert path, key path).
+    fn expired_pair(tag: &str) -> (std::path::PathBuf, String, String) {
+        let dir = std::env::temp_dir().join(format!("eg-doctor-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(100);
+        params.not_after = time::OffsetDateTime::now_utc() - time::Duration::days(10);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let (c, k) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&c, cert.pem()).unwrap();
+        std::fs::write(&k, key.serialize_pem()).unwrap();
+        let s = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+        (dir, s(c), s(k))
+    }
+
+    fn has(f: &[Finding], needle: &str) -> bool {
+        f.iter().any(|x| x.message.contains(needle))
+    }
+
+    /// `lint` reads the certificate on disk — but only when TLS is on and a path is set.
+    #[test]
+    fn lint_reports_an_expired_certificate_on_disk_only_when_tls_serves_it() {
+        let (dir, cert, key) = expired_pair("lint");
+        let mut cfg = Config::default();
+        cfg.tls.cert_path = cert.clone();
+        cfg.tls.key_path = key;
+
+        cfg.tls.enabled = false;
+        assert!(
+            !has(&lint(&cfg), "has expired"),
+            "TLS off: the file is not served"
+        );
+
+        cfg.tls.enabled = true;
+        let f = lint(&cfg);
+        assert!(
+            f.iter()
+                .any(|x| x.level == Level::Error && x.message.contains("has expired")),
+            "{:?}",
+            f.iter().map(|x| &x.message).collect::<Vec<_>>()
+        );
+
+        cfg.tls.cert_path = String::new();
+        assert!(!has(&lint(&cfg), "has expired"), "no path: nothing to read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `[[tls.certs]]` mistakes that would stop the proxy at startup are errors here first.
+    #[test]
+    fn sni_certificates_with_bad_hosts_or_unreadable_files_are_errors() {
+        let (dir, cert, key) = expired_pair("sni");
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.cert_path = cert.clone();
+        cfg.tls.key_path = key.clone();
+        let sni = |hosts: &[&str], path: &str| crate::config::SniCertCfg {
+            cert_path: path.to_string(),
+            key_path: key.clone(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        };
+        let errors = |cfg: &Config| {
+            lint(cfg)
+                .into_iter()
+                .filter(|x| x.level == Level::Error && x.message.contains("tls.certs"))
+                .count()
+        };
+        cfg.tls.certs = vec![sni(&["api.example.com", "*.example.org"], &cert)];
+        assert_eq!(errors(&cfg), 0);
+        cfg.tls.certs = vec![sni(&[], &cert)];
+        assert_eq!(errors(&cfg), 1, "empty hosts");
+        cfg.tls.certs = vec![sni(&["a.*.example.com"], &cert)];
+        assert_eq!(errors(&cfg), 1, "wildcard not in the first label");
+        cfg.tls.certs = vec![sni(&["api.example.com"], "/nonexistent/cert.pem")];
+        assert_eq!(errors(&cfg), 1, "unreadable certificate");
+        // An extra pair's expiry is reported like the default one's.
+        cfg.tls.certs = vec![sni(&["api.example.com"], &cert)];
+        let expired = lint(&cfg)
+            .into_iter()
+            .filter(|x| x.message.contains("has expired"))
+            .count();
+        assert_eq!(expired, 2, "the default pair and the extra one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acme_challenge_settings_that_would_fail_an_order_are_errors() {
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.acme.enabled = true;
+        cfg.tls.acme.domains = vec!["*.example.com".into()];
+        let errors = |cfg: &Config| -> Vec<String> {
+            lint(cfg)
+                .into_iter()
+                .filter(|x| x.level == Level::Error)
+                .map(|x| x.message)
+                .collect()
+        };
+        assert!(
+            errors(&cfg).iter().any(|m| m.contains("wildcard")),
+            "wildcard over http-01"
+        );
+        cfg.tls.acme.challenge = "dns-01".into();
+        assert!(
+            errors(&cfg).iter().any(|m| m.contains("provider")),
+            "dns-01 with no provider"
+        );
+        cfg.tls.acme.dns.provider = "cloudflare".into();
+        cfg.tls.acme.dns.zone_id = "zone".into();
+        cfg.tls.acme.dns.api_token_env = "EG_DOCTOR_TOKEN_UNSET_NEVER".into();
+        assert!(
+            errors(&cfg)
+                .iter()
+                .any(|m| m.contains("$EG_DOCTOR_TOKEN_UNSET_NEVER")),
+            "token variable unset"
+        );
+        std::env::set_var("EG_DOCTOR_TOKEN_SET", "t");
+        cfg.tls.acme.dns.api_token_env = "EG_DOCTOR_TOKEN_SET".into();
+        assert!(
+            !errors(&cfg)
+                .iter()
+                .any(|m| m.contains("tls.acme") || m.contains("wildcard")),
+            "{:?}",
+            errors(&cfg)
+        );
+        cfg.tls.acme.challenge = "tls-alpn-01".into();
+        assert!(errors(&cfg).iter().any(|m| m.contains("tls-alpn-01")));
+    }
+
+    #[test]
+    fn acme_without_renewal_is_warned_about() {
+        let (dir, cert, key) = expired_pair("acme");
+        let mut cfg = Config::default();
+        cfg.tls.enabled = true;
+        cfg.tls.cert_path = cert;
+        cfg.tls.key_path = key;
+        cfg.tls.acme.enabled = true;
+        cfg.tls.acme.domains = vec!["example.com".into()];
+
+        cfg.tls.acme.renew = true;
+        assert!(!has(&lint(&cfg), "tls.acme.renew = false"));
+        cfg.tls.acme.renew = false;
+        assert!(has(&lint(&cfg), "tls.acme.renew = false"));
+        cfg.tls.acme.enabled = false;
+        assert!(
+            !has(&lint(&cfg), "tls.acme.renew = false"),
+            "ACME off: nothing to renew"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn certificate_expiry_thresholds_depend_on_whether_anything_renews() {
         use crate::certstore::{CertInfo, RenewPlan};
@@ -563,6 +785,7 @@ mod tests {
             not_after: now + days_left * day,
             serial: "01".into(),
             self_issued: true,
+            ari_id: None,
         };
         let levels = |days_left, plan| {
             cert_expiry_findings("c.pem", &cert(days_left), plan, now)

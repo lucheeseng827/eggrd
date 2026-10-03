@@ -54,12 +54,20 @@ pub fn load_server_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerC
 /// Every new handshake asks the store for the current certificate, so swapping the store's pair
 /// takes effect on the next connection with no restart and no dropped connections.
 pub fn server_config(store: Arc<crate::certstore::CertStore>) -> Result<Arc<ServerConfig>> {
+    server_config_with(store)
+}
+
+/// [`server_config`] around any certificate resolver — a single [`CertStore`](crate::certstore::CertStore)
+/// or an [`SniResolver`](crate::certstore::SniResolver) choosing between several by hostname.
+pub fn server_config_with(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+) -> Result<Arc<ServerConfig>> {
     let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .context("selecting TLS protocol versions")?
             .with_no_client_auth()
-            .with_cert_resolver(store);
+            .with_cert_resolver(resolver);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }

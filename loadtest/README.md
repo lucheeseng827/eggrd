@@ -70,6 +70,7 @@ whole run, so client-side (k6) and server-side (proxy) views can be correlated.
 | `ratelimit-redis` | `ratelimit`   | **live Redis** shared-store limiter (the Phase-4 ◐ item) |
 | `full`            | `saturation`  | realistic-policy ceiling + graceful degradation past it |
 | `full`            | `soak`        | endurance: memory/FD/latency drift; hot-reload under load |
+| `baseline`        | `smoke` (+ `--direct`) | a short fixed-rate run (`RATE`, `DURATION`; 300 req/s for 30 s by default): p99 and memory on every change, not capacity. CI runs it as an advisory check |
 
 The k6 scripts are scenario-aware where it matters (the WAF script mixes attack payloads and
 asserts 403s; the auth/saturation/soak scripts always send the API key, which auth=none ignores),

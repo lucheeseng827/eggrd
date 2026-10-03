@@ -11,6 +11,8 @@
 #   cargo build --release
 #   bash scripts/check-crypto-provider.sh
 #   bash scripts/acme-pebble-test.sh     # needs docker; see the acme-pebble job
+#   bash scripts/redis-live-test.sh      # needs docker or EDGEGUARD_TEST_REDIS_URL
+#   bash scripts/worker-check.sh         # needs node; builds worker/ and runs it on workerd
 name: CI
 
 on:
@@ -66,3 +68,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Issue and renew against Pebble
         run: bash scripts/acme-pebble-test.sh
+
+  # The Redis-backed rate limiter and LLM budget against a live Redis. #[ignore]d in the default
+  # suite; the script starts Redis under Docker and fails if a test skipped instead of running.
+  redis-live:
+    name: redis (live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Rate limiter and budget against Redis
+        run: bash scripts/redis-live-test.sh
+
+  # The Cloudflare Worker (worker/, a detached crate): build the deployable bundle with
+  # worker-build and serve it on workerd, the runtime Cloudflare runs, checking auth, forwarding
+  # and response hardening. Not a deploy: routes, domains and secret bindings need an account.
+  worker:
+    name: worker (workerd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: worker
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the bundle and run it on workerd
+        run: bash scripts/worker-check.sh

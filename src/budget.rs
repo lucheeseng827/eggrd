@@ -1037,6 +1037,8 @@ mod tests {
     //
     //   docker run --rm -p 6379:6379 redis:7-alpine
     //   cargo test -p eggrd --lib budget::tests::redis_ -- --ignored
+    //
+    // CI runs them via scripts/redis-live-test.sh, which also fails if one skipped.
 
     fn redis_url() -> String {
         std::env::var("EDGEGUARD_TEST_REDIS_URL")

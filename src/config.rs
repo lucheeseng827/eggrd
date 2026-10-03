@@ -43,6 +43,48 @@ pub struct Config {
     pub log: LogCfg,
     /// One OTLP SERVER span per proxied request. Off by default. See [`TracingCfg`].
     pub tracing: TracingCfg,
+    /// Metrics beyond the Prometheus endpoint. See [`MetricsCfg`].
+    pub metrics: MetricsCfg,
+}
+
+/// `[metrics]` — where metrics go besides `/__edgeguard/metrics`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MetricsCfg {
+    /// Push the same metrics to an OpenTelemetry collector. See [`OtlpMetricsCfg`].
+    pub otlp: OtlpMetricsCfg,
+}
+
+/// `[metrics.otlp]` — push every metric `/__edgeguard/metrics` serves to an OTLP/HTTP collector, as
+/// OTLP-JSON, on an interval. The Prometheus endpoint is unchanged; this is for setups that collect
+/// with an OpenTelemetry pipeline and do not scrape. Counters are cumulative, so a missed push
+/// loses resolution, never counts. Off by default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct OtlpMetricsCfg {
+    /// Push metrics to `endpoint`. Off by default.
+    pub enabled: bool,
+    /// OTLP/HTTP metrics endpoint, e.g. `http://otel-collector:4318/v1/metrics`. Empty disables
+    /// export regardless of `enabled`.
+    pub endpoint: String,
+    /// Seconds between pushes.
+    pub interval_secs: u64,
+    /// `service.name` on the exported resource.
+    pub service_name: String,
+    /// Per-push timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+impl Default for OtlpMetricsCfg {
+    fn default() -> Self {
+        OtlpMetricsCfg {
+            enabled: false,
+            endpoint: String::new(),
+            interval_secs: 60,
+            service_name: "edgeguard".into(),
+            timeout_ms: 5_000,
+        }
+    }
 }
 
 /// Outbound alerting (`[alerts]`). When `enabled` with a `webhook_url`, EdgeGuard POSTs a
@@ -485,6 +527,7 @@ pub struct ServerCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TracingCfg {
+    /// Emit a span per request to `endpoint`. Off by default.
     pub enabled: bool,
     /// OTLP/HTTP traces endpoint, e.g. `http://otel-collector:4318/v1/traces`. Empty disables
     /// tracing regardless of `enabled` — an endpoint-less "enabled" would mint trace ids on every
@@ -557,6 +600,7 @@ pub struct LogCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LogShipCfg {
+    /// Ship access-log records to `url`. Off by default.
     pub enabled: bool,
     /// Collector URL. Empty disables shipping regardless of `enabled`.
     pub url: String,
@@ -762,6 +806,35 @@ pub struct ValidationCfg {
     /// the body-read deadline don't apply (the connect/first-byte `upstream_timeout` still
     /// does); egress bytes are tallied as frames flow. Non-SSE responses are unaffected.
     pub stream_passthrough: bool,
+    /// Stream (don't buffer) responses of **any** content type when nothing on the request needs
+    /// the whole body: no LLM metering (`[llm]` route), no reversible DLP masking, and no outbound
+    /// DLP scan (`dlp.scan_response`). Those still buffer, whatever this says. Off by default for
+    /// now. When a response streams:
+    /// * `max_response_body` is enforced as the bytes flow — over the cap the connection is cut
+    ///   (the status and headers were already sent, so there is no clean 502 to give);
+    /// * the body-read part of `upstream_timeout` does not apply (time-to-headers still does);
+    /// * an upstream error mid-body truncates the response instead of becoming a 502;
+    /// * egress bytes are counted per frame, as for SSE.
+    ///
+    /// `text/event-stream` keeps its own switch, `stream_passthrough`.
+    pub stream_responses: bool,
+    /// Stream (don't buffer) **request** bodies to the upstream when nothing needs the whole body:
+    /// no WAF rule inspects the body, inbound DLP is off (`dlp.scan_request`), and no LLM feature
+    /// reads it (`[llm]`, the virtual-key vault and budgets parse the model from the body). Those
+    /// still buffer, whatever this says. Off by default for now. When a request streams:
+    /// * `max_body` still holds. A `Content-Length` over it gets `413` before anything is sent
+    ///   upstream; a body without one that grows past it is cut, and the client gets `413` too —
+    ///   but the upstream has already seen the start of it, so it must tolerate an aborted upload;
+    /// * ingress bytes are counted as the body flows.
+    pub stream_requests: bool,
+    /// Routes (by path prefix) whose request body may stream **and still be inspected**, on a
+    /// bounded window rather than the whole body. Only takes effect with `stream_requests` on.
+    /// Without an entry, a WAF body rule or inbound DLP forces the request to buffer; with one, the
+    /// first `window` bytes are inspected before anything is sent upstream and the rest is
+    /// scanned frame by frame with `overlap` bytes carried between frames. Weaker than whole-body
+    /// inspection — see [`StreamInspectCfg`]. Inbound DLP in `redact` mode and LLM routes still
+    /// buffer, whatever this says.
+    pub stream_inspect: Vec<StreamInspectCfg>,
     /// Tunnel WebSocket (and other `Upgrade`) connections through to the upstream. Off by
     /// default: the normal path strips the hop-by-hop `Upgrade`/`Connection` headers, so an
     /// upgrade request would be forwarded as a plain HTTP request and the handshake would fail.
@@ -878,6 +951,37 @@ impl Default for RateLimitCfg {
     }
 }
 
+/// One `[[validation.stream_inspect]]` route: a streamed request body inspected on a bounded
+/// window (0.6.0, A3). What it does NOT catch, compared with buffering the whole body:
+///
+/// * a match that starts in one frame and ends in a later one is only caught when it fits in
+///   `overlap` bytes (the carry between frames);
+/// * a block decided after the first `window` bytes comes too late to keep the upload from the
+///   upstream: the upstream has seen the start of it, the upload is cut, and the client gets `403`;
+/// * DLP in `redact` mode cannot rewrite a body that is already on its way, so it keeps buffering.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct StreamInspectCfg {
+    /// Path prefix this applies to, e.g. "/upload/". The longest matching prefix wins.
+    pub path: String,
+    /// Bytes inspected as one piece before anything is forwarded, e.g. "64KiB". A body that ends
+    /// within it is inspected whole, as if buffered.
+    pub window: String,
+    /// Bytes of each frame's tail carried into the next frame's scan, e.g. "4KiB". The longest
+    /// pattern match that can span two frames. Must be smaller than `window`.
+    pub overlap: String,
+}
+
+impl Default for StreamInspectCfg {
+    fn default() -> Self {
+        StreamInspectCfg {
+            path: String::new(),
+            window: "64KiB".into(),
+            overlap: "4KiB".into(),
+        }
+    }
+}
+
 impl Default for ValidationCfg {
     fn default() -> Self {
         ValidationCfg {
@@ -887,6 +991,9 @@ impl Default for ValidationCfg {
             max_header_bytes: "0".into(),
             allow_methods: vec![],
             stream_passthrough: false,
+            stream_responses: false,
+            stream_requests: false,
+            stream_inspect: Vec::new(),
             websocket_passthrough: false,
             compress_responses: false,
         }
@@ -972,6 +1079,29 @@ pub struct TlsCfg {
     pub redirect_hosts: Vec<String>,
     /// Automatic certificate issuance. See `[tls.acme]`.
     pub acme: AcmeCfg,
+    /// More certificates on the same listener, chosen by the hostname the client asks for (SNI):
+    /// one `[[tls.certs]]` entry per pair. The pair above (`cert_path`/`key_path`, or what
+    /// self-signed or ACME put there) stays the default, served to any name no entry claims and to
+    /// clients that send no name. These pairs are provided by you or another tool (cert-manager,
+    /// certbot, Vault Agent): they are reloaded when they change on disk, like the default pair, and
+    /// warned about as they near expiry, but nothing here renews them.
+    pub certs: Vec<SniCertCfg>,
+}
+
+/// One extra certificate, served to the hostnames in `hosts`. See [`TlsCfg::certs`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SniCertCfg {
+    /// PEM certificate chain (leaf first).
+    pub cert_path: String,
+    /// PEM private key.
+    pub key_path: String,
+    /// The names this certificate is served for: exact hostnames (`api.example.com`) or a
+    /// one-label wildcard (`*.example.com`, which matches `a.example.com` but not
+    /// `example.com` or `a.b.example.com`). An exact name always wins over a wildcard. Required:
+    /// the names are not read from the certificate, so what is served for which host is stated
+    /// here, in the config, where it is reviewed.
+    pub hosts: Vec<String>,
 }
 
 impl TlsCfg {
@@ -1009,6 +1139,7 @@ impl Default for TlsCfg {
             redirect_status: 308,
             redirect_hosts: Vec::new(),
             acme: AcmeCfg::default(),
+            certs: Vec::new(),
         }
     }
 }
@@ -1055,6 +1186,55 @@ pub struct AcmeCfg {
     /// listener holds port 80 it answers the HTTP-01 challenge, so renewal needs no second
     /// listener. On by default.
     pub renew: bool,
+    /// Ask the CA when to renew (ACME Renewal Information, RFC 9773), on top of the two-thirds
+    /// rule. When the CA offers it, its suggested window can bring a renewal **earlier** (a CA
+    /// that must revoke certificates after an incident says so this way) but never later: the
+    /// two-thirds point still applies. Renewal orders also tell the CA which certificate they
+    /// replace, which some CAs exempt from rate limits. A CA without ARI, or one that fails to
+    /// answer, leaves the two-thirds rule alone. One unauthenticated GET per certificate, as
+    /// often as the CA's `Retry-After` allows. On by default.
+    pub ari: bool,
+    /// How the CA checks this edge controls the names: `"http-01"` (default) serves a token on
+    /// port 80; `"dns-01"` publishes a TXT record through `[tls.acme.dns]` instead. DNS-01 is the
+    /// only way to get a **wildcard** (`*.example.com`) and works for hosts the CA cannot reach on
+    /// :80; it needs API access to the zone.
+    pub challenge: String,
+    /// The DNS provider for `challenge = "dns-01"`. See `[tls.acme.dns]`.
+    pub dns: AcmeDnsCfg,
+}
+
+/// Where DNS-01 publishes its `_acme-challenge` TXT records.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AcmeDnsCfg {
+    /// `"cloudflare"`, or `"challtestsrv"` (Pebble's test DNS server, for testing only).
+    pub provider: String,
+    /// Cloudflare: the zone the records go in (Zone ID, from the zone's Overview page).
+    pub zone_id: String,
+    /// Name of the environment variable holding the provider's API token (Cloudflare: a token with
+    /// `Zone.DNS:Edit` on that zone only). The token itself is never read from this file, never
+    /// logged, and `doctor` errors if the variable is unset. Default `CLOUDFLARE_API_TOKEN`.
+    pub api_token_env: String,
+    /// Cloudflare API base URL. Only for testing against a stub.
+    pub api_base: String,
+    /// `challtestsrv`: its management URL, e.g. `http://localhost:8055`.
+    pub url: String,
+    /// Seconds to wait after publishing a record before asking the CA to check it, so it has reached
+    /// the authoritative servers. Default 30; raise it if validation fails with "no TXT record".
+    pub propagation_secs: u64,
+}
+
+impl Default for AcmeDnsCfg {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            zone_id: String::new(),
+            api_token_env: "CLOUDFLARE_API_TOKEN".into(),
+            api_base: "https://api.cloudflare.com/client/v4".into(),
+            url: String::new(),
+            propagation_secs: 30,
+        }
+    }
 }
 
 impl Default for AcmeCfg {
@@ -1069,6 +1249,9 @@ impl Default for AcmeCfg {
             accept_tos: false,
             budget_enabled: true,
             renew: true,
+            ari: true,
+            challenge: "http-01".into(),
+            dns: AcmeDnsCfg::default(),
         }
     }
 }
@@ -1340,6 +1523,9 @@ impl Config {
             // redirect an edge's traces — path, query, client address, user agent — to a collector
             // of its choosing. Edge-local, never pushed.
             tracing: self.tracing.clone(),
+            // And the metrics endpoint: where this edge's numbers (hostnames, certificate names,
+            // route labels) are pushed. Edge-local, never pushed.
+            metrics: self.metrics.clone(),
         })
     }
 
@@ -1671,6 +1857,19 @@ mod tests {
         assert!(!merged.llm.telemetry.capture_content);
         // ...while the rest of `llm` still took the pushed policy.
         assert_eq!(merged.llm.on_unpriced_model, "block");
+    }
+
+    /// A pushed policy cannot repoint where this edge sends its metrics or traces.
+    #[test]
+    fn with_policy_from_keeps_the_metrics_and_tracing_endpoints_edge_local() {
+        let mut local = Config::default();
+        local.metrics.otlp.enabled = true;
+        local.metrics.otlp.endpoint = "http://local:4318/v1/metrics".into();
+        local.tracing.endpoint = "http://local:4318/v1/traces".into();
+        let policy = "[metrics.otlp]\nenabled = true\nendpoint = \"http://evil:4318/v1/metrics\"\n\n[tracing]\nendpoint = \"http://evil:4318/v1/traces\"\n";
+        let merged = local.with_policy_from(policy).unwrap();
+        assert_eq!(merged.metrics.otlp.endpoint, "http://local:4318/v1/metrics");
+        assert_eq!(merged.tracing.endpoint, "http://local:4318/v1/traces");
     }
 
     #[test]

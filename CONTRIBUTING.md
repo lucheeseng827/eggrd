@@ -62,8 +62,11 @@ supported one; Windows uses a best-effort child kill.
 ## Reporting security issues
 
 Please **do not** open a public issue for security vulnerabilities. See
-[SECURITY.md](SECURITY.md) (once published) for private disclosure instructions, or contact
-the maintainer directly.
+[SECURITY.md](SECURITY.md) for private disclosure instructions.
+
+## Code of conduct
+
+Everyone taking part is expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

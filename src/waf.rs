@@ -263,6 +263,29 @@ impl WafEngine {
         self.mode
     }
 
+    /// Whether [`evaluate`](Self::evaluate) would read the request body: the WAF is on, body
+    /// inspection is on, and at least one rule targets the body. When false, a request may stream
+    /// past the WAF without being buffered.
+    pub fn needs_body(&self) -> bool {
+        self.mode != WafMode::Off
+            && self.inspect_body
+            && self.rules.iter().any(|r| r.target.includes(Location::Body))
+    }
+
+    /// Evaluate a piece of a request body alone against the body rules: the later frames of a
+    /// streamed body ([`crate::stream_inspect`]), after `evaluate` has seen the path, headers and
+    /// first window. `None` when nothing inspects the body.
+    pub fn evaluate_body(&self, body: &[u8]) -> Option<WafHit> {
+        if !self.needs_body() || body.is_empty() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(body);
+        self.rules
+            .iter()
+            .find(|r| r.target.includes(Location::Body) && r.set.is_match(&text))
+            .map(|r| r.hit(Location::Body))
+    }
+
     /// Evaluate a request against the rules and return the first match, if any. Returns `None`
     /// immediately when disabled. Each enabled location's inspection text is assembled at most
     /// once, then every rule that targets that location is checked against it. The path is
@@ -375,6 +398,41 @@ fn join_header_values(headers: &HeaderMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The WAF reads the body only when it is on, body inspection is on, and a rule targets it.
+    #[test]
+    fn needs_body_only_when_a_live_rule_targets_the_body() {
+        use crate::config::{WafCfg, WafRule};
+        let cfg = |mode: &str, inspect_body: bool, rules: Vec<WafRule>| WafCfg {
+            mode: mode.into(),
+            sqli: false,
+            xss: false,
+            path_traversal: false,
+            inspect_body,
+            rules,
+            ..Default::default()
+        };
+        let rule = |target: &str| WafRule {
+            id: "r".into(),
+            pattern: "evil".into(),
+            target: target.into(),
+        };
+        let engine = |c: WafCfg| WafEngine::build(&c).unwrap();
+        assert!(engine(cfg("block", true, vec![rule("body")])).needs_body());
+        assert!(engine(cfg("report", true, vec![rule("all")])).needs_body());
+        assert!(
+            !engine(cfg("off", true, vec![rule("body")])).needs_body(),
+            "off"
+        );
+        assert!(
+            !engine(cfg("block", false, vec![rule("body")])).needs_body(),
+            "body inspection off"
+        );
+        assert!(
+            !engine(cfg("block", true, vec![rule("path")])).needs_body(),
+            "no rule targets the body"
+        );
+    }
     use crate::config::WafRule;
     use axum::http::{HeaderMap, HeaderValue};
 

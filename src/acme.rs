@@ -41,8 +41,8 @@ use axum::{
     Router,
 };
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
-    NewOrder, OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, CertificateIdentifier, ChallengeType,
+    Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -58,6 +58,13 @@ pub const HTTP01_PORT: u16 = 80;
 /// Whatever is serving `:80` answers from it — the order's own temporary listener on first boot,
 /// or the redirect listener during a renewal, when that listener already holds the port.
 pub type ChallengeMap = Arc<RwLock<HashMap<String, String>>>;
+
+/// The shared challenge map for a redirect listener on `redirect_port`, when there is one to share:
+/// only a listener on [`HTTP01_PORT`] is where the CA looks, so only then does renewal publish its
+/// tokens there instead of binding the port itself.
+pub fn shared_challenges(redirect_port: u16) -> Option<ChallengeMap> {
+    (redirect_port == HTTP01_PORT).then(ChallengeMap::default)
+}
 
 /// The key authorization for `token`, if an order is currently waiting on it.
 pub fn challenge_response(map: &ChallengeMap, token: &str) -> Option<String> {
@@ -269,6 +276,19 @@ pub async fn obtain_certificate_via(
     cp: Option<&crate::cp::CpClient>,
     challenges: Option<&ChallengeMap>,
 ) -> Result<Issuance> {
+    obtain_certificate_replacing(acme, tls, cp, challenges, None).await
+}
+
+/// [`obtain_certificate_via`] for a renewal: `replaces` names the certificate being renewed
+/// (RFC 9773 §5), which some CAs exempt from rate limits. Only pass it when the CA answered a
+/// [`renewal_window`] request for that certificate, i.e. it supports ARI.
+pub async fn obtain_certificate_replacing(
+    acme: &AcmeCfg,
+    tls: &TlsCfg,
+    cp: Option<&crate::cp::CpClient>,
+    challenges: Option<&ChallengeMap>,
+    replaces: Option<&crate::certstore::AriId>,
+) -> Result<Issuance> {
     anyhow::ensure!(
         !acme.domains.is_empty(),
         "tls.acme.domains must list at least one domain"
@@ -281,6 +301,25 @@ pub async fn obtain_certificate_via(
         !tls.cert_path.is_empty() && !tls.key_path.is_empty(),
         "tls.cert_path and tls.key_path must be set so the issued certificate can be stored"
     );
+    let dns01 = match acme.challenge.as_str() {
+        "http-01" | "" => false,
+        "dns-01" => true,
+        other => anyhow::bail!(
+            "unknown tls.acme.challenge {other:?} (expected \"http-01\" or \"dns-01\")"
+        ),
+    };
+    // A wildcard can only be proven through DNS (RFC 8555 §7.1.3): refuse it here rather than
+    // spend an order the CA is certain to reject.
+    if let Some(w) = acme.domains.iter().find(|d| d.trim().starts_with("*.")) {
+        anyhow::ensure!(
+            dns01,
+            "{w} is a wildcard; wildcards need tls.acme.challenge = \"dns-01\""
+        );
+    }
+    // Build the DNS provider before spending budget, so a missing token fails here, not mid-order.
+    let dns = dns01
+        .then(|| crate::acme_dns::DnsProvider::from_cfg(&acme.dns))
+        .transpose()?;
 
     // Ask the budget before asking the CA. A CA that refuses an order still counts it, so the only
     // place this check is worth anything is before the request leaves.
@@ -289,7 +328,15 @@ pub async fn obtain_certificate_via(
         Err(deferred) => return Ok(deferred),
     };
 
-    let result = run_order(acme, tls, budget.as_ref(), challenges).await;
+    let result = run_order(
+        acme,
+        tls,
+        budget.as_ref(),
+        challenges,
+        dns.as_ref(),
+        replaces,
+    )
+    .await;
 
     // Tell the control plane how the leased order ended, on EVERY path out of `run_order`.
     //
@@ -316,6 +363,8 @@ async fn run_order(
     tls: &TlsCfg,
     budget: Option<&crate::acme_budget::IssuanceBudget>,
     shared: Option<&ChallengeMap>,
+    dns: Option<&crate::acme_dns::DnsProvider>,
+    replaces: Option<&crate::certstore::AriId>,
 ) -> Result<()> {
     info!(domains = ?acme.domains, directory = %acme.directory_url, "starting ACME order");
 
@@ -326,10 +375,24 @@ async fn run_order(
         .iter()
         .map(|d| Identifier::Dns(d.clone()))
         .collect();
-    let mut order = account
-        .new_order(&NewOrder::new(&identifiers))
-        .await
-        .context("creating ACME order")?;
+    let plain = NewOrder::new(&identifiers);
+    let mut order = match replaces {
+        None => account.new_order(&plain).await,
+        Some(id) => {
+            let replacing = NewOrder::new(&identifiers).replaces(certificate_identifier(id));
+            match account.new_order(&replacing).await {
+                Ok(order) => Ok(order),
+                // A CA may refuse the `replaces` field (the certificate is already replaced, or it
+                // no longer names these identifiers). That must not cost the renewal: ask again
+                // without it, as a pre-ARI client would.
+                Err(e) => {
+                    warn!(error = %e, "ACME order naming the replaced certificate was refused; ordering without it");
+                    account.new_order(&plain).await
+                }
+            }
+        }
+    }
+    .context("creating ACME order")?;
 
     // The challenge server starts BEFORE the authorizations are walked, sharing a map the loop
     // fills in. In 0.8 a challenge is marked ready through a handle that only exists inside the
@@ -340,13 +403,17 @@ async fn run_order(
         Some(map) => Arc::clone(map),
         None => ChallengeMap::default(),
     };
-    let server = match shared {
+    let server = match (dns, shared) {
+        // DNS-01 publishes records instead; nothing is served on :80.
+        (Some(_), _) => None,
         // Someone else (the redirect listener) is answering on :80 from the shared map.
-        Some(_) => None,
-        None => Some(AbortOnDrop(Some(
+        (None, Some(_)) => None,
+        (None, None) => Some(AbortOnDrop(Some(
             spawn_challenge_server(Arc::clone(&responses)).await?,
         ))),
     };
+    // TXT records this order published, removed after the order whatever its outcome.
+    let mut dns_records: Vec<crate::acme_dns::TxtRecord> = Vec::new();
     let result = async {
         // Remove this order's tokens on every exit path, so a shared map does not keep answering
         // for an order that has finished.
@@ -362,6 +429,25 @@ async fn run_order(
                 AuthorizationStatus::Pending => {}
                 AuthorizationStatus::Valid => continue,
                 other => anyhow::bail!("unexpected authorization status: {other:?}"),
+            }
+            if let Some(provider) = dns {
+                let Identifier::Dns(name) = authz.identifier().identifier.clone() else {
+                    anyhow::bail!("DNS-01 can only prove DNS names");
+                };
+                let mut challenge = authz
+                    .challenge(ChallengeType::Dns01)
+                    .context("CA offered no dns-01 challenge")?;
+                let record = crate::acme_dns::challenge_record_name(&name);
+                let value = challenge.key_authorization().dns_value();
+                dns_records.push(provider.publish(&record, &value).await?);
+                info!(record = %record, "published the DNS-01 record");
+                // Let the record reach the authoritative servers before the CA looks for it.
+                tokio::time::sleep(std::time::Duration::from_secs(acme.dns.propagation_secs)).await;
+                challenge
+                    .set_ready()
+                    .await
+                    .context("signaling challenge ready")?;
+                continue;
             }
             let mut challenge = authz
                 .challenge(ChallengeType::Http01)
@@ -424,24 +510,83 @@ async fn run_order(
     if let Some(server) = server {
         server.stop().await;
     }
+    // Take the DNS-01 records out again. A record left behind is harmless to validation but
+    // clutters the zone, so a failed removal is logged, not fatal.
+    if let Some(provider) = dns {
+        for record in &dns_records {
+            if let Err(e) = provider.remove(record).await {
+                warn!(record = %record.name, error = format!("{e:#}"), "could not remove the DNS-01 record");
+            }
+        }
+    }
     result
+}
+
+fn certificate_identifier(id: &crate::certstore::AriId) -> CertificateIdentifier<'static> {
+    CertificateIdentifier {
+        authority_key_identifier: id.aki.clone().into(),
+        serial: id.serial.clone().into(),
+    }
+}
+
+/// A CA's suggested renewal window for one certificate (RFC 9773 §4.2), in unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewalWindow {
+    pub start: i64,
+    pub end: i64,
+    /// When to ask again, from the CA's `Retry-After`.
+    pub retry_after: std::time::Duration,
+    /// The CA's page explaining the window, when it gives one (it does when it moves a window
+    /// earlier after an incident).
+    pub explanation_url: Option<String>,
+}
+
+/// Ask the CA when the certificate `id` should be renewed. `Ok(None)` when the CA does not offer
+/// ARI, or when there is no cached ACME account — an account is never registered just to ask.
+pub async fn renewal_window(
+    acme: &AcmeCfg,
+    id: &crate::certstore::AriId,
+) -> Result<Option<RenewalWindow>> {
+    let Some(account) = cached_account(acme).await? else {
+        return Ok(None);
+    };
+    match account.renewal_info(&certificate_identifier(id)).await {
+        Ok((info, retry_after)) => Ok(Some(RenewalWindow {
+            start: info.suggested_window.start.unix_timestamp(),
+            end: info.suggested_window.end.unix_timestamp(),
+            retry_after,
+            explanation_url: info.explanation_url,
+        })),
+        Err(instant_acme::Error::Unsupported(_)) => Ok(None),
+        Err(e) => Err(e).context("fetching ACME renewal information"),
+    }
+}
+
+/// The account restored from cached credentials, if there are any.
+async fn cached_account(acme: &AcmeCfg) -> Result<Option<Account>> {
+    let creds_path = Path::new(&acme.cache_dir).join("account.json");
+    if !creds_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&creds_path)
+        .with_context(|| format!("reading cached ACME account {}", creds_path.display()))?;
+    let creds: AccountCredentials =
+        serde_json::from_str(&raw).context("parsing cached ACME account credentials")?;
+    Account::builder()
+        .context("building ACME client")?
+        .from_credentials(creds)
+        .await
+        .context("restoring ACME account from cached credentials")
+        .map(Some)
 }
 
 /// Restore the ACME account from cached credentials, or create and cache a new one (so renewals
 /// reuse the same account instead of re-registering).
 async fn account(acme: &AcmeCfg) -> Result<Account> {
-    let creds_path = Path::new(&acme.cache_dir).join("account.json");
-    if creds_path.exists() {
-        let raw = std::fs::read_to_string(&creds_path)
-            .with_context(|| format!("reading cached ACME account {}", creds_path.display()))?;
-        let creds: AccountCredentials =
-            serde_json::from_str(&raw).context("parsing cached ACME account credentials")?;
-        return Account::builder()
-            .context("building ACME client")?
-            .from_credentials(creds)
-            .await
-            .context("restoring ACME account from cached credentials");
+    if let Some(account) = cached_account(acme).await? {
+        return Ok(account);
     }
+    let creds_path = Path::new(&acme.cache_dir).join("account.json");
 
     let mailto = (!acme.email.is_empty()).then(|| format!("mailto:{}", acme.email));
     let contact: Vec<&str> = mailto.as_deref().into_iter().collect();
@@ -540,6 +685,171 @@ impl Drop for AbortOnDrop {
 
 #[cfg(test)]
 mod tests {
+
+    /// Settings that cannot work fail before anything is sent: no account, no order, no budget
+    /// spent. The directory URL is unroutable on purpose — reaching it would be the bug.
+    #[tokio::test]
+    async fn dns01_misconfiguration_fails_before_any_request() {
+        let base = std::env::temp_dir().join(format!("eg-acme-dns-{}", std::process::id()));
+        let acme = |domains: &[&str], challenge: &str, provider: &str| AcmeCfg {
+            enabled: true,
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+            accept_tos: true,
+            directory_url: "http://192.0.2.1:9/never".into(),
+            cache_dir: base.to_string_lossy().into_owned(),
+            challenge: challenge.into(),
+            dns: crate::config::AcmeDnsCfg {
+                provider: provider.into(),
+                ..Default::default()
+            },
+            ..AcmeCfg::default()
+        };
+        let tls = TlsCfg {
+            cert_path: base.join("c.pem").to_string_lossy().into_owned(),
+            key_path: base.join("k.pem").to_string_lossy().into_owned(),
+            ..TlsCfg::default()
+        };
+        let err = |a: AcmeCfg| {
+            let tls = tls.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let e = obtain_certificate(&a, &tls, None).await.unwrap_err();
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(2),
+                    "it went to the network"
+                );
+                format!("{e:#}")
+            }
+        };
+        assert!(err(acme(&["*.example.com"], "http-01", ""))
+            .await
+            .contains("wildcard"));
+        assert!(err(acme(&["example.com"], "tls-alpn-01", ""))
+            .await
+            .contains("tls-alpn-01"));
+        assert!(err(acme(&["example.com"], "dns-01", ""))
+            .await
+            .contains("provider"));
+        assert!(err(acme(&["*.example.com"], "dns-01", "nope"))
+            .await
+            .contains("nope"));
+    }
+
+    // Wildcard issuance over DNS-01 against Pebble, with challtestsrv as the DNS provider. Same rig
+    // as the HTTP-01 tests (Pebble resolves through challtestsrv), but nothing listens on :80: the
+    // CA finds the TXT record the order published, and the record is cleared afterwards.
+    #[tokio::test]
+    #[ignore = "requires a live test ACME CA (Pebble) + challtestsrv — see the module test comment"]
+    async fn acme_dns01_wildcard_issues_against_pebble() {
+        let Ok(directory_url) = std::env::var("EDGEGUARD_TEST_ACME_DIR") else {
+            eprintln!("skipping: set EDGEGUARD_TEST_ACME_DIR");
+            return;
+        };
+        let dns_url = std::env::var("EDGEGUARD_TEST_ACME_DNS_URL")
+            .unwrap_or_else(|_| "http://localhost:8055".into());
+        let domain =
+            std::env::var("EDGEGUARD_TEST_ACME_DOMAIN").unwrap_or_else(|_| "edgeguard.test".into());
+        crate::tls::init_crypto();
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("eg-acme-dns01-{stamp}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let cert_path = base.join("cert.pem").to_string_lossy().into_owned();
+        let key_path = base.join("key.pem").to_string_lossy().into_owned();
+        let wildcard = format!("*.{domain}");
+        let acme = AcmeCfg {
+            enabled: true,
+            domains: vec![wildcard.clone(), domain.clone()],
+            email: "ci@example.test".into(),
+            directory_url,
+            cache_dir: base.to_string_lossy().into_owned(),
+            accept_tos: true,
+            challenge: "dns-01".into(),
+            dns: crate::config::AcmeDnsCfg {
+                provider: "challtestsrv".into(),
+                url: dns_url,
+                propagation_secs: 0,
+                ..Default::default()
+            },
+            ..AcmeCfg::default()
+        };
+        let tls = TlsCfg {
+            enabled: true,
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+            acme: acme.clone(),
+            ..TlsCfg::default()
+        };
+
+        obtain_certificate(&acme, &tls, None)
+            .await
+            .expect("ACME DNS-01 wildcard issuance against Pebble");
+
+        // The served pair loads, and the leaf names the wildcard (DER carries the SAN as ASCII).
+        let store = crate::certstore::CertStore::load(
+            &cert_path,
+            &key_path,
+            crate::certstore::CertSource::Acme,
+        )
+        .expect("the issued pair loads");
+        assert!(!store.info().self_issued);
+        let leaf = crate::tls::load_certs(&cert_path).unwrap();
+        let der = leaf[0].as_ref();
+        assert!(
+            der.windows(wildcard.len())
+                .any(|w| w == wildcard.as_bytes()),
+            "the certificate covers {wildcard}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Renewal shares tokens with the redirect listener only when that listener is on :80, where
+    /// the CA actually looks; on any other port it would answer challenges nobody asks for.
+    #[test]
+    fn challenges_are_shared_only_with_a_redirect_listener_on_port_80() {
+        let shared = shared_challenges(HTTP01_PORT).expect("redirect on :80 shares");
+        shared.write().unwrap().insert("tok".into(), "auth".into());
+        assert_eq!(challenge_response(&shared, "tok").as_deref(), Some("auth"));
+        assert!(shared_challenges(8080).is_none());
+        assert!(shared_challenges(0).is_none());
+    }
+
+    /// ARI only ever uses an account already on disk: none cached means no request and no
+    /// registration (`None`), and an unreadable cache is an error, not silently "no ARI".
+    #[tokio::test]
+    async fn ari_uses_only_a_cached_account() {
+        let dir = std::env::temp_dir().join(format!(
+            "eg-acme-ari-cache-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let acme = AcmeCfg {
+            cache_dir: dir.to_string_lossy().into_owned(),
+            // Unroutable: a test that reached the network would fail rather than hang on a CA.
+            directory_url: "http://127.0.0.1:9/dir".into(),
+            ..AcmeCfg::default()
+        };
+        let id = crate::certstore::AriId {
+            aki: "wP_u".into(),
+            serial: "AMr-".into(),
+        };
+
+        assert!(cached_account(&acme).await.unwrap().is_none());
+        assert_eq!(renewal_window(&acme, &id).await.unwrap(), None);
+        assert!(
+            !dir.join("account.json").exists(),
+            "asking about ARI must not register an account"
+        );
+
+        std::fs::write(dir.join("account.json"), "not json").unwrap();
+        assert!(cached_account(&acme).await.is_err());
+        assert!(renewal_window(&acme, &id).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
     use crate::config::{AcmeCfg, TlsCfg};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -624,6 +934,79 @@ mod tests {
         );
         let key = std::fs::read_to_string(&key_path).expect("private key written");
         assert!(key.contains("BEGIN"), "private key PEM present");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ARI against Pebble, which implements RFC 9773: read the issued certificate's identifier, ask
+    // for its renewal window, then renew naming it as replaced. Same rig as the test above.
+    #[tokio::test]
+    #[ignore = "requires a live test ACME CA (Pebble) + :80 — see the module test comment"]
+    async fn acme_ari_window_and_replacing_renewal_against_pebble() {
+        let Ok(directory_url) = std::env::var("EDGEGUARD_TEST_ACME_DIR") else {
+            eprintln!("skipping: set EDGEGUARD_TEST_ACME_DIR");
+            return;
+        };
+        let domain =
+            std::env::var("EDGEGUARD_TEST_ACME_DOMAIN").unwrap_or_else(|_| "edgeguard.test".into());
+        crate::tls::init_crypto();
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("eg-acme-ari-{stamp}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let cert_path = base.join("cert.pem").to_string_lossy().into_owned();
+        let key_path = base.join("key.pem").to_string_lossy().into_owned();
+        let acme = AcmeCfg {
+            enabled: true,
+            domains: vec![domain],
+            email: "ci@example.test".into(),
+            directory_url,
+            cache_dir: base.to_string_lossy().into_owned(),
+            accept_tos: true,
+            ..AcmeCfg::default()
+        };
+        let tls = TlsCfg {
+            enabled: true,
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+            acme: acme.clone(),
+            ..TlsCfg::default()
+        };
+        let served = |path: &str| {
+            let pem = std::fs::read(path).unwrap();
+            let der = rustls_pemfile::certs(&mut pem.as_slice())
+                .next()
+                .unwrap()
+                .unwrap();
+            crate::certstore::CertInfo::from_der(&der).unwrap()
+        };
+
+        obtain_certificate(&acme, &tls, None)
+            .await
+            .expect("first issuance against Pebble");
+        let first = served(&cert_path);
+        let id = first
+            .ari_id
+            .clone()
+            .expect("a CA-issued certificate carries an ARI identifier");
+
+        let window = renewal_window(&acme, &id)
+            .await
+            .expect("renewal info request")
+            .expect("Pebble offers ARI");
+        assert!(window.start < window.end, "{window:?}");
+        assert!(
+            window.start > first.not_before && window.end <= first.not_after,
+            "the window lies inside the certificate's validity: {window:?}, {first:?}"
+        );
+
+        obtain_certificate_replacing(&acme, &tls, None, None, Some(&id))
+            .await
+            .expect("renewal naming the replaced certificate");
+        let second = served(&cert_path);
+        assert_ne!(first.serial, second.serial, "a new certificate was issued");
         let _ = std::fs::remove_dir_all(&base);
     }
 

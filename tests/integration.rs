@@ -1167,6 +1167,16 @@ async fn public_private_split_serves_internal_endpoints_only_on_admin() {
 /// first event before the upstream has finished (streamed) or only after (buffered). Hand-rolled
 /// over `TcpStream` so no stream/SSE helper crate is needed.
 async fn spawn_sse_upstream(gap: Duration) -> SocketAddr {
+    spawn_chunked_upstream(gap, "text/event-stream", b"data: one\n\n", b"data: two\n\n").await
+}
+
+/// Raw-TCP chunked upstream of any `content_type`: writes `first`, waits `gap`, writes `second`.
+async fn spawn_chunked_upstream(
+    gap: Duration,
+    content_type: &'static str,
+    first: &'static [u8],
+    second: &'static [u8],
+) -> SocketAddr {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn write_chunk(sock: &mut tokio::net::TcpStream, data: &[u8]) {
@@ -1187,16 +1197,18 @@ async fn spawn_sse_upstream(gap: Duration) -> SocketAddr {
                 // Drain the request head (a GET fits in one read); we don't parse it.
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf).await;
-                sock.write_all(
-                    b"HTTP/1.1 200 OK\r\n\
-                      Content-Type: text/event-stream\r\n\
-                      Transfer-Encoding: chunked\r\n\r\n",
-                )
-                .await
-                .unwrap();
-                write_chunk(&mut sock, b"data: one\n\n").await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: {content_type}\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n"
+                );
+                // The proxy may hang up early (a capped stream); that is not this task's failure.
+                if sock.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                write_chunk(&mut sock, first).await;
                 tokio::time::sleep(gap).await;
-                write_chunk(&mut sock, b"data: two\n\n").await;
+                write_chunk(&mut sock, second).await;
                 sock.write_all(b"0\r\n\r\n").await.unwrap(); // terminating chunk
                 sock.flush().await.unwrap();
             });
@@ -3070,4 +3082,407 @@ async fn the_forwarded_uri_is_still_verbatim_after_the_log_split() {
     .await;
     assert_eq!(resp.status, StatusCode::OK);
     assert_eq!(resp.body, target);
+}
+
+/// GET `path` through `proxy` with a fresh hyper client, timing from just before the send.
+async fn get_streamed(proxy: SocketAddr, path: &str) -> (String, Duration, Duration) {
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .uri(format!("http://{proxy}{path}"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let start = std::time::Instant::now();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    read_streamed(resp, start).await
+}
+
+/// With `stream_responses` on, a plain download streams like SSE: the first part reaches the
+/// client before the upstream has written the second.
+#[tokio::test]
+async fn stream_responses_forwards_any_body_as_it_arrives() {
+    let gap = Duration::from_millis(500);
+    let up = spawn_chunked_upstream(
+        gap,
+        "application/octet-stream",
+        b"part one\n",
+        b"part two\n",
+    )
+    .await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.validation.stream_responses = true;
+    let proxy = spawn_proxy(cfg).await;
+
+    let (text, first, last) = get_streamed(proxy, "/file.bin").await;
+    assert_eq!(text, "part one\npart two\n");
+    assert!(first < gap, "first byte too late (buffered?): {first:?}");
+    assert!(last >= gap, "last byte too early: {last:?}");
+}
+
+/// The switch is off by default: the same download is buffered, as before 0.6.
+#[tokio::test]
+async fn stream_responses_off_keeps_buffering_non_sse_bodies() {
+    let gap = Duration::from_millis(500);
+    let up = spawn_chunked_upstream(
+        gap,
+        "application/octet-stream",
+        b"part one\n",
+        b"part two\n",
+    )
+    .await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    let proxy = spawn_proxy(cfg).await;
+
+    let (text, first, _) = get_streamed(proxy, "/file.bin").await;
+    assert_eq!(text, "part one\npart two\n");
+    assert!(
+        first >= gap,
+        "body was not buffered: first byte at {first:?}"
+    );
+}
+
+/// On a streamed response `max_response_body` still holds, enforced as bytes flow: what fits is
+/// delivered, then the connection is cut — the client sees an error, never the bytes past the cap.
+#[tokio::test]
+async fn streamed_response_is_cut_at_max_response_body() {
+    let gap = Duration::from_millis(200);
+    let up = spawn_chunked_upstream(
+        gap,
+        "application/octet-stream",
+        b"part one\n",
+        b"part two\n",
+    )
+    .await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.validation.stream_responses = true;
+    cfg.validation.max_response_body = "12".into(); // the first part (9 B) fits, both (18 B) do not
+    let proxy = spawn_proxy(cfg).await;
+
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .uri(format!("http://{proxy}/file.bin"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "headers were sent before the cap was hit"
+    );
+    let mut body = resp.into_body();
+    let (mut text, mut errored) = (String::new(), false);
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(f) => {
+                if let Some(d) = f.data_ref() {
+                    text.push_str(&String::from_utf8_lossy(d));
+                }
+            }
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        text.contains("one"),
+        "the part under the cap is delivered: {text:?}"
+    );
+    assert!(!text.contains("two"), "nothing past the cap: {text:?}");
+    assert!(errored, "a cut body must not look complete: {text:?}");
+}
+
+// --- Request streaming (validation.stream_requests) ---
+
+/// A request body fed from a channel, so a test controls when each part is sent.
+struct ChanBody(tokio::sync::mpsc::Receiver<Bytes>);
+
+impl hyper::body::Body for ChanBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        self.0
+            .poll_recv(cx)
+            .map(|o| o.map(|b| Ok(hyper::body::Frame::data(b))))
+    }
+}
+
+/// An upstream that signals as soon as the first frame of a request body arrives, then reads the
+/// rest and answers with the body length. Returns its address, the "first frame seen" receiver,
+/// and a count of requests it received.
+async fn spawn_body_watching_upstream() -> (
+    SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    let app = Router::new().fallback(any(move |req: Request<Body>| {
+        let seen_tx = seen_tx.clone();
+        let hits = Arc::clone(&hits2);
+        async move {
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut body = req.into_body();
+            let mut total = 0usize;
+            let mut signalled = false;
+            while let Some(frame) = body.frame().await {
+                let Ok(frame) = frame else {
+                    return Response::new(Body::from("aborted"));
+                };
+                if let Some(d) = frame.data_ref() {
+                    total += d.len();
+                    if !signalled && !d.is_empty() {
+                        let _ = seen_tx.send(());
+                        signalled = true;
+                    }
+                }
+            }
+            Response::new(Body::from(format!("got {total} bytes")))
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, seen_rx, hits)
+}
+
+/// POST a two-part body through `proxy`: send `first`, then wait for `between` to resolve before
+/// sending `second`. Returns the response (status, text).
+async fn post_in_two_parts<F: std::future::Future<Output = ()>>(
+    proxy: SocketAddr,
+    first: &'static [u8],
+    second: &'static [u8],
+    between: F,
+) -> (StatusCode, String) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+    let client: Client<_, ChanBody> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://{proxy}/upload"))
+        .body(ChanBody(rx))
+        .unwrap();
+    let send = tokio::spawn(async move { client.request(req).await });
+    tx.send(Bytes::from_static(first)).await.unwrap();
+    between.await;
+    let _ = tx.send(Bytes::from_static(second)).await;
+    drop(tx);
+    let resp = send.await.unwrap().unwrap();
+    let status = resp.status();
+    let text = resp.into_body().collect().await.map_or_else(
+        |_| String::new(),
+        |b| String::from_utf8_lossy(&b.to_bytes()).into_owned(),
+    );
+    (status, text)
+}
+
+/// With `stream_requests` on, the upstream sees the start of an upload while the client is still
+/// sending the rest.
+#[tokio::test]
+async fn stream_requests_forwards_the_body_as_it_arrives() {
+    let (up, mut seen, _) = spawn_body_watching_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.validation.stream_requests = true;
+    let proxy = spawn_proxy(cfg).await;
+
+    let (status, text) = post_in_two_parts(proxy, b"part one\n", b"part two\n", async {
+        tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .expect("the upstream saw nothing before the upload ended (buffered?)")
+            .unwrap();
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "got 18 bytes");
+}
+
+/// Off by default: the upstream sees nothing until the whole body has arrived.
+#[tokio::test]
+async fn stream_requests_off_keeps_buffering_the_body() {
+    let (up, mut seen, _) = spawn_body_watching_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    let proxy = spawn_proxy(cfg).await;
+
+    let (status, text) = post_in_two_parts(proxy, b"part one\n", b"part two\n", async {
+        let early = tokio::time::timeout(Duration::from_millis(400), seen.recv()).await;
+        assert!(
+            early.is_err(),
+            "the upstream saw the body before it was complete"
+        );
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "got 18 bytes");
+}
+
+/// A declared `Content-Length` over `max_body` is refused before anything reaches the upstream.
+#[tokio::test]
+async fn streamed_request_over_declared_length_is_refused_upfront() {
+    let (up, _seen, hits) = spawn_body_watching_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.validation.stream_requests = true;
+    cfg.validation.max_body = "8".into();
+    let proxy = spawn_proxy(cfg).await;
+
+    let r = send(
+        proxy,
+        "POST",
+        "/upload",
+        None,
+        Bytes::from_static(b"far more than eight bytes"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// A chunked body (no length) that grows past `max_body` is cut, and the client gets 413 — not the
+/// 502 a cut upload would otherwise read as.
+#[tokio::test]
+async fn streamed_request_that_outgrows_max_body_gets_413() {
+    let (up, _seen, _) = spawn_body_watching_upstream().await;
+    let mut cfg = base_cfg(format!("http://{up}"));
+    cfg.auth.mode = "none".into();
+    cfg.validation.stream_requests = true;
+    cfg.validation.max_body = "12".into(); // the first part (9 B) fits, both (18 B) do not
+    let proxy = spawn_proxy(cfg).await;
+
+    let (status, _) = post_in_two_parts(proxy, b"part one\n", b"part two\n", async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    })
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A WAF rule that inspects the body still sees it with `stream_requests` on: that request is
+/// buffered and blocked, as before.
+#[tokio::test]
+async fn a_body_inspecting_waf_rule_overrides_stream_requests() {
+    let up = spawn_upstream().await;
+    let mut cfg = waf_base(up);
+    cfg.waf = WafCfg {
+        mode: "block".into(),
+        inspect_body: true,
+        ..Default::default()
+    };
+    cfg.validation.stream_requests = true;
+    let proxy = spawn_proxy(cfg).await;
+    let r = send(
+        proxy,
+        "POST",
+        "/submit",
+        None,
+        Bytes::from_static(b"bio=<script>steal(document.cookie)</script>"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+}
+
+// --- Bounded-window inspection of streamed requests (validation.stream_inspect) ---
+
+/// A blocking body-inspecting WAF, streaming on, and `/upload` inspected on an 8-byte window.
+fn windowed_cfg(up: SocketAddr) -> Config {
+    let mut cfg = waf_base(up);
+    cfg.waf = WafCfg {
+        mode: "block".into(),
+        inspect_body: true,
+        ..Default::default()
+    };
+    cfg.validation.stream_requests = true;
+    cfg.validation.stream_inspect = vec![edgeguard::config::StreamInspectCfg {
+        path: "/upload".into(),
+        window: "8".into(),
+        overlap: "4".into(),
+    }];
+    cfg
+}
+
+/// On an opted-in route a clean upload streams although the WAF reads bodies: the upstream sees
+/// the window before the client has sent the rest, and gets the whole body.
+#[tokio::test]
+async fn stream_inspect_streams_a_clean_body_past_a_body_reading_waf() {
+    let (up, mut seen, _) = spawn_body_watching_upstream().await;
+    let proxy = spawn_proxy(windowed_cfg(up)).await;
+
+    let (status, text) = post_in_two_parts(proxy, b"part one\n", b"part two\n", async {
+        tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .expect("the upstream saw nothing before the upload ended (buffered?)")
+            .unwrap();
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "got 18 bytes");
+}
+
+/// A match in the window is refused before anything reaches the upstream.
+#[tokio::test]
+async fn stream_inspect_blocks_a_match_in_the_window_before_the_upstream_sees_it() {
+    let (up, _seen, hits) = spawn_body_watching_upstream().await;
+    let proxy = spawn_proxy(windowed_cfg(up)).await;
+    let r = send(
+        proxy,
+        "POST",
+        "/upload",
+        None,
+        Bytes::from_static(b"<script>steal(document.cookie)</script> and then a long clean tail"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// A match after the window cuts the upload and the client gets 403; the upstream has seen the
+/// start of it — the documented cost of streaming.
+#[tokio::test]
+async fn stream_inspect_cuts_an_upload_on_a_match_in_the_tail() {
+    let (up, mut seen, hits) = spawn_body_watching_upstream().await;
+    let proxy = spawn_proxy(windowed_cfg(up)).await;
+
+    let (status, _) = post_in_two_parts(
+        proxy,
+        b"clean start\n",
+        b"<script>steal(document.cookie)</script>",
+        async {
+            tokio::time::timeout(Duration::from_secs(5), seen.recv())
+                .await
+                .expect("the window was not forwarded")
+                .unwrap();
+        },
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A route that did not opt in keeps buffering for the WAF, as before.
+#[tokio::test]
+async fn stream_inspect_leaves_other_routes_buffered() {
+    let (up, mut seen, _) = spawn_body_watching_upstream().await;
+    let mut cfg = windowed_cfg(up);
+    cfg.validation.stream_inspect[0].path = "/elsewhere".into();
+    let proxy = spawn_proxy(cfg).await;
+
+    let (status, text) = post_in_two_parts(proxy, b"part one\n", b"part two\n", async {
+        let early = tokio::time::timeout(Duration::from_millis(400), seen.recv()).await;
+        assert!(
+            early.is_err(),
+            "the upstream saw the body before it was complete"
+        );
+    })
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(text, "got 18 bytes");
 }

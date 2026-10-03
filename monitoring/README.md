@@ -113,6 +113,22 @@ It assumes the standard EdgeGuard metric names (`edgeguard_requests_total`,
 | `edgeguard_csp_reports_total` | counter | — | CSP reports |
 | `up` | gauge | `job` | Targets up (scrape health) |
 
+## The versioned bundle
+
+The alert rules (`prometheus/alerts.yml`) and the dashboards (`grafana/dashboards/*.json`) are
+versioned together as one bundle; the version is in [`VERSION`](VERSION). It follows SemVer:
+
+- **major**: an alert or dashboard renamed or removed, or a metric it reads renamed (your routing or
+  links break);
+- **minor**: a new alert or panel;
+- **patch**: a threshold, a description or a layout fix.
+
+On Kubernetes with the Prometheus Operator, the rules file becomes a `PrometheusRule` unchanged:
+indent it under `spec:`. The dashboards go into a ConfigMap labelled for the Grafana sidecar
+(`grafana_dashboard: "1"` in kube-prometheus-stack). The Enterprise control-plane Helm chart ships
+both, stamped with the bundle version (`monitoring.prometheusRule.enabled`,
+`monitoring.grafanaDashboards.enabled`).
+
 ## Files
 
 ```
@@ -120,8 +136,10 @@ monitoring/
 ├── compose.yaml                 # Podman/Docker Compose: edgeguard + upstream + traffic + prometheus + grafana
 ├── edgeguard.demo.toml          # demo proxy config (public/private split, limiter on, WAF report mode)
 ├── upstream.conf                # nginx stub backend (static 200)
+├── VERSION                      # the bundle version (alerts.yml + dashboards)
 ├── prometheus/
-│   └── prometheus.yml           # scrape config (bundled demo + commented host-gateway target)
+│   ├── prometheus.yml           # scrape config (bundled demo + commented host-gateway target)
+│   └── alerts.yml               # alerting rules (part of the bundle)
 └── grafana/
     ├── provisioning/
     │   ├── datasources/prometheus.yml   # auto-wired Prometheus datasource

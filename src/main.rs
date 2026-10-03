@@ -25,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 use edgeguard::config::{parse_duration, Config};
 use edgeguard::generate::{generate, Target};
 use edgeguard::logship;
+use edgeguard::otlp_metrics;
 use edgeguard::telemetry;
 use edgeguard::{
     acme, build_admin_router, build_public_router, build_router, build_runtime, build_state,
@@ -566,6 +567,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // OTLP metrics: the Prometheus registry, pushed to a collector on an interval.
+    if cfg.metrics.otlp.enabled
+        && otlp_metrics::spawn_exporter(&cfg.metrics.otlp, log_metrics.clone(), shutdown_rx.clone())
+            .is_none()
+    {
+        warn!("[metrics.otlp] is enabled but no exporter started; check metrics.otlp.endpoint");
+    }
+
     // Managed mode: poll the control plane for policy (hot-reloading it) and report usage deltas.
     if let Some(cp_client) = cp_client {
         let poll = parse_duration(&cfg.control_plane.poll_interval).unwrap_or_else(|e| {
@@ -716,12 +725,58 @@ async fn main() -> Result<()> {
             };
             client.set_cert_store(Arc::clone(&cert_store), domains);
         }
-        let server_config = tls::server_config(Arc::clone(&cert_store))?;
+        // Extra pairs served by hostname (`[[tls.certs]]`). Each is its own store: loaded now (a
+        // pair that cannot be served fails startup, as the default one does), watched, and checked
+        // for expiry below.
+        let mut sni_certs = Vec::new();
+        for c in &cfg.tls.certs {
+            let store =
+                certstore::CertStore::load(&c.cert_path, &c.key_path, certstore::CertSource::File)
+                    .with_context(|| {
+                        format!(
+                            "loading [[tls.certs]] {} (does the key match the certificate?)",
+                            c.cert_path
+                        )
+                    })?;
+            sni_certs.push(certstore::SniCert {
+                hosts: c.hosts.clone(),
+                store,
+            });
+        }
+        let server_config = if sni_certs.is_empty() {
+            tls::server_config(Arc::clone(&cert_store))?
+        } else {
+            let resolver = certstore::SniResolver::new(Arc::clone(&cert_store), sni_certs.clone())
+                .context("[[tls.certs]]")?;
+            info!(certs = ?resolver, "serving certificates by hostname (SNI)");
+            tls_metrics.set_sni_certs(sni_certs.clone());
+            tls::server_config_with(Arc::new(resolver))?
+        };
+        for c in &sni_certs {
+            if cfg.tls.watch {
+                let store = Arc::clone(&c.store);
+                let rx = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = certstore::watch(store, rx).await {
+                        warn!(error = format!("{e:#}"), "certificate watcher stopped; changes on disk are picked up by the hourly check");
+                    }
+                });
+            }
+            // Nothing here renews these (`RenewPlan::None`), but the loop still re-reads them hourly
+            // and warns as they near expiry.
+            let renewer = certstore::Renewer {
+                store: Arc::clone(&c.store),
+                plan: certstore::RenewPlan::None,
+                tls: cfg.tls.clone(),
+                cp: None,
+                challenges: None,
+            };
+            tokio::spawn(certstore::maintain(renewer, shutdown_rx.clone()));
+        }
 
         // While the redirect listener holds the HTTP-01 port, ACME renewals publish their
         // challenge tokens here and that listener answers them (see `tls::redirect_router`).
-        let challenges =
-            (cfg.tls.redirect_port == acme::HTTP01_PORT).then(acme::ChallengeMap::default);
+        let challenges = acme::shared_challenges(cfg.tls.redirect_port);
 
         if cfg.tls.watch {
             let store = Arc::clone(&cert_store);

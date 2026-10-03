@@ -105,6 +105,25 @@ pub struct CertInfo {
     /// Self-signed renewal only ever replaces a certificate that is self-issued, so an operator's
     /// own CA-issued certificate at the same path is never overwritten.
     pub self_issued: bool,
+    /// The certificate's ARI identifier (RFC 9773 §4.1), when it carries an Authority Key
+    /// Identifier. `None` leaves renewal on the two-thirds rule alone.
+    #[serde(skip)]
+    pub ari_id: Option<AriId>,
+}
+
+/// An ACME Renewal Information certificate identifier: the base64url (unpadded) `keyIdentifier` of
+/// the Authority Key Identifier extension and of the DER serial number's content octets, the two
+/// together naming a certificate uniquely within its CA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AriId {
+    pub aki: String,
+    pub serial: String,
+}
+
+impl fmt::Display for AriId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.aki, self.serial)
+    }
 }
 
 impl CertInfo {
@@ -173,6 +192,47 @@ pub struct CertStore {
     /// `RENEW_SOURCES.len() * RENEW_OUTCOMES.len()` counters, source-major.
     renewals: [AtomicU64; 6],
     last_renewal: Mutex<Option<RenewalRecord>>,
+    /// The CA's last ARI answer for the served certificate (see [`Renewer::check`]).
+    ari: Mutex<Option<AriCache>>,
+}
+
+/// What the CA said about renewing one certificate, and until when that answer stands.
+#[derive(Debug, Clone)]
+struct AriCache {
+    /// The certificate it is about; a renewed certificate is asked about afresh.
+    serial: String,
+    /// When ARI says to renew. `None`: the CA gave no window (no ARI, or the request failed).
+    renew_at: Option<i64>,
+    /// Do not ask again before this.
+    refetch_at: i64,
+}
+
+/// Re-ask bounds for ARI: never more often than hourly (the renewal check's own pace), never less
+/// than daily, whatever `Retry-After` says. A CA without ARI is asked again a day later, in case it
+/// adds it; a failed request is retried after an hour.
+const ARI_MIN_RECHECK_SECS: u64 = 60 * 60;
+const ARI_MAX_RECHECK_SECS: u64 = 24 * 60 * 60;
+
+/// How long to wait before asking the CA about a certificate again: its `Retry-After`, held
+/// between [`ARI_MIN_RECHECK_SECS`] and [`ARI_MAX_RECHECK_SECS`].
+fn ari_recheck_secs(retry_after_secs: u64) -> u64 {
+    retry_after_secs.clamp(ARI_MIN_RECHECK_SECS, ARI_MAX_RECHECK_SECS)
+}
+
+/// Where in the CA's suggested window `[start, end]` a certificate renews. RFC 9773 §4.2 asks for a
+/// uniformly random point; it is derived from the serial so that hourly re-checks land on the same
+/// point instead of re-rolling (which would bias renewal towards the start of the window), while
+/// different certificates still spread across it.
+pub fn ari_renew_at(start: i64, end: i64, serial: &str) -> i64 {
+    if end <= start {
+        return start;
+    }
+    // FNV-1a: stable across builds and platforms, unlike the std hasher.
+    let hash = serial.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let span = (end - start) as u64 + 1;
+    start + (hash % span) as i64
 }
 
 impl fmt::Debug for CertStore {
@@ -200,7 +260,19 @@ impl CertStore {
             reloads_rejected: AtomicU64::new(0),
             renewals: Default::default(),
             last_renewal: Mutex::new(None),
+            ari: Mutex::new(None),
         }))
+    }
+
+    /// When the CA's ARI window says to renew the served certificate, if it has said.
+    pub fn ari_renew_at(&self) -> Option<i64> {
+        let serial = self.info().serial;
+        self.ari
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|c| c.serial == serial)
+            .and_then(|c| c.renew_at)
     }
 
     pub fn cert_path(&self) -> &str {
@@ -272,36 +344,66 @@ impl CertStore {
 
     /// Prometheus text exposition for the certificate, appended to `/__edgeguard/metrics`.
     pub fn render_metrics(&self, out: &mut String) {
-        let info = self.info();
+        self.render_metrics_with(&[], out);
+    }
+
+    /// [`render_metrics`](Self::render_metrics) for this (default) pair plus the extra SNI pairs.
+    /// Each family's `# HELP`/`# TYPE` is written once, as the exposition format requires; the
+    /// default pair's series keep their 0.5.0 labels, and each extra pair adds a series labelled
+    /// `cert="<its first host>"`. Renewal counters are the default pair's only: nothing here
+    /// renews an extra pair.
+    pub fn render_metrics_with(&self, extras: &[SniCert], out: &mut String) {
         let source = self.source.label();
+        let gauge = |out: &mut String, name: &str, pick: fn(&CertInfo) -> i64| {
+            out.push_str(&format!(
+                "edgeguard_{name}{{source=\"{source}\"}} {}\n",
+                pick(&self.info())
+            ));
+            for c in extras {
+                out.push_str(&format!(
+                    "edgeguard_{name}{{source=\"{}\",cert=\"{}\"}} {}\n",
+                    c.store.source.label(),
+                    escape_label(c.name()),
+                    pick(&c.store.info())
+                ));
+            }
+        };
         out.push_str(
             "# HELP edgeguard_tls_cert_not_after_seconds Expiry of the served TLS certificate (unix seconds).\n\
              # TYPE edgeguard_tls_cert_not_after_seconds gauge\n",
         );
-        out.push_str(&format!(
-            "edgeguard_tls_cert_not_after_seconds{{source=\"{source}\"}} {}\n",
-            info.not_after
-        ));
+        gauge(out, "tls_cert_not_after_seconds", |i| i.not_after);
         out.push_str(
             "# HELP edgeguard_tls_cert_not_before_seconds Start of validity of the served TLS certificate (unix seconds).\n\
              # TYPE edgeguard_tls_cert_not_before_seconds gauge\n",
         );
-        out.push_str(&format!(
-            "edgeguard_tls_cert_not_before_seconds{{source=\"{source}\"}} {}\n",
-            info.not_before
-        ));
+        gauge(out, "tls_cert_not_before_seconds", |i| i.not_before);
         out.push_str(
             "# HELP edgeguard_tls_cert_reloads_total Certificate reloads from disk, by outcome.\n\
              # TYPE edgeguard_tls_cert_reloads_total counter\n",
         );
-        out.push_str(&format!(
-            "edgeguard_tls_cert_reloads_total{{outcome=\"swapped\"}} {}\n",
-            self.reloads_swapped.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "edgeguard_tls_cert_reloads_total{{outcome=\"rejected\"}} {}\n",
-            self.reloads_rejected.load(Ordering::Relaxed)
-        ));
+        for (outcome, own, pick) in [
+            (
+                "swapped",
+                &self.reloads_swapped,
+                (|s: &CertStore| &s.reloads_swapped) as fn(&CertStore) -> &AtomicU64,
+            ),
+            ("rejected", &self.reloads_rejected, |s: &CertStore| {
+                &s.reloads_rejected
+            }),
+        ] {
+            out.push_str(&format!(
+                "edgeguard_tls_cert_reloads_total{{outcome=\"{outcome}\"}} {}\n",
+                own.load(Ordering::Relaxed)
+            ));
+            for c in extras {
+                out.push_str(&format!(
+                    "edgeguard_tls_cert_reloads_total{{outcome=\"{outcome}\",cert=\"{}\"}} {}\n",
+                    escape_label(c.name()),
+                    pick(&c.store).load(Ordering::Relaxed)
+                ));
+            }
+        }
         out.push_str(
             "# HELP edgeguard_tls_cert_renewals_total Certificate renewal attempts, by source and outcome.\n\
              # TYPE edgeguard_tls_cert_renewals_total counter\n",
@@ -328,7 +430,9 @@ impl CertStore {
             "not_after": info.not_after,
             "days_left": info.days_left(now),
             "self_issued": info.self_issued,
-            "renewal_due": renewal_due(info.not_before, info.not_after, now),
+            "renewal_due": renewal_due(info.not_before, info.not_after, now)
+                || self.ari_renew_at().is_some_and(|t| now >= t),
+            "ari_renew_at": self.ari_renew_at(),
             "last_renewal": self.last_renewal(),
         })
     }
@@ -366,6 +470,160 @@ fn load_pair(cert_path: &str, key_path: &str) -> Result<Live> {
     })
 }
 
+/// Whether a filesystem event in a watched directory should trigger a reload. Everything except
+/// reads: a reload *opens and reads* the pair, and on Linux that is itself an `Access` event in the
+/// same directory — reacting to it would make every reload schedule the next one, forever.
+fn triggers_reload(kind: &EventKind) -> bool {
+    !matches!(kind, EventKind::Access(_))
+}
+
+/// A Prometheus label value: backslash, quote and newline escaped.
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// The listener's certificate resolver when more than one pair is configured: picks a pair by the
+/// hostname in the ClientHello (SNI). Each pair is its own [`CertStore`], so each is swapped,
+/// watched and checked independently; this only chooses between them, per handshake.
+///
+/// Matching: an exact name first, then a one-label wildcard (`*.example.com` matches
+/// `a.example.com`, not `example.com` or `a.b.example.com`), then the default pair. Names compare
+/// case-insensitively, as DNS names do.
+pub struct SniResolver {
+    default: Arc<CertStore>,
+    certs: Vec<SniCert>,
+    exact: std::collections::HashMap<String, usize>,
+    /// `(suffix including the leading dot, index)`, e.g. `(".example.com", 0)`.
+    wildcard: Vec<(String, usize)>,
+}
+
+/// A `[[tls.certs]]` host pattern, normalised: lowercase, no trailing dot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SniHost {
+    Exact(String),
+    /// The suffix a matching name ends with, leading dot included (`.example.com`).
+    Wildcard(String),
+}
+
+/// Parse one `[[tls.certs]]` host: an exact name, or `*.` followed by a domain of two or more
+/// labels. Shared by the resolver and `doctor`, so both refuse the same patterns.
+pub fn parse_sni_host(raw: &str) -> Result<SniHost> {
+    let h = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if let Some(suffix) = h.strip_prefix("*.") {
+        anyhow::ensure!(
+            !suffix.is_empty() && !suffix.contains('*') && suffix.contains('.'),
+            "[[tls.certs]] host {raw:?}: a wildcard must be `*.` followed by a domain with at least \
+             two labels, like `*.example.com`"
+        );
+        return Ok(SniHost::Wildcard(format!(".{suffix}")));
+    }
+    anyhow::ensure!(
+        !h.is_empty() && !h.contains('*'),
+        "[[tls.certs]] host {raw:?}: use an exact name or a leading `*.` wildcard"
+    );
+    Ok(SniHost::Exact(h))
+}
+
+/// One extra pair and the hostnames it serves.
+#[derive(Clone)]
+pub struct SniCert {
+    pub hosts: Vec<String>,
+    pub store: Arc<CertStore>,
+}
+
+impl SniCert {
+    /// The label this pair carries in metrics and `GET /__edgeguard/tls`: its first host.
+    pub fn name(&self) -> &str {
+        self.hosts.first().map(String::as_str).unwrap_or("")
+    }
+}
+
+impl fmt::Debug for SniResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SniResolver")
+            .field("default", &self.default.cert_path())
+            .field(
+                "certs",
+                &self.certs.iter().map(SniCert::name).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl SniResolver {
+    /// Build the resolver, refusing host patterns it could not match as written: an empty list, a
+    /// wildcard anywhere but the first label, or the same name claimed by two pairs.
+    pub fn new(default: Arc<CertStore>, certs: Vec<SniCert>) -> Result<Self> {
+        let mut exact = std::collections::HashMap::new();
+        let mut wildcard = Vec::new();
+        for (i, c) in certs.iter().enumerate() {
+            anyhow::ensure!(
+                !c.hosts.is_empty(),
+                "[[tls.certs]] {}: `hosts` is empty; list the names this certificate is served for",
+                c.store.cert_path()
+            );
+            for raw in &c.hosts {
+                match parse_sni_host(raw)? {
+                    SniHost::Wildcard(key) => {
+                        anyhow::ensure!(
+                            !wildcard.iter().any(|(s, _)| *s == key),
+                            "[[tls.certs]] host {raw:?} is claimed by two certificates"
+                        );
+                        wildcard.push((key, i));
+                    }
+                    SniHost::Exact(h) => anyhow::ensure!(
+                        exact.insert(h, i).is_none(),
+                        "[[tls.certs]] host {raw:?} is claimed by two certificates"
+                    ),
+                }
+            }
+        }
+        Ok(Self {
+            default,
+            certs,
+            exact,
+            wildcard,
+        })
+    }
+
+    /// The store serving `server_name` (the SNI value; `None` when the client sent none).
+    pub fn select(&self, server_name: Option<&str>) -> &Arc<CertStore> {
+        let Some(name) = server_name else {
+            return &self.default;
+        };
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(&i) = self.exact.get(&name) {
+            return &self.certs[i].store;
+        }
+        // One label only: strip the first label and look for the rest as a wildcard suffix.
+        if let Some(dot) = name.find('.') {
+            let suffix = &name[dot..];
+            if let Some((_, i)) = self.wildcard.iter().find(|(s, _)| s == suffix) {
+                return &self.certs[*i].store;
+            }
+        }
+        &self.default
+    }
+
+    pub fn default_store(&self) -> &Arc<CertStore> {
+        &self.default
+    }
+
+    pub fn certs(&self) -> &[SniCert] {
+        &self.certs
+    }
+}
+
+impl ResolvesServerCert for SniResolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(
+            &self.select(hello.server_name()).live.load().key,
+        ))
+    }
+}
+
 /// Reload `store` whenever its certificate or key file changes. Runs until `shutdown` flips.
 ///
 /// Watches the parent *directories*, not the files, for the same reason config hot-reload does:
@@ -376,7 +634,7 @@ fn load_pair(cert_path: &str, key_path: &str) -> Result<Live> {
 pub async fn watch(store: Arc<CertStore>, mut shutdown: tokio_watch::Receiver<bool>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<()>(8);
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
-        Ok(event) if !matches!(event.kind, EventKind::Access(_)) => {
+        Ok(event) if triggers_reload(&event.kind) => {
             let _ = tx.try_send(());
         }
         Ok(_) => {}
@@ -476,7 +734,16 @@ impl Renewer {
     pub async fn check(&self) -> Result<Check> {
         let info = self.store.info();
         let now = now_unix();
-        if !renewal_due(info.not_before, info.not_after, now) {
+        let two_thirds = renewal_due(info.not_before, info.not_after, now);
+        // ARI can only bring a renewal earlier: it is asked alongside the two-thirds rule, never
+        // instead of it.
+        let ari_at = if self.plan == RenewPlan::Acme && self.tls.acme.ari {
+            self.ari_window(&info, now).await
+        } else {
+            None
+        };
+        let ari_due = ari_at.is_some_and(|t| now >= t);
+        if !two_thirds && !ari_due {
             return Ok(Check::NotDue);
         }
         match self.plan {
@@ -484,13 +751,17 @@ impl Renewer {
                 info!(
                     domains = ?self.tls.acme.domains,
                     days_left = info.days_left(now),
+                    reason = if two_thirds { "two_thirds" } else { "ari" },
                     "ACME certificate is due for renewal"
                 );
-                let result = crate::acme::obtain_certificate_via(
+                // Name the replaced certificate only to a CA that answered ARI for it.
+                let replaces = ari_at.and(info.ari_id.as_ref());
+                let result = crate::acme::obtain_certificate_replacing(
                     &self.tls.acme,
                     &self.tls,
                     self.cp.as_deref(),
                     self.challenges.as_ref(),
+                    replaces,
                 )
                 .await;
                 match result {
@@ -557,6 +828,56 @@ impl Renewer {
     }
 }
 
+impl Renewer {
+    /// The CA's ARI renewal point for the served certificate: from the cache while it stands,
+    /// otherwise asked for and cached until the CA's `Retry-After` (within the re-ask bounds).
+    /// `None` when the certificate has no ARI identifier or the CA gave no window.
+    async fn ari_window(&self, info: &CertInfo, now: i64) -> Option<i64> {
+        let id = info.ari_id.as_ref()?;
+        let previous = self
+            .store
+            .ari
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|c| c.serial == info.serial);
+        if let Some(c) = &previous {
+            if now < c.refetch_at {
+                return c.renew_at;
+            }
+        }
+        let (renew_at, wait) = match crate::acme::renewal_window(&self.tls.acme, id).await {
+            Ok(Some(w)) => {
+                let at = ari_renew_at(w.start, w.end, &info.serial);
+                let lifetime = info.not_after - info.not_before;
+                if at < info.not_before + lifetime / 3 * 2 {
+                    info!(
+                        renew_at = at,
+                        explanation_url = w.explanation_url.as_deref().unwrap_or(""),
+                        "the CA's renewal window (ARI) is earlier than the two-thirds point"
+                    );
+                }
+                (Some(at), w.retry_after.as_secs())
+            }
+            Ok(None) => (None, ARI_MAX_RECHECK_SECS),
+            Err(e) => {
+                warn!(error = format!("{e:#}"), "could not read the CA's renewal window (ARI); the two-thirds rule still applies");
+                // Keep what the CA said last time about this certificate.
+                (previous.and_then(|c| c.renew_at), ARI_MIN_RECHECK_SECS)
+            }
+        };
+        let wait = ari_recheck_secs(wait) as i64;
+        if let Ok(mut g) = self.store.ari.lock() {
+            *g = Some(AriCache {
+                serial: info.serial.clone(),
+                renew_at,
+                refetch_at: now + wait,
+            });
+        }
+        renew_at
+    }
+}
+
 /// Keep the served certificate current until `shutdown` flips: re-read the files, and renew when
 /// due. Checks once immediately, so a certificate already past its renewal point at startup (a
 /// 0.4.0 self-signed certificate on its 70th day, say) is renewed now rather than in an hour.
@@ -588,7 +909,7 @@ pub async fn maintain(renewer: Renewer, mut shutdown: tokio_watch::Receiver<bool
             Ok(Check::Unrenewable) => {
                 let info = renewer.store.info();
                 let days_left = info.days_left(now_unix());
-                if !warned_unrenewable || days_left < URGENT_DAYS {
+                if should_warn_unrenewable(warned_unrenewable, days_left) {
                     warn!(
                         cert = %renewer.store.cert_path(),
                         days_left,
@@ -609,17 +930,29 @@ pub async fn maintain(renewer: Renewer, mut shutdown: tokio_watch::Receiver<bool
             }
         }
 
-        let wait = if failures == 0 {
-            CHECK_EVERY + Duration::from_secs(jitter_secs(CHECK_JITTER_SECS))
-        } else {
-            backoff(failures)
-        };
+        let wait = next_wait(failures);
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() { return; }
             }
         }
+    }
+}
+
+/// Warn about a certificate nothing here can renew once, then again on every check in its last
+/// [`URGENT_DAYS`] — often enough to be seen, not so often that it is noise for two months.
+fn should_warn_unrenewable(already_warned: bool, days_left: i64) -> bool {
+    !already_warned || days_left < URGENT_DAYS
+}
+
+/// How long [`maintain`] sleeps before its next check: hourly plus jitter while healthy, the
+/// [`backoff`] schedule after failures.
+fn next_wait(failures: u32) -> Duration {
+    if failures == 0 {
+        CHECK_EVERY + Duration::from_secs(jitter_secs(CHECK_JITTER_SECS))
+    } else {
+        backoff(failures)
     }
 }
 
@@ -722,12 +1055,72 @@ mod der {
         let not_before = read(validity.value).context("reading notBefore")?;
         let not_after = read(not_before.rest).context("reading notAfter")?;
 
+        // Best effort: a certificate whose extensions this walker cannot read still loads; it just
+        // renews on the two-thirds rule alone.
+        let ari_id = authority_key_id(subject.rest)
+            .ok()
+            .flatten()
+            .map(|aki| super::AriId {
+                aki: b64url(aki),
+                serial: b64url(serial.value),
+            });
+
         Ok(CertInfo {
             not_before: time_to_unix(not_before.tag, not_before.value)?,
             not_after: time_to_unix(not_after.tag, not_after.value)?,
             serial: serial.value.iter().map(|b| format!("{b:02x}")).collect(),
             self_issued: issuer.whole == subject.whole,
+            ari_id,
         })
+    }
+
+    fn b64url(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// The `keyIdentifier` octets of the Authority Key Identifier extension, reading from just after
+    /// `subject` (so from `subjectPublicKeyInfo`). `None` when the certificate has no extensions,
+    /// no AKI, or an AKI without a key identifier.
+    fn authority_key_id(after_subject: &[u8]) -> Result<Option<&[u8]>> {
+        const EXPLICIT_3: u8 = 0xa3;
+        const OID: u8 = 0x06;
+        const BOOLEAN: u8 = 0x01;
+        const OCTET_STRING: u8 = 0x04;
+        const IMPLICIT_0: u8 = 0x80;
+        // id-ce-authorityKeyIdentifier, 2.5.29.35.
+        const AKI_OID: &[u8] = &[0x55, 0x1d, 0x23];
+
+        let spki = expect(after_subject, SEQUENCE, "subjectPublicKeyInfo")?;
+        let mut cur = spki.rest;
+        // Skip the optional issuerUniqueID [1] and subjectUniqueID [2].
+        while matches!(cur.first(), Some(0x81 | 0x82 | 0xa1 | 0xa2)) {
+            cur = read(cur)?.rest;
+        }
+        if cur.first() != Some(&EXPLICIT_3) {
+            return Ok(None);
+        }
+        let wrapper = read(cur)?;
+        let mut exts = expect(wrapper.value, SEQUENCE, "extensions")?.value;
+        while !exts.is_empty() {
+            let ext = expect(exts, SEQUENCE, "extension")?;
+            exts = ext.rest;
+            let oid = expect(ext.value, OID, "extnID")?;
+            if oid.value != AKI_OID {
+                continue;
+            }
+            let mut rest = oid.rest;
+            if rest.first() == Some(&BOOLEAN) {
+                rest = read(rest)?.rest;
+            }
+            let value = expect(rest, OCTET_STRING, "extnValue")?;
+            let aki = expect(value.value, SEQUENCE, "AuthorityKeyIdentifier")?;
+            return Ok(match aki.value.first() {
+                Some(&IMPLICIT_0) => Some(read(aki.value)?.value),
+                _ => None,
+            });
+        }
+        Ok(None)
     }
 
     /// `UTCTime` (`YYMMDDHHMMSSZ`) or `GeneralizedTime` (`YYYYMMDDHHMMSSZ`) to unix seconds. RFC
@@ -773,6 +1166,19 @@ mod der {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// 0x80 is the BER *indefinite* length, which DER forbids. It must be refused, not read
+        /// as a short-form length of 128.
+        #[test]
+        fn indefinite_length_is_rejected() {
+            let mut input = vec![0x04, 0x80];
+            input.extend([0u8; 200]);
+            assert!(read(&input).is_err());
+            // The largest short-form length is still read as one.
+            let mut short = vec![0x04, 0x7f];
+            short.extend([0u8; 0x7f]);
+            assert_eq!(read(&short).unwrap().value.len(), 0x7f);
+        }
 
         #[test]
         fn utc_time_century_rule() {
@@ -1013,6 +1419,324 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Reads must not trigger a reload: a reload reads the pair, so on Linux it would trigger the
+    /// next one, forever.
+    #[test]
+    fn watcher_reloads_on_changes_but_not_on_reads() {
+        use notify::event::{AccessKind, CreateKind, DataChange, ModifyKind, RemoveKind};
+        assert!(!triggers_reload(&EventKind::Access(AccessKind::Any)));
+        assert!(!triggers_reload(&EventKind::Access(AccessKind::Read)));
+        assert!(triggers_reload(&EventKind::Create(CreateKind::File)));
+        assert!(triggers_reload(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        ))));
+        assert!(triggers_reload(&EventKind::Remove(RemoveKind::File)));
+        // A symlink flip (the Kubernetes `..data` swap) arrives as a rename, i.e. a Modify.
+        assert!(triggers_reload(&EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Any
+        ))));
+    }
+
+    #[test]
+    fn unrenewable_warning_is_once_then_on_every_check_in_the_last_week() {
+        assert!(should_warn_unrenewable(false, 60), "first sighting");
+        assert!(
+            !should_warn_unrenewable(true, 60),
+            "not again while there is time"
+        );
+        assert!(
+            !should_warn_unrenewable(true, URGENT_DAYS),
+            "boundary: 7 days is not urgent"
+        );
+        assert!(should_warn_unrenewable(true, URGENT_DAYS - 1));
+        assert!(should_warn_unrenewable(true, -3), "already expired");
+    }
+
+    /// Healthy: hourly, plus up to ten minutes of jitter so a fleet started together spreads out.
+    #[test]
+    fn healthy_checks_are_hourly_with_jitter_and_failures_back_off() {
+        let hour = Duration::from_secs(3600);
+        let mut max_jitter = Duration::ZERO;
+        for _ in 0..200 {
+            let w = next_wait(0);
+            assert!(w >= hour && w < hour + Duration::from_secs(600), "{w:?}");
+            max_jitter = max_jitter.max(w - hour);
+        }
+        // 200 draws from 0..600 s: all under 300 s has probability 2^-200.
+        assert!(max_jitter > Duration::from_secs(300), "{max_jitter:?}");
+        assert_eq!(next_wait(1), Duration::from_secs(5 * 60));
+        assert_eq!(next_wait(3), Duration::from_secs(20 * 60));
+        assert_eq!(next_wait(20), MAX_BACKOFF);
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(12 * 3600));
+    }
+
+    #[test]
+    fn jitter_stays_below_its_bound_and_varies() {
+        assert_eq!(jitter_secs(0), 0);
+        let draws: std::collections::HashSet<u64> = (0..100).map(|_| jitter_secs(1000)).collect();
+        assert!(draws.iter().all(|&j| j < 1000), "{draws:?}");
+        assert!(draws.len() > 10, "jitter must vary: {draws:?}");
+    }
+
+    /// Renewal through `check` keeps the key by default (anything pinning it keeps working) and
+    /// replaces it only when `self_signed_rotate_key` asks.
+    #[tokio::test]
+    async fn check_keeps_the_key_unless_rotation_is_asked_for() {
+        for rotate in [false, true] {
+            let dir = tmpdir(if rotate { "rotate" } else { "keep" });
+            let cert = dir.join("cert.pem").to_string_lossy().into_owned();
+            let key = dir.join("key.pem").to_string_lossy().into_owned();
+            let expired = expired_self_signed();
+            crate::selfsigned::publish_pair(&expired.0, &expired.1, &cert, &key).unwrap();
+            let store = CertStore::load(&cert, &key, CertSource::SelfSigned).unwrap();
+            let mut tls = tls_cfg(&cert, &key);
+            tls.self_signed_rotate_key = rotate;
+            let renewer = Renewer {
+                store: Arc::clone(&store),
+                plan: RenewPlan::from_cfg(&tls),
+                tls,
+                cp: None,
+                challenges: None,
+            };
+            assert_eq!(renewer.check().await.unwrap(), Check::Renewed);
+            let key_after = std::fs::read_to_string(&key).unwrap();
+            assert_eq!(key_after == expired.1, !rotate, "rotate_key = {rotate}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The loop itself: started on an expired certificate it renews straight away (not an hour
+    /// later), and it returns when shutdown flips.
+    #[tokio::test]
+    async fn maintain_renews_a_due_certificate_at_once_and_stops_on_shutdown() {
+        let dir = tmpdir("maintain");
+        let cert = dir.join("cert.pem").to_string_lossy().into_owned();
+        let key = dir.join("key.pem").to_string_lossy().into_owned();
+        let expired = expired_self_signed();
+        crate::selfsigned::publish_pair(&expired.0, &expired.1, &cert, &key).unwrap();
+        let store = CertStore::load(&cert, &key, CertSource::SelfSigned).unwrap();
+        let tls = tls_cfg(&cert, &key);
+        let renewer = Renewer {
+            store: Arc::clone(&store),
+            plan: RenewPlan::from_cfg(&tls),
+            tls,
+            cp: None,
+            challenges: None,
+        };
+        let (tx, rx) = tokio_watch::channel(false);
+        let task = tokio::spawn(maintain(renewer, rx));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.info().not_after < now_unix() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "not renewed within 10 s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(store.last_renewal().unwrap().outcome, "ok");
+
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("maintain did not stop on shutdown")
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renewal_counters_are_kept_per_source_and_outcome() {
+        let dir = tmpdir("counters");
+        let (cert, key) = write_self_signed(&dir, 30);
+        let store = CertStore::load(&cert, &key, CertSource::SelfSigned).unwrap();
+        store.record_renewal("acme", "deferred", None);
+        store.record_renewal("acme", "deferred", None);
+        store.record_renewal("self_signed", "failed", Some("disk full".into()));
+        let mut out = String::new();
+        store.render_metrics(&mut out);
+        for (src, outcome, n) in [
+            ("acme", "ok", 0),
+            ("acme", "failed", 0),
+            ("acme", "deferred", 2),
+            ("self_signed", "ok", 0),
+            ("self_signed", "failed", 1),
+            ("self_signed", "deferred", 0),
+        ] {
+            let line = format!(
+                "edgeguard_tls_cert_renewals_total{{source=\"{src}\",outcome=\"{outcome}\"}} {n}\n"
+            );
+            assert!(out.contains(&line), "missing {line:?} in:\n{out}");
+        }
+        let last = store.last_renewal().unwrap();
+        assert_eq!((last.source, last.outcome), ("self_signed", "failed"));
+        assert_eq!(last.error.as_deref(), Some("disk full"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_json_describes_the_served_certificate() {
+        let dir = tmpdir("status");
+        let (cert, key) = write_self_signed(&dir, 30);
+        let store = CertStore::load(&cert, &key, CertSource::SelfSigned).unwrap();
+        let info = store.info();
+        let j = store.status_json();
+        assert_eq!(j["source"], "self_signed");
+        assert_eq!(j["cert_path"], cert.as_str());
+        assert_eq!(j["serial"], info.serial.as_str());
+        assert_eq!(j["not_after"], info.not_after);
+        assert_eq!(j["not_before"], info.not_before);
+        assert!((29..=30).contains(&j["days_left"].as_i64().unwrap()), "{j}");
+        assert_eq!(j["self_issued"], true);
+        assert_eq!(j["renewal_due"], false);
+        assert!(j["last_renewal"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sni_host_patterns_are_exact_names_or_one_leading_wildcard() {
+        assert_eq!(
+            parse_sni_host(" API.Example.com. ").unwrap(),
+            SniHost::Exact("api.example.com".into())
+        );
+        assert_eq!(
+            parse_sni_host("*.Example.com").unwrap(),
+            SniHost::Wildcard(".example.com".into())
+        );
+        for bad in [
+            "",
+            "*",
+            "*.",
+            "*.com",
+            "a.*.example.com",
+            "*.*.example.com",
+            "api*.example.com",
+        ] {
+            assert!(parse_sni_host(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    fn sni_fixture() -> (
+        PathBuf,
+        Arc<CertStore>,
+        Arc<CertStore>,
+        Arc<CertStore>,
+        SniResolver,
+    ) {
+        let dir = tmpdir("sni");
+        let pair = |name: &str| {
+            let d = dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let (c, k) = write_self_signed(&d, 30);
+            CertStore::load(&c, &k, CertSource::File).unwrap()
+        };
+        let (default, api, wild) = (pair("default"), pair("api"), pair("wild"));
+        let resolver = SniResolver::new(
+            Arc::clone(&default),
+            vec![
+                SniCert {
+                    hosts: vec!["api.example.com".into()],
+                    store: Arc::clone(&api),
+                },
+                SniCert {
+                    hosts: vec!["*.example.com".into(), "example.org".into()],
+                    store: Arc::clone(&wild),
+                },
+            ],
+        )
+        .unwrap();
+        (dir, default, api, wild, resolver)
+    }
+
+    #[test]
+    fn sni_picks_exact_then_one_label_wildcard_then_the_default() {
+        let (dir, default, api, wild, r) = sni_fixture();
+        let is = |name: Option<&str>, want: &Arc<CertStore>| {
+            assert!(Arc::ptr_eq(r.select(name), want), "{name:?}");
+        };
+        is(Some("api.example.com"), &api);
+        is(Some("API.Example.COM."), &api); // DNS names are case-insensitive; trailing dot
+        is(Some("shop.example.com"), &wild); // one label under the wildcard
+        is(Some("example.org"), &wild); // a second exact host on the same pair
+        is(Some("a.shop.example.com"), &default); // two labels: not the wildcard
+        is(Some("example.com"), &default); // the apex is not `*.example.com`
+        is(Some("other.net"), &default);
+        is(None, &default); // no SNI at all
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sni_refuses_empty_hosts_and_names_claimed_twice() {
+        let (dir, default, api, wild, _) = sni_fixture();
+        let cert = |hosts: &[&str], store: &Arc<CertStore>| SniCert {
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            store: Arc::clone(store),
+        };
+        let build = |certs| SniResolver::new(Arc::clone(&default), certs);
+        assert!(build(vec![cert(&[], &api)]).is_err(), "empty hosts");
+        assert!(
+            build(vec![
+                cert(&["a.example.com"], &api),
+                cert(&["A.example.com"], &wild)
+            ])
+            .is_err(),
+            "the same exact name twice"
+        );
+        assert!(
+            build(vec![
+                cert(&["*.example.com"], &api),
+                cert(&["*.example.com"], &wild)
+            ])
+            .is_err(),
+            "the same wildcard twice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One `# HELP`/`# TYPE` per family however many pairs, the default pair's series unchanged,
+    /// and one more series per extra pair labelled with its first host.
+    #[test]
+    fn extra_pairs_render_as_labelled_series_in_the_same_families() {
+        let (dir, default, api, wild, r) = sni_fixture();
+        let mut out = String::new();
+        default.render_metrics_with(r.certs(), &mut out);
+        for family in [
+            "edgeguard_tls_cert_not_after_seconds",
+            "edgeguard_tls_cert_not_before_seconds",
+            "edgeguard_tls_cert_reloads_total",
+            "edgeguard_tls_cert_renewals_total",
+        ] {
+            assert_eq!(
+                out.matches(&format!("# TYPE {family} ")).count(),
+                1,
+                "{family}"
+            );
+        }
+        assert!(out.contains(&format!(
+            "edgeguard_tls_cert_not_after_seconds{{source=\"file\"}} {}\n",
+            default.info().not_after
+        )));
+        assert!(out.contains(&format!(
+            "edgeguard_tls_cert_not_after_seconds{{source=\"file\",cert=\"api.example.com\"}} {}\n",
+            api.info().not_after
+        )));
+        assert!(out.contains(&format!(
+            "edgeguard_tls_cert_not_after_seconds{{source=\"file\",cert=\"*.example.com\"}} {}\n",
+            wild.info().not_after
+        )));
+        assert!(out.contains(
+            "edgeguard_tls_cert_reloads_total{outcome=\"swapped\",cert=\"api.example.com\"} 0\n"
+        ));
+        // Renewals are the default pair's only.
+        assert!(!out.contains("renewals_total{source=\"acme\",outcome=\"ok\",cert="));
+        // No extras: byte-for-byte what 0.5.0 rendered.
+        let (mut a, mut b) = (String::new(), String::new());
+        default.render_metrics(&mut a);
+        default.render_metrics_with(&[], &mut b);
+        assert_eq!(a, b);
+        assert!(!a.contains("cert="));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn plan_follows_config() {
         let mut tls = TlsCfg::default();
@@ -1038,6 +1762,138 @@ mod tests {
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
         (cert.pem(), key.serialize_pem())
+    }
+
+    /// A leaf from a CA whose key identifier is `C0 FF EE`, with serial `CA FE` and an AKI
+    /// extension: the certificate instant-acme's own test derives `wP_u.AMr-` from.
+    fn ca_issued_with_aki(
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> (String, String) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_identifier_method = rcgen::KeyIdMethod::PreSpecified(vec![0xC0, 0xFF, 0xEE]);
+        let ca = rcgen::CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+
+        let mut params = rcgen::CertificateParams::new(hosts()).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(&[0xCA, 0xFE]));
+        params.use_authority_key_identifier_extension = true;
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &ca).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    #[test]
+    fn ari_identifier_is_read_from_the_authority_key_identifier_and_serial() {
+        let (pem, _) = ca_issued_with_aki(past(1), past(-89));
+        let der = rustls_pemfile::certs(&mut pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let info = CertInfo::from_der(&der).unwrap();
+        // RFC 9773 §4.1 encoding; the same vector instant-acme tests its x509-parser path with.
+        assert_eq!(info.ari_id.unwrap().to_string(), "wP_u.AMr-");
+
+        // A self-signed certificate has no AKI, so no ARI identifier: two-thirds rule only.
+        let dir = tmpdir("ari-none");
+        let (cert, key) = write_self_signed(&dir, 90);
+        let store = CertStore::load(&cert, &key, CertSource::SelfSigned).unwrap();
+        assert!(store.info().ari_id.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ari_is_re_asked_between_hourly_and_daily() {
+        assert_eq!(
+            ari_recheck_secs(0),
+            3_600,
+            "a zero Retry-After still waits an hour"
+        );
+        assert_eq!(
+            ari_recheck_secs(6 * 3_600),
+            6 * 3_600,
+            "the CA's hint is used as given"
+        );
+        assert_eq!(
+            ari_recheck_secs(7 * 86_400),
+            86_400,
+            "never longer than a day"
+        );
+    }
+
+    #[test]
+    fn ari_point_is_inside_the_window_and_stable_per_certificate() {
+        let (start, end) = (1_000_000, 1_086_400);
+        for serial in ["01", "cafe", "00ff", "7fffffffffffffff"] {
+            let at = ari_renew_at(start, end, serial);
+            assert!((start..=end).contains(&at), "{serial}: {at}");
+            assert_eq!(
+                at,
+                ari_renew_at(start, end, serial),
+                "re-checks land on the same point"
+            );
+        }
+        assert_ne!(
+            ari_renew_at(start, end, "01"),
+            ari_renew_at(start, end, "02")
+        );
+        // An empty or inverted window means "now-ish": its start.
+        assert_eq!(ari_renew_at(start, start, "01"), start);
+        assert_eq!(ari_renew_at(end, start, "01"), end);
+    }
+
+    /// The CA's window can bring a renewal before the two-thirds point; a window in the future,
+    /// or ARI turned off, leaves the certificate alone.
+    #[tokio::test]
+    async fn an_ari_window_that_has_opened_makes_a_young_certificate_due() {
+        let dir = tmpdir("ari-due");
+        let cert = dir.join("cert.pem").to_string_lossy().into_owned();
+        let key = dir.join("key.pem").to_string_lossy().into_owned();
+        // Day 1 of 90: nowhere near two-thirds.
+        let (leaf_pem, leaf_key) = ca_issued_with_aki(past(1), past(-89));
+        crate::selfsigned::publish_pair(&leaf_pem, &leaf_key, &cert, &key).unwrap();
+        let store = CertStore::load(&cert, &key, CertSource::Acme).unwrap();
+        let now = now_unix();
+        let serial = store.info().serial;
+        let seed = |renew_at: i64| {
+            *store.ari.lock().unwrap() = Some(AriCache {
+                serial: serial.clone(),
+                renew_at: Some(renew_at),
+                refetch_at: now + 3600,
+            });
+        };
+        let renewer = |ari: bool| {
+            let mut tls = tls_cfg(&cert, &key);
+            tls.self_signed = false;
+            tls.acme.enabled = true;
+            tls.acme.ari = ari;
+            // No domains: an attempted renewal fails at once, without a CA, which is how the
+            // test sees that one was attempted.
+            tls.acme.domains = Vec::new();
+            Renewer {
+                store: Arc::clone(&store),
+                plan: RenewPlan::from_cfg(&tls),
+                tls,
+                cp: None,
+                challenges: None,
+            }
+        };
+
+        seed(now + 86_400);
+        assert_eq!(renewer(true).check().await.unwrap(), Check::NotDue);
+
+        seed(now - 60);
+        let err = renewer(true).check().await.unwrap_err();
+        assert!(format!("{err:#}").contains("domains"), "{err:#}");
+        assert_eq!(store.status_json()["renewal_due"], true);
+        assert_eq!(store.status_json()["ari_renew_at"], now - 60);
+
+        // Off: the window is not consulted.
+        assert_eq!(renewer(false).check().await.unwrap(), Check::NotDue);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn expired_ca_issued() -> (String, String) {

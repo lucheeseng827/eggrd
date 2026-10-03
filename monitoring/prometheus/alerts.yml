@@ -100,9 +100,9 @@ groups:
       - alert: EdgeGuardAcmeBudgetLow
         expr: |
           min by (ca, bucket, key) (edgeguard_acme_budget_remaining)
-            / on (ca, bucket) group_left() (
-              max by (ca, bucket) (edgeguard_acme_budget_remaining > 0)
-            ) < 0.4
+            / on (ca, bucket) group_left()
+              max by (ca, bucket) (edgeguard_acme_budget_limit)
+            < 0.4
         for: 30m
         labels:
           severity: warning

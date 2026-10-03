@@ -609,6 +609,12 @@ mod tests {
         /// The body of the last lease request, so a test can prove the edge asked at all — and
         /// that it sent raw identifiers rather than a key it computed itself.
         last_lease: Arc<StdMutex<Option<serde_json::Value>>>,
+        /// Usage reports to refuse with a 500 before accepting, to exercise the retry path.
+        fail_usage: Arc<std::sync::atomic::AtomicIsize>,
+        /// Usage reports accepted so far.
+        usage_count: Arc<std::sync::atomic::AtomicUsize>,
+        /// Every accepted usage report, in order.
+        all_usage: Arc<StdMutex<Vec<serde_json::Value>>>,
     }
 
     async fn policy(headers: HeaderMap) -> axum::response::Response {
@@ -631,7 +637,16 @@ mod tests {
     }
 
     async fn usage(State(s): State<Stub>, body: axum::body::Bytes) -> StatusCode {
-        *s.last_usage.lock().unwrap() = serde_json::from_slice(&body).ok();
+        use std::sync::atomic::Ordering;
+        if s.fail_usage.fetch_sub(1, Ordering::SeqCst) > 0 {
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+        if let Some(v) = &v {
+            s.all_usage.lock().unwrap().push(v.clone());
+        }
+        *s.last_usage.lock().unwrap() = v;
+        s.usage_count.fetch_add(1, Ordering::SeqCst);
         StatusCode::ACCEPTED
     }
 
@@ -872,6 +887,105 @@ mod tests {
         // An empty id makes the heartbeat unreportable on the control-plane side, so the edge would
         // vanish from the fleet view with nothing anywhere saying why.
         assert!(!default_edge_id().trim().is_empty());
+    }
+
+    /// The heartbeat carries the served certificate: expiry and source always, and the ACME
+    /// domains only when ACME is the source (a self-signed or file certificate names no managed
+    /// record, so it must not advance one).
+    #[tokio::test]
+    async fn usage_report_carries_the_served_certificate() {
+        use crate::certstore::{CertSource, CertStore};
+        let dir = std::env::temp_dir().join(format!("eg-cp-cert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem").to_string_lossy().into_owned();
+        let key = dir.join("key.pem").to_string_lossy().into_owned();
+        crate::selfsigned::write_to(&["localhost".to_string()], 30, &cert, &key).unwrap();
+        let domains = vec!["example.com".to_string()];
+
+        for (source, want_domains) in [
+            (CertSource::Acme, serde_json::json!(["example.com"])),
+            // Empty is left off the wire entirely.
+            (CertSource::SelfSigned, serde_json::Value::Null),
+        ] {
+            let (addr, stub) = spawn_stub().await;
+            let c = client(addr);
+            let store = CertStore::load(&cert, &key, source).unwrap();
+            assert!(c.set_cert_store(Arc::clone(&store), domains.clone()));
+            assert!(
+                !c.set_cert_store(Arc::clone(&store), domains.clone()),
+                "set once"
+            );
+            c.report_usage(&UsageDelta::default()).await.unwrap();
+            let got = stub.last_usage.lock().unwrap().clone().unwrap();
+            assert_eq!(got["cert_not_after"], store.info().not_after);
+            assert_eq!(got["cert_source"], source.label());
+            assert_eq!(got["cert_domains"], want_domains, "{source:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed report puts the usage back for the next one, and an idle period still reports
+    /// (the report is also the heartbeat).
+    #[tokio::test]
+    async fn report_loop_retries_failed_usage_and_heartbeats_when_idle() {
+        use std::sync::atomic::Ordering;
+        let (addr, stub) = spawn_stub().await;
+        stub.fail_usage.store(1, Ordering::SeqCst);
+        let metrics = Arc::new(Metrics::new());
+        metrics.add_usage_bytes(100, 250);
+        let (tx, rx) = watch::channel(false);
+        let task = tokio::spawn(report_loop(
+            client(addr),
+            Arc::clone(&metrics),
+            Duration::from_millis(20),
+            rx,
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while stub.usage_count.load(Ordering::SeqCst) < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "no reports arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(true).unwrap();
+        task.await.unwrap();
+
+        assert!(
+            stub.fail_usage.load(Ordering::SeqCst) < 0,
+            "the 500 was served"
+        );
+        let all = stub.all_usage.lock().unwrap().clone();
+        // The first accepted report re-ships what the refused one carried.
+        assert_eq!(all[0]["ingress_bytes"], 100, "{all:?}");
+        assert_eq!(all[0]["egress_bytes"], 250, "{all:?}");
+        // The next is an idle period: nothing to bill, but it still arrives as a heartbeat.
+        assert_eq!(all[1]["ingress_bytes"], 0, "{all:?}");
+        assert_eq!(all[1]["edge_id"], all[0]["edge_id"]);
+    }
+
+    /// On shutdown the loop flushes what accumulated since the last tick, so billable usage is not
+    /// lost with the process.
+    #[tokio::test]
+    async fn report_loop_flushes_pending_usage_on_shutdown() {
+        let (addr, stub) = spawn_stub().await;
+        let metrics = Arc::new(Metrics::new());
+        metrics.add_usage_bytes(100, 250);
+        let (tx, rx) = watch::channel(false);
+        // An interval long enough that only the shutdown flush can report.
+        let task = tokio::spawn(report_loop(
+            client(addr),
+            Arc::clone(&metrics),
+            Duration::from_secs(3600),
+            rx,
+        ));
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("report_loop did not stop")
+            .unwrap();
+        let all = stub.all_usage.lock().unwrap().clone();
+        assert_eq!(all.len(), 1, "exactly the final flush: {all:?}");
+        assert_eq!(all[0]["ingress_bytes"], 100);
+        assert_eq!(all[0]["egress_bytes"], 250);
     }
 
     #[tokio::test]

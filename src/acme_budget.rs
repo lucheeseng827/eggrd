@@ -314,6 +314,11 @@ impl IssuanceBudget {
     pub fn ca_name(&self) -> &'static str {
         self.profile.name
     }
+
+    /// The CA's limit for `bucket`: what a fresh bucket allows, and what `remaining` counts down from.
+    pub fn limit(&self, bucket: Bucket) -> u64 {
+        self.profile.gcra(bucket).burst()
+    }
 }
 
 /// Unix seconds now.
@@ -351,6 +356,25 @@ pub fn render_metrics(budget: &IssuanceBudget, domains: &[String], now_unix: i64
             budget.ca_name(),
             bucket.label(),
             escape_label(&label),
+        ));
+    }
+    // The denominator for "how much is left": alerting on remaining / limit fires at the same share
+    // of every bucket, where an absolute threshold would be early on one and late on another.
+    out.push_str(
+        "# HELP edgeguard_acme_budget_limit The CA's limit for each bucket, which edgeguard_acme_budget_remaining counts down from.\n",
+    );
+    out.push_str("# TYPE edgeguard_acme_budget_limit gauge\n");
+    let mut seen = Vec::new();
+    for (bucket, _, _) in budget.remaining(domains, now_unix) {
+        if seen.contains(&bucket) {
+            continue;
+        }
+        seen.push(bucket);
+        out.push_str(&format!(
+            "edgeguard_acme_budget_limit{{ca=\"{}\",bucket=\"{}\"}} {}\n",
+            budget.ca_name(),
+            bucket.label(),
+            budget.limit(bucket),
         ));
     }
     out
@@ -585,6 +609,19 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("edgeguard_acme_budget_remaining"), "{text}");
+        // The alert's denominator: Let's Encrypt's published limits, one series per bucket.
+        assert!(
+            text.contains(
+                "edgeguard_acme_budget_limit{ca=\"letsencrypt\",bucket=\"identifier_set\"} 5\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "edgeguard_acme_budget_limit{ca=\"letsencrypt\",bucket=\"registered_domain\"} 50\n"
+            ),
+            "{text}"
+        );
     }
 
     #[test]

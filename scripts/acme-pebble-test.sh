@@ -64,6 +64,7 @@ fi
 out="$(mktemp)"
 EDGEGUARD_TEST_ACME_DIR=https://localhost:14000/dir \
 EDGEGUARD_TEST_ACME_DOMAIN=edgeguard.test \
+EDGEGUARD_TEST_ACME_DNS_URL=http://localhost:8055 \
   cargo test --lib acme::tests:: -- --ignored --nocapture --test-threads=1 2>&1 | tee "$out"
 
 # The guard that makes this worth running: every Pebble test must have RUN, not returned early.
@@ -74,7 +75,7 @@ if grep -q 'skipping' "$out"; then
   echo "::error::an ACME test skipped instead of running — the rig is not configured" >&2
   fail=1
 fi
-for t in acme_http01_issues_against_pebble acme_renewal_through_the_redirect_listener_against_pebble; do
+for t in acme_http01_issues_against_pebble acme_renewal_through_the_redirect_listener_against_pebble acme_dns01_wildcard_issues_against_pebble acme_ari_window_and_replacing_renewal_against_pebble; do
   if ! grep -q "acme::tests::$t \.\.\. ok" "$out"; then
     echo "::error::$t did not pass" >&2
     fail=1
@@ -82,4 +83,4 @@ for t in acme_http01_issues_against_pebble acme_renewal_through_the_redirect_lis
 done
 rm -f "$out"
 [ "$fail" -eq 0 ] || exit 1
-echo "ACME issuance and renewal proven against Pebble."
+echo "ACME issuance (HTTP-01 and DNS-01 wildcard), renewal and ARI proven against Pebble."

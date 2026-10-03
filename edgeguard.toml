@@ -135,6 +135,25 @@ allow_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 # streams this way, `max_response_body` and the body-read timeout don't apply (the
 # connect/first-byte `upstream_timeout` still does). Non-SSE responses are unaffected.
 stream_passthrough = false
+# Stream responses of ANY content type (downloads, large JSON) as they arrive, instead of holding
+# the whole body in memory. Only when nothing needs the whole body: LLM routes, reversible DLP and
+# outbound DLP scanning still buffer. `max_response_body` still applies, enforced as bytes flow
+# (over it the connection is cut — the headers are already out); the body-read timeout does not.
+stream_responses = false
+# Stream REQUEST bodies (uploads) to the upstream as they arrive. Only when nothing reads the whole
+# body first: a WAF rule on the body, inbound DLP and LLM features still buffer. `max_body` still
+# applies: a declared Content-Length over it is refused up front; a body that grows past it is cut
+# (413 to the client) after the upstream has seen its start.
+stream_requests = false
+# With stream_requests on, routes listed here stream even though the WAF or inbound DLP reads the
+# body: the first `window` bytes are inspected before anything is forwarded, then every later frame
+# with `overlap` bytes carried between frames. Weaker than whole-body inspection (a long match across
+# a frame boundary is missed; a block after the window cuts an upload the upstream has started to
+# see). DLP `redact` and LLM routes still buffer. See docs/CONFIG.md.
+# [[validation.stream_inspect]]
+# path = "/upload/"
+# window = "64KiB"
+# overlap = "4KiB"
 # Tunnel WebSocket (and other `Upgrade`) connections to the upstream. Off by default: the normal
 # path strips the hop-by-hop Upgrade/Connection headers, so a WebSocket handshake would be
 # forwarded as a plain HTTP request and fail. Turn this on to proxy WS apps (chat, live
@@ -189,6 +208,14 @@ inspect_body = false    # inspect the (size-capped) request body — opt in
 # "only these may connect". Both empty (the default) = allow all. A bad entry fails at startup.
 # NB: keys on the resolved client IP — behind a trusted proxy/LB, set server.trust_forwarded_for
 # so this sees the real client rather than the proxy.
+# --- OTLP metrics (optional) ---
+# Push every metric /__edgeguard/metrics serves to an OpenTelemetry collector, for pipelines that
+# do not scrape. Edge-local: a control plane cannot repoint it.
+# [metrics.otlp]
+# enabled = true
+# endpoint = "http://otel-collector:4318/v1/metrics"
+# interval_secs = 60
+
 [log]
 # What the access log records. The request line is the most useful field in an access log and the
 # easiest place to leak a secret: password-reset links, OAuth `?code=`, presigned URLs and
@@ -292,6 +319,15 @@ redirect_status = 308
 # domain. Malformed hosts (spaces, CR/LF, userinfo) are always refused with 400.
 redirect_hosts = []      # e.g. ["app.example.com"]
 
+# More certificates on this listener, chosen by the hostname the client asks for (SNI). The pair
+# above stays the default (any other name, or no name). Each extra pair is reloaded when it changes
+# on disk and warned about near expiry, but not renewed here. `hosts` is required: exact names or a
+# one-label wildcard ("*.example.com"); an exact name wins over a wildcard.
+# [[tls.certs]]
+# cert_path = "/etc/eggrd/api.crt"
+# key_path = "/etc/eggrd/api.key"
+# hosts = ["api.example.com"]
+
 # Automatic certificates via ACME / Let's Encrypt (HTTP-01 challenge on port 80). The issued
 # certificate is written to the cert_path/key_path above. NOTE: requires a public domain and
 # inbound :80; the default directory is Let's Encrypt STAGING so a first run can't burn the
@@ -306,6 +342,18 @@ accept_tos = false    # must be true to accept the provider's Terms of Service
 # Renew at two-thirds of the certificate's lifetime while running; new connections get the renewed
 # certificate with no restart. With redirect_port = 80 the redirect listener answers the challenge.
 renew = true
+# "http-01" (default): the CA fetches a token from port 80. "dns-01": the order publishes a TXT
+# record through [tls.acme.dns] instead — required for wildcards ("*.example.com") and for hosts the
+# CA cannot reach on :80.
+challenge = "http-01"
+
+# DNS-01 provider (only read when challenge = "dns-01"). The API token is read from the environment
+# variable named here, never from this file: a Cloudflare token with Zone.DNS:Edit on this zone only.
+# [tls.acme.dns]
+# provider = "cloudflare"
+# zone_id = ""                         # the zone's ID (Overview page)
+# api_token_env = "CLOUDFLARE_API_TOKEN"
+# propagation_secs = 30                # wait before the CA looks for the record
 
 # ── Managed mode (optional) ───────────────────────────────────────────────────────────────
 # Pull this edge's policy from a remote control plane and report operational metrics to it. OFF

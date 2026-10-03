@@ -6,7 +6,101 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-02
+
 ### Added
+- **ACME Renewal Information (ARI, RFC 9773)** (`tls.acme.ari`, on by default). Renewal still
+  happens at two-thirds of a certificate's lifetime, and now also when the CA's suggested window
+  opens earlier, which is how a CA asks for certificates to be replaced after an incident. The
+  window can bring renewal forward but never push it later. The point inside the window is fixed
+  per certificate, so hourly checks do not re-roll it. Renewal orders name the certificate they
+  replace, which some CAs exempt from rate limits, and fall back to a plain order if the CA refuses.
+  The ARI identifier is read by the existing DER walker, so no X.509 crate is added. `GET
+  /__edgeguard/tls` shows `ari_renew_at`. Proven against Pebble in the `acme-pebble` job: window read
+  for an issued certificate, then a renewal naming it.
+- **Monitoring as a versioned bundle.** `monitoring/VERSION` (1.0.0) versions the alert rules and
+  the Grafana dashboards together, with a SemVer policy in `monitoring/README.md` (rename or remove
+  is major, a new alert or panel minor, a threshold or wording patch). The Enterprise control-plane
+  Helm chart (0.5.0) can now install them as a `PrometheusRule` and a Grafana-sidecar dashboards
+  ConfigMap, both off by default and stamped with the bundle version. CI validates the rules with
+  promtool, checks the dashboards, fails if the chart's copy drifts from `monitoring/`, and packs
+  `eggrd-monitoring-<version>.tar.gz`.
+- **Streaming documented end to end.** A README "Streaming" section, and a table in
+  `docs/CONFIG.md` of exactly which features keep a request or response buffered with streaming
+  on. `docs/ROADMAP.md` marks the "the real fix is streaming" gap closed.
+- **Streamed uploads inspected on a bounded window** (`[[validation.stream_inspect]]`, opt-in per
+  route). With `stream_requests` on, a WAF body rule or inbound DLP still forced an upload to
+  buffer. A listed route now streams anyway. The WAF and DLP inspect the first `window` bytes
+  before anything reaches the upstream, so a match there is a clean `403`. Every later frame is
+  then scanned as it passes, with `overlap` bytes carried between frames, and a blocking match cuts
+  the upload with a `403`. Weaker than whole-body inspection, and documented as such: a match
+  longer than the overlap across a frame boundary is missed, and a block in the tail comes after the
+  upstream has seen the start of the upload. DLP `redact` and LLM routes keep buffering.
+- **Community files.** A Code of Conduct (Contributor Covenant 2.1), issue forms for bugs and
+  feature requests, and a pull request template. The issue chooser points security reports to
+  private vulnerability reporting rather than a public issue.
+- **Cloudflare Worker built and run in CI.** `scripts/worker-check.sh` builds the worker's
+  deployable bundle with `worker-build --release`, from a newly committed `worker/Cargo.lock`, and
+  serves it on workerd, the runtime Cloudflare runs. It checks that a request without credentials
+  or with a wrong password gets `401` without reaching the origin, and that the right credentials
+  get the origin's `200` with the hardening headers added and `Server` stripped. `worker-build`
+  and `wrangler` are pinned. A Cloudflare deploy is still untested. `docs/ROADMAP.md` no longer
+  says the build is broken: that failure was `strip = true`, fixed earlier.
+- **Live-Redis tests in CI.** The Redis-backed rate limiter and LLM budget tests were `#[ignore]`d
+  and ran nowhere. `scripts/redis-live-test.sh` starts a Redis, runs them, and fails if any of them
+  skipped. It runs in CI here and in the public repository's `ci.yml`.
+- **OTLP metrics export** (`[metrics.otlp]`, off by default). Metrics were Prometheus-scrape only,
+  which leaves out a pipeline that collects with OpenTelemetry and does not scrape. Every metric
+  `/__edgeguard/metrics` serves is now pushed as OTLP-JSON to a `/v1/metrics` endpoint on an
+  interval, plus once on shutdown. It is converted from the Prometheus exposition itself rather than
+  instrumented twice, so the two cannot disagree and a new metric needs no second change. Counters
+  become cumulative monotonic Sums, gauges become Gauges, and the request-duration histogram becomes
+  an OTLP Histogram (per-bucket counts with explicit bounds). Edge-local like `[tracing]`: a pushed
+  policy cannot repoint it. Proven with the real binary pushing to a stub collector: 17 families, the
+  request counter and histogram matching the traffic sent. `[tracing]` (one SERVER span per request,
+  shipped earlier) is now documented in `docs/CONFIG.md` alongside it.
+- **ACME over DNS-01, and wildcard certificates** (`tls.acme.challenge = "dns-01"`). HTTP-01 was the
+  only challenge, so a wildcard could never be issued and a host the CA cannot reach on :80 could
+  not be certified. A DNS-01 order publishes `_acme-challenge` TXT records through `[tls.acme.dns]`,
+  waits `propagation_secs`, then answers. Its records are removed afterwards whatever the outcome,
+  and nothing binds :80. The first provider is **Cloudflare** (zone id plus a token scoped to
+  `Zone.DNS:Edit`, read from the environment variable `api_token_env` names, never from the config
+  and never logged or included in errors). `challtestsrv` drives Pebble's test DNS server.
+  Renewal uses the same challenge. A wildcard over HTTP-01, an unknown challenge, or a provider
+  that cannot be built (no zone, unset token) fails before any order is sent or budget spent, and
+  `edgeguard doctor` reports each. Proof: provider requests against recorded API shapes, and a
+  DNS-01 wildcard order against Pebble in the `acme-pebble` CI job, which now also fails if that
+  test skips.
+- **Several certificates on one listener, chosen by hostname (SNI).** `[[tls.certs]]` entries
+  (`cert_path`, `key_path`, `hosts`) add pairs to the TLS listener; the `[tls]` pair stays the
+  default for any other name and for clients that send none, so self-signed and ACME keep working
+  as before. Matching is exact name first, then a one-label wildcard (`*.example.com`), then the
+  default, case-insensitively. Each extra pair is its own live store, so it is watched, reloaded
+  and swapped on its own (proven over real handshakes: replacing one pair on disk changed only that
+  hostname's certificate). Its expiry is checked hourly and warned about, but nothing here renews
+  it. `GET /__edgeguard/tls` lists them under `sni`, and the certificate metrics gain one series
+  per pair labelled `cert="<first host>"`. The default pair's series are unchanged, so existing
+  alerts and dashboards keep working and the expiry alerts now cover the extra pairs too. Host
+  patterns that cannot match as written (empty, wildcard not in the first label, a name claimed
+  twice) fail startup, and `edgeguard doctor` reports them first.
+- **Request bodies can stream** (`validation.stream_requests`, off by default). Every upload was
+  read whole into memory before a byte went upstream, so `max_body` (2 MiB by default) capped
+  uploads for everyone. With the switch on, a request body is forwarded as it arrives whenever
+  nothing reads it first. A WAF rule targeting the body, inbound DLP and the LLM features (metering,
+  key vault, budgets) still buffer, decided by `streams_request` with a test per reader.
+  `max_body` still holds: a declared `Content-Length` over it gets `413` before the upstream is
+  contacted; a body without one that grows past it is cut and the client gets `413` (not `502`),
+  though the upstream has seen the start of it. Ingress bytes for usage are counted as the body
+  flows. The upstream client now carries a boxed body, so one client serves both paths.
+- **Responses of any content type can stream** (`validation.stream_responses`, off by default).
+  Until now only `text/event-stream` could skip buffering; a download was held whole in memory,
+  and `max_response_body` defaults to unbounded. With the switch on, a response streams as it
+  arrives whenever nothing on the request needs the whole body. LLM metering, reversible DLP and
+  outbound DLP scanning still buffer, decided in one place (`streams_any_response`) with a test per
+  feature. `max_response_body` is still enforced, as the bytes flow: over it the connection is cut
+  (the status was already sent) and the client sees a truncated body, never the bytes past the
+  cap. The upstream's `Content-Length` is kept, since the body passes through unchanged. The first
+  slice of 0.6's "streaming bodies end to end".
 - **Certificates rotate on their own, and a running proxy picks up a new certificate without a
   restart.** Up to 0.4.0 the listener read its certificate once at boot and kept it for the life
   of the process: nothing renewed an ACME certificate, nothing regenerated a self-signed one, and a
@@ -810,7 +904,9 @@ unchanged). Ships the v0–v2.5 feature set below.
 - Added an optional `validation.max_response_body` cap so a huge upstream response can't
   OOM the proxy.
 
-[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lucheeseng827/eggrd/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/lucheeseng827/eggrd/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/lucheeseng827/eggrd/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lucheeseng827/eggrd/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/lucheeseng827/eggrd/compare/v0.2.1...v0.2.2

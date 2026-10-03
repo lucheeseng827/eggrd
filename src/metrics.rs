@@ -193,6 +193,9 @@ pub struct Metrics {
     /// store is built after the registry) so its expiry, reload and renewal series render with
     /// everything else, and `GET /__edgeguard/tls` can find it through the state it already has.
     cert_store: std::sync::OnceLock<std::sync::Arc<crate::certstore::CertStore>>,
+    /// The extra `[[tls.certs]]` pairs, served by hostname (SNI). Rendered as more series in the
+    /// same families, labelled `cert="<first host>"`.
+    sni_certs: std::sync::OnceLock<Vec<crate::certstore::SniCert>>,
     /// One counter per [`OUTCOMES`] entry (parallel index).
     requests: Vec<AtomicU64>,
     /// One counter per [`RL_SCOPES`] entry (parallel index).
@@ -286,6 +289,7 @@ impl Default for Metrics {
             log_shipper: std::sync::OnceLock::new(),
             span_shipper: std::sync::OnceLock::new(),
             cert_store: std::sync::OnceLock::new(),
+            sni_certs: std::sync::OnceLock::new(),
             requests: OUTCOMES.iter().map(|_| AtomicU64::new(0)).collect(),
             ratelimit_hits: RL_SCOPES.iter().map(|_| AtomicU64::new(0)).collect(),
             waf_hits: WAF_RULES.iter().map(|_| AtomicU64::new(0)).collect(),
@@ -462,6 +466,16 @@ impl Metrics {
     /// Install the live certificate store. Called once at startup, when TLS is enabled.
     pub fn set_cert_store(&self, store: std::sync::Arc<crate::certstore::CertStore>) -> bool {
         self.cert_store.set(store).is_ok()
+    }
+
+    /// Install the extra SNI pairs. Called once at startup, when `[[tls.certs]]` lists any.
+    pub fn set_sni_certs(&self, certs: Vec<crate::certstore::SniCert>) -> bool {
+        self.sni_certs.set(certs).is_ok()
+    }
+
+    /// The extra SNI pairs (empty when none are configured).
+    pub fn sni_certs(&self) -> &[crate::certstore::SniCert] {
+        self.sni_certs.get().map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// The live certificate store, if this process terminates TLS.
@@ -1008,7 +1022,7 @@ impl Metrics {
         ));
 
         if let Some(store) = self.cert_store.get() {
-            store.render_metrics(&mut out);
+            store.render_metrics_with(self.sni_certs(), &mut out);
         }
 
         out

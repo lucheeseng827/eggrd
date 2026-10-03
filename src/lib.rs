@@ -9,6 +9,7 @@ pub mod access;
 pub mod accesslog;
 pub mod acme;
 pub mod acme_budget;
+pub mod acme_dns;
 pub mod alert;
 pub mod auth;
 pub mod budget;
@@ -24,10 +25,12 @@ pub mod limiter;
 pub mod llm;
 pub mod logship;
 pub mod metrics;
+pub mod otlp_metrics;
 pub mod proxy;
 pub mod reload;
 pub mod scaffold;
 pub mod selfsigned;
+pub mod stream_inspect;
 pub mod supervisor;
 pub mod telemetry;
 pub mod tls;
@@ -149,7 +152,7 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
     let auth = AuthEngine::build(&cfg.auth)?;
     // Compile the WAF here too, so a bad custom pattern fails fast at startup/reload rather
     // than per-request (and a broken hot-reload keeps the previous policy).
-    let waf = crate::waf::WafEngine::build(&cfg.waf)?;
+    let waf = Arc::new(crate::waf::WafEngine::build(&cfg.waf)?);
     // Compile the CORS policy (None when disabled). An incoherent policy — credentialed
     // wildcard, enabled-but-no-origins — fails here, so it's caught at startup/reload.
     let cors = crate::cors::CorsPolicy::build(&cfg.cors)?;
@@ -179,6 +182,11 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
         max_header_bytes,
         upstream_timeout,
         stream_passthrough: cfg.validation.stream_passthrough,
+        stream_responses: cfg.validation.stream_responses,
+        stream_requests: cfg.validation.stream_requests,
+        stream_inspect: crate::stream_inspect::InspectWindow::build(
+            &cfg.validation.stream_inspect,
+        )?,
         websocket_passthrough: cfg.validation.websocket_passthrough,
         llm: {
             // Validate the unpriced-model policy up front so a typo fails at load/reload rather than
@@ -203,8 +211,7 @@ pub fn build_state(cfg: Arc<Config>) -> Result<AppState> {
     // Build the managed-mode client (if `[control_plane]` is enabled) before `cfg` is consumed.
     let cp = crate::cp::CpClient::from_cfg(&cfg.control_plane)?;
     let runtime = build_runtime(cfg)?;
-    let client =
-        Client::builder(TokioExecutor::new()).build_http::<http_body_util::Full<bytes::Bytes>>();
+    let client = Client::builder(TokioExecutor::new()).build_http::<axum::body::Body>();
     Ok(AppState {
         client,
         metrics: Arc::new(Metrics::new()),

@@ -57,7 +57,8 @@ an identity provider.
 
 | Tag | Notes |
 |---|---|
-| `latest` | newest release (= `0.4.0`) |
+| `latest` | newest release (= `0.5.0`) |
+| `0.5.0` | Certificates rotate on their own: ACME and self-signed renewal, and a running proxy hot-swaps a new certificate with no restart; `GET /__edgeguard/tls` and cert-expiry metrics; managed-mode edges report the certificate they serve (**see the upgrade note**) |
 | `0.4.0` | Self-signed TLS + `:80`→HTTPS redirect + `edgeguard cert`; access-log query redaction, **now on by default** (**see the upgrade note**); `aws-lc-sys` dropped — image ~9 MiB smaller |
 | `0.3.1` | `--version` added; unknown arguments now rejected instead of silently ignored |
 | `0.3.0` | ACME issuance fixed (0.7.2 could not read Let's Encrypt's current authorization payload); `linux/arm64` restored |
@@ -65,8 +66,17 @@ an identity provider.
 | `0.2.1` | cookie-hardening opt-out (`httponly_cookie_exempt`) for JS-readable / double-submit CSRF cookies |
 | `0.2.0` | per-path upstreams, request IDs, gzip, WebSocket passthrough, IP access lists |
 
-Pin a version in production: `mancube/eggrd:0.4.0`.
+Pin a version in production: `mancube/eggrd:0.5.0`.
 
+> **Upgrading to 0.5.0 turns certificate rotation on.** `[tls] watch`, `[tls.acme] renew` and
+> `self_signed_renew` all default to on, so a running proxy now reloads a certificate replaced on
+> disk (cert-manager, Vault Agent, certbot) and renews its own ACME or self-signed certificate at
+> two-thirds of its lifetime — no restart. A self-signed renewal reuses the existing key unless
+> `self_signed_rotate_key = true`, and a CA-issued certificate at `cert_path` is never overwritten.
+> With `redirect_port = 80` the redirect listener now answers the renewal's HTTP-01 challenge. In
+> managed mode an idle edge now sends its usage report every interval (as a heartbeat) instead of
+> skipping it.
+>
 > **Upgrading to 0.4.0 changes what lands in your access logs.** `[log] query` now defaults to
 > `redact`: query-string values that look like a credential (by name — `token`, `key`, `secret`,
 > `password`, `auth`, `code`, `state`, `email`, …, plus `[log] redact_params`; or by shape — a
@@ -96,7 +106,7 @@ Pin a version in production: `mancube/eggrd:0.4.0`.
 ```bash
 docker run -p 8080:8080 \
   -e UPSTREAM=http://app.internal:3000 \
-  mancube/eggrd:0.4.0 --config /etc/edgeguard/edgeguard.toml
+  mancube/eggrd:0.5.0 --config /etc/edgeguard/edgeguard.toml
 ```
 
 Bring your own config (overrides the baked-in default):
@@ -105,7 +115,7 @@ Bring your own config (overrides the baked-in default):
 docker run -p 8080:8080 \
   -e UPSTREAM=http://app.internal:3000 \
   -v "$PWD/edgeguard.toml:/etc/edgeguard/edgeguard.toml:ro" \
-  mancube/eggrd:0.4.0 --config /etc/edgeguard/edgeguard.toml
+  mancube/eggrd:0.5.0 --config /etc/edgeguard/edgeguard.toml
 ```
 
 > ⚠️ The shipped config's `users` value is a **non-working placeholder** — set a real credential before exposing anything (see [Auth](#auth--secrets)).
@@ -113,7 +123,7 @@ docker run -p 8080:8080 \
 **Co-process mode** (EdgeGuard supervises your app as PID 1) needs your app in the same image. Copy the binary into your app's image instead of running this one directly:
 
 ```dockerfile
-COPY --from=mancube/eggrd:0.4.0 /usr/local/bin/edgeguard /usr/local/bin/edgeguard
+COPY --from=mancube/eggrd:0.5.0 /usr/local/bin/edgeguard /usr/local/bin/edgeguard
 ENTRYPOINT ["/usr/local/bin/edgeguard", "--config", "/etc/edgeguard/edgeguard.toml", "--wrap", "node server.js"]
 ```
 
@@ -149,7 +159,7 @@ Auth, rate limits, TLS/ACME, CSP, WAF-lite, and size/method limits are set in th
 - **Rate limiting** (GCRA → `429`): per-IP, optional per-route overrides, optional per-key; in-process `governor` or shared **Redis** store for multi-replica global limits.
 - **WAF-lite** (off by default): SQLi / XSS / path-traversal heuristics + custom deny patterns, with a report-only rollout mode.
 - **Response hardening**: CSP (+ report-only + report sink), HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`; adds `Secure; HttpOnly; SameSite` to cookies — with a per-cookie `httponly_cookie_exempt` opt-out so a JS-readable double-submit CSRF cookie stays readable; strips `Server` / `X-Powered-By`.
-- **TLS** via rustls, optional **ACME / Let's Encrypt** (HTTP-01).
+- **TLS** via rustls, optional **ACME / Let's Encrypt** (HTTP-01), with **automatic certificate rotation**: ACME and self-signed certificates renew at two-thirds of their lifetime, and a certificate replaced on disk is hot-swapped without a restart (`[tls] watch`).
 - **Limits**: body-size (`413`), header-size (`431`), method allowlist (`405`).
 - **Config hot-reload**, **structured JSON access logs**, **Prometheus metrics**.
 
@@ -163,6 +173,7 @@ The reserved `/__edgeguard/*` namespace is never forwarded upstream:
 | `/__edgeguard/ready` | readiness — `200` only when upstream accepts a connection, else `503` |
 | `/__edgeguard/metrics` | Prometheus metrics |
 | `/__edgeguard/csp-report` | CSP violation report sink |
+| `/__edgeguard/tls` | served certificate: source, serial, validity, days left, last renewal attempt |
 
 Use `ADMIN_PORT` to move these onto a private listener and keep them off the public port.
 
@@ -171,7 +182,7 @@ Use `ADMIN_PORT` to move these onto a private listener and keep them off the pub
 Hash a password with the built-in helper (distroless has no shell — pass `--hash` as an arg, feed the password on stdin):
 
 ```bash
-echo -n 'your-password' | docker run -i --rm mancube/eggrd:0.4.0 --hash
+echo -n 'your-password' | docker run -i --rm mancube/eggrd:0.5.0 --hash
 # paste the $argon2id$... string as the user's value in edgeguard.toml
 ```
 

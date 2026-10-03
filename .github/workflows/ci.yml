@@ -10,6 +10,7 @@
 #   cargo test --all-targets
 #   cargo build --release
 #   bash scripts/check-crypto-provider.sh
+#   bash scripts/acme-pebble-test.sh     # needs docker; see the acme-pebble job
 name: CI
 
 on:
@@ -50,3 +51,18 @@ jobs:
         run: bash scripts/check-crypto-provider.sh
       - name: Build (release)
         run: cargo build --release
+
+  # ACME issuance AND renewal against Pebble, a real test CA. These tests are #[ignore]d in the
+  # default suite because they need a CA, DNS pointing at this host and port 80; the script
+  # provides all three and fails if a test skipped instead of running (a skip reports "ok").
+  # Linux only: it runs Pebble under Docker, which the Windows runner cannot host.
+  acme-pebble:
+    name: acme (Pebble)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Issue and renew against Pebble
+        run: bash scripts/acme-pebble-test.sh

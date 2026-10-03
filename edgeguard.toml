@@ -262,11 +262,20 @@ self_signed = false
 # that is not fails generation rather than silently dropping it from the certificate.
 self_signed_hosts = []
 self_signed_days = 90    # deliberately short — a stopgap that expires beats one that never does
+# Regenerate before expiry (at two-thirds of the lifetime) and serve it without a restart. Only a
+# certificate that is itself self-signed is replaced, never a CA-issued one at the same path.
+self_signed_renew = true
+self_signed_rotate_key = false   # keep the key across renewals, so clients pinning it keep working
 # MULTI-REPLICA: generation is per-process. Several replicas booting at once against the SAME
 # writable cert_path can each see "no certificate" and generate, and the last writer wins — the
 # replicas then serve different certificates, or one fails to start on a mismatched pair. There
 # is no cross-process lock here. Generate once up front (`edgeguard cert`) and mount the result
 # read-only when you run more than one replica; first-boot generation is for a single instance.
+
+# Reload cert_path/key_path when they change on disk — cert-manager, Vault Agent, certbot, a mounted
+# Kubernetes secret — with no restart and no dropped connections. A pair that does not load is
+# rejected and the current one keeps serving.
+watch = true
 
 # --- HTTP → HTTPS redirect ---
 # Terminating TLS only protects traffic that REACHES the TLS port, and a browser given a bare
@@ -294,6 +303,9 @@ email = ""            # ACME account contact
 directory_url = "https://acme-staging-v02.api.letsencrypt.org/directory"
 cache_dir = "./acme"  # stores the ACME account key for renewals
 accept_tos = false    # must be true to accept the provider's Terms of Service
+# Renew at two-thirds of the certificate's lifetime while running; new connections get the renewed
+# certificate with no restart. With redirect_port = 80 the redirect listener answers the challenge.
+renew = true
 
 # ── Managed mode (optional) ───────────────────────────────────────────────────────────────
 # Pull this edge's policy from a remote control plane and report operational metrics to it. OFF

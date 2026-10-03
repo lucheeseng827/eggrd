@@ -40,22 +40,31 @@ pub fn init_crypto() {
 /// Build a rustls [`ServerConfig`] from a PEM certificate chain and private key. Uses an
 /// explicit ring provider so it doesn't depend on which provider happens to be the process
 /// default. Advertises HTTP/1.1 via ALPN (the proxy speaks HTTP/1.1 upstream).
+///
+/// The certificate is served through a [`CertStore`](crate::certstore::CertStore), so it can be
+/// replaced while the listener runs; use [`server_config`] with your own store to keep the handle.
 pub fn load_server_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>> {
-    let certs = load_certs(cert_path)?;
-    let key = load_key(key_path)?;
+    let store =
+        crate::certstore::CertStore::load(cert_path, key_path, crate::certstore::CertSource::File)
+            .context("building rustls ServerConfig (does the key match the certificate?)")?;
+    server_config(store)
+}
 
+/// Build the listener's [`ServerConfig`] around a live [`CertStore`](crate::certstore::CertStore).
+/// Every new handshake asks the store for the current certificate, so swapping the store's pair
+/// takes effect on the next connection with no restart and no dropped connections.
+pub fn server_config(store: Arc<crate::certstore::CertStore>) -> Result<Arc<ServerConfig>> {
     let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .context("selecting TLS protocol versions")?
             .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .context("building rustls ServerConfig (does the key match the certificate?)")?;
+            .with_cert_resolver(store);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
-fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path).with_context(|| format!("opening certificate file {path}"))?;
     let mut reader = BufReader::new(file);
     let certs = rustls_pemfile::certs(&mut reader)
@@ -65,7 +74,7 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+pub(crate) fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path).with_context(|| format!("opening private key file {path}"))?;
     let mut reader = BufReader::new(file);
     rustls_pemfile::private_key(&mut reader)
@@ -139,11 +148,15 @@ pub async fn serve(
     Ok(())
 }
 
-/// The ACME HTTP-01 challenge prefix. The redirect listener answers `404` here instead of
-/// redirecting: a CA validating a challenge must read the token over plain HTTP, and bouncing it
-/// to a port whose certificate is the very thing being issued would deadlock issuance. Nothing on
-/// this path is served by the redirect listener itself — `crate::acme` binds `:80` for the
-/// duration of an order and the redirect listener starts only after it has released the port.
+/// The ACME HTTP-01 challenge prefix. The redirect listener never redirects here: a CA validating
+/// a challenge must read the token over plain HTTP, and bouncing it to a port whose certificate is
+/// the very thing being issued would deadlock issuance.
+///
+/// At startup `crate::acme` binds `:80` itself for the first order, and the redirect listener
+/// starts only after it has released the port. A *renewal* happens while the redirect listener is
+/// up and holding `:80`, so the order publishes its tokens to a shared
+/// [`ChallengeMap`](crate::acme::ChallengeMap) and this listener answers them; any other path
+/// under the prefix is `404`.
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
 /// Decide the `Location` for an HTTP request that should be served over HTTPS.
@@ -229,10 +242,16 @@ fn is_valid_host(host: &str) -> bool {
 }
 
 /// The redirect listener's router: one catch-all that answers every method and path.
-fn redirect_router(tls_port: u16, status: StatusCode, allowed: Vec<String>) -> Router {
+fn redirect_router(
+    tls_port: u16,
+    status: StatusCode,
+    allowed: Vec<String>,
+    challenges: Option<crate::acme::ChallengeMap>,
+) -> Router {
     let allowed = Arc::new(allowed);
     Router::new().fallback(move |req: Request<axum::body::Body>| {
         let allowed = Arc::clone(&allowed);
+        let challenges = challenges.clone();
         async move {
             let path_and_query = req
                 .uri()
@@ -240,8 +259,14 @@ fn redirect_router(tls_port: u16, status: StatusCode, allowed: Vec<String>) -> R
                 .map(|pq| pq.as_str())
                 .unwrap_or("/");
 
-            if path_and_query.starts_with(ACME_CHALLENGE_PREFIX) {
-                return (StatusCode::NOT_FOUND, "not found\n").into_response();
+            if let Some(token) = req.uri().path().strip_prefix(ACME_CHALLENGE_PREFIX) {
+                let answer = challenges
+                    .as_ref()
+                    .and_then(|m| crate::acme::challenge_response(m, token));
+                return match answer {
+                    Some(key_auth) => (StatusCode::OK, key_auth).into_response(),
+                    None => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+                };
             }
 
             let host = req
@@ -301,6 +326,7 @@ pub async fn serve_redirect(
     tls_port: u16,
     status: u16,
     allowed: Vec<String>,
+    challenges: Option<crate::acme::ChallengeMap>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let status = parse_redirect_status(status)?;
@@ -314,7 +340,7 @@ pub async fn serve_redirect(
 
     axum::serve(
         listener,
-        redirect_router(tls_port, status, allowed).into_make_service(),
+        redirect_router(tls_port, status, allowed, challenges).into_make_service(),
     )
     .with_graceful_shutdown(async move {
         let mut shutdown = shutdown;
@@ -427,7 +453,7 @@ mod tests {
         use axum::body::Body;
         use tower::ServiceExt;
 
-        let app = redirect_router(8443, StatusCode::PERMANENT_REDIRECT, vec![]);
+        let app = redirect_router(8443, StatusCode::PERMANENT_REDIRECT, vec![], None);
 
         let res = app
             .clone()
@@ -473,6 +499,53 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn redirect_listener_answers_a_renewal_challenge_and_nothing_else() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        // A renewal runs while this listener holds :80, so the order publishes its tokens here.
+        let challenges = crate::acme::ChallengeMap::default();
+        challenges
+            .write()
+            .unwrap()
+            .insert("tok123".to_string(), "tok123.thumbprint".to_string());
+        let app = redirect_router(
+            443,
+            StatusCode::PERMANENT_REDIRECT,
+            vec![],
+            Some(challenges.clone()),
+        );
+        let get = |uri: &'static str| {
+            app.clone().oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("host", "example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+
+        let res = get("/.well-known/acme-challenge/tok123").await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"tok123.thumbprint");
+
+        // Unknown tokens are still 404 and never redirected.
+        let res = get("/.well-known/acme-challenge/other").await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(res.headers().get("location").is_none());
+
+        // Once the order finishes and clears its tokens, the same path is 404 again.
+        challenges.write().unwrap().clear();
+        let res = get("/.well-known/acme-challenge/tok123").await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Everything else still redirects.
+        let res = get("/page").await.unwrap();
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    }
+
     #[test]
     fn redirect_status_accepts_only_navigational_redirects() {
         for ok in [301, 302, 303, 307, 308] {
@@ -502,7 +575,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         // A typo'd `redirect_status = 200` must fail loudly at startup rather than answering
         // every plaintext request with an empty 200 that looks like the app.
-        assert!(serve_redirect(listener, 443, 200, vec![], rx)
+        assert!(serve_redirect(listener, 443, 200, vec![], None, rx)
             .await
             .is_err());
     }

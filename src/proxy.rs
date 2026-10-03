@@ -1472,6 +1472,27 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response<Body> {
     resp
 }
 
+/// The served TLS certificate (`GET /__edgeguard/tls`): source, serial, validity, days left,
+/// whether renewal is due, and the last renewal attempt. `404` when this listener does not
+/// terminate TLS. Lives with the other ops endpoints, so in split mode it is admin-port only.
+pub async fn tls_status(State(state): State<AppState>) -> Response<Body> {
+    match state.metrics.cert_store() {
+        Some(store) => {
+            let mut resp = Response::new(Body::from(store.status_json().to_string()));
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            resp
+        }
+        None => {
+            let mut resp = Response::new(Body::from("TLS is not enabled on this listener\n"));
+            *resp.status_mut() = StatusCode::NOT_FOUND;
+            resp
+        }
+    }
+}
+
 /// CSP violation report sink (`POST /__edgeguard/csp-report`). Browsers POST a JSON report
 /// here when `headers.csp_report_uri` points at it; we count and log it, then `204`.
 pub async fn csp_report(State(state): State<AppState>, body: Bytes) -> StatusCode {

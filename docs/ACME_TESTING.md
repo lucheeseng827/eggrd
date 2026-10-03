@@ -12,6 +12,18 @@ of them will otherwise conclude that `acme.rs` is broken when it is not.
 
 ---
 
+## The short way — one script (what CI runs)
+
+```bash
+bash scripts/acme-pebble-test.sh
+```
+
+Starts Pebble, trusts its directory root, points the test domain at this host, allows binding
+`:80`, runs both Pebble tests (issuance, and renewal through the redirect listener) and fails if
+either skipped instead of running. Needs Docker and root or passwordless sudo. CI runs exactly this
+script, so a green run locally is the same check. Recipe A below is the same steps by hand, with
+the reasons each one is needed.
+
 ## Recipe A — Pebble, on your machine
 
 [Pebble](https://github.com/letsencrypt/pebble) is a small but real ACME CA. This

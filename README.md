@@ -52,6 +52,8 @@ section used to overstate it.
 | Self-signed certificates | **proven** | `self_signed = true` generated a certificate on first boot, rustls loaded it, `curl --cacert` got `200` through it, and an untrusting client was refused — so it is real TLS, not a bypass. Key file mode asserted `0600`. |
 | HTTP→HTTPS redirect | **proven** | Plaintext `:8080` answered `308` to the TLS port with path and query intact; a `POST` followed the redirect and arrived upstream still a `POST` with its body; a forged `Host` outside `redirect_hosts` got `400` and no `Location`; `/.well-known/acme-challenge/` got `404`, not a redirect. |
 | Shared-store rate limiting | **proven** | Two replicas against one Redis: 5 allowed against a single key, where the per-replica store allowed 10. |
+| Certificate rotation | **proven** | A live TLS listener swapped certificates under concurrent traffic with zero failed requests, and new handshakes presented the new certificate. The file watcher picked up an atomic replace and a Kubernetes-style `..data` symlink flip; a certificate written without its key was refused while the old pair kept serving. The binary, started on an expired self-signed certificate, renewed it at boot with the same key. |
+| ACME renewal | **proven against Pebble** | Issued against Pebble, then renewed while the redirect listener held `:80` and answered the challenge from the shared token map; the live listener swapped to the renewed certificate with no restart. Runs in CI on every change (`scripts/acme-pebble-test.sh`), which fails if a test skipped instead of running. Not yet run against Let's Encrypt itself. |
 | ACME issuance | **proven, and it was broken** | Not "untested and probably fine" — a two-year-old client could no longer read the CA's replies. Found by running it, fixed, and it now issues in about five seconds against Let's Encrypt staging. |
 | WASM edge worker | **runs, not deployed** | Builds a deployable bundle and serves requests on **workerd**, the runtime Cloudflare runs in production: 401 unauthenticated, 200 from the origin with all six hardening headers. It has *not* been deployed to a Cloudflare account, so routes, custom domains and secret bindings remain untested. |
 
@@ -723,7 +725,9 @@ edgeguard cert --host app.internal --days 90 --cert-out ./tls/cert.pem --key-out
 ```
 
 The key is written `0600`; generation is skipped once a certificate exists, so restarts keep
-serving the same one. **Be clear about what this buys.** It encrypts the connection — which is
+serving the same one. Once two-thirds of its lifetime has passed, the running proxy regenerates
+it — signed with the **same key**, so anything that trusted it by public key keeps working — and
+serves the new one without a restart (`self_signed_renew`, on by default). **Be clear about what this buys.** It encrypts the connection — which is
 what makes HSTS, `Secure` cookies and the hardening headers mean anything at all — but it
 proves no identity, so browsers show an interstitial and strict clients refuse it outright
 (`curl --cacert ./tls/cert.pem …` to trust it explicitly). `edgeguard doctor` says so out loud.
@@ -762,11 +766,40 @@ and `accept_tos = true`. EdgeGuard runs the ACME **HTTP-01** challenge (it binds
 for the validation, so that must be reachable from the internet), writes the issued chain and
 key to `tls.cert_path` / `tls.key_path`, and serves them.
 
+The running proxy **renews** the certificate once two-thirds of its lifetime has passed (day 60 of
+90) and serves the renewed one to new connections — no restart, no dropped connections. With
+`tls.redirect_port = 80` the redirect listener answers the renewal's HTTP-01 challenge itself, so
+nothing else has to free the port. A failed renewal keeps serving the current certificate and
+retries (5 minutes, doubling to 12 hours), leaving a month of attempts before anything expires.
+
 > ⚠️ ACME requires a real public domain and inbound port 80, so it can't be exercised by the
-> in-process test suite. The flow is implemented against `instant-acme` and compiled in CI,
-> but is **only proven against a live CA**. The default directory is **Let's Encrypt staging**
-> (`tls.acme.directory_url`) so a first run can't burn the strict production rate limits —
-> switch to production explicitly once it works against staging.
+> default in-process test suite. Issuance and renewal are proven against **Pebble**, a real test
+> CA, in CI on every change — `bash scripts/acme-pebble-test.sh` runs the same check locally. The default directory
+> is **Let's Encrypt staging** (`tls.acme.directory_url`) so a first run can't burn the strict
+> production rate limits — switch to production explicitly once it works against staging.
+
+### Certificate rotation
+
+Whatever produces the certificate, the listener serves it from a live store rather than a copy
+taken at boot:
+
+- **Replaced on disk → served.** `tls.watch` (on by default) reloads `cert_path`/`key_path` when
+  they change — cert-manager, Vault Agent, certbot, or a mounted Kubernetes secret, whose `..data`
+  symlink flip is followed. New handshakes get the new certificate; established connections are
+  untouched. A pair that does not load (a certificate whose key is not there yet, or does not
+  match) is refused and the current one keeps serving.
+- **Renewed in-process.** ACME and self-signed certificates are renewed at two-thirds of their
+  lifetime, as above. A file you provide is never overwritten by renewal.
+- **Visible.** `GET /__edgeguard/tls` (on the admin port in split mode) reports the source, serial,
+  validity, days left and the last renewal attempt with its error. `/__edgeguard/metrics` carries
+  `edgeguard_tls_cert_not_after_seconds`, `…_reloads_total` and `…_renewals_total`, and
+  `monitoring/` ships expiry alerts and dashboard panels for them. `edgeguard doctor` reports the
+  days left on the certificate at `cert_path`.
+
+For several replicas sharing one certificate, let **one** process renew (or an external tool) and
+point the rest at the same files with `acme.renew = false` / `self_signed_renew = false`: they
+pick up the renewed pair through the watcher. In managed mode the control plane's issuance lease
+already stops replicas from spending the CA's shared rate limit between them.
 
 For a managed-TLS platform (most PaaS) you typically leave TLS off and let the platform
 terminate it; TLS termination here is for the VPS / front-proxy path.
@@ -1242,7 +1275,44 @@ tenant_id = "acme"                # this edge's tenant id
 ```
 
 It's a thin, generic "pull config / report usage to a URL" client (`src/cp.rs`) — with no
-`[control_plane]` configured, the binary is byte-for-byte the standalone proxy.
+`[control_plane]` configured, the binary is byte-for-byte the standalone proxy. The control plane it
+talks to is **eggrd Enterprise** — see [Editions](#editions).
+
+## Editions
+
+Everything in this repository is the **Community** edition: the proxy, Apache-2.0, free, with no
+feature withheld. If one proxy in front of one app is what you run, it is all you need, and that
+will not change — a capability that matters to a single proxy (certificate rotation, mTLS to an
+upstream, tracing) belongs here, not behind a licence.
+
+**eggrd Enterprise** is the layer above a *fleet* of proxies: a self-hosted control plane that
+your edges pull their policy from and report to (managed mode). It is closed-source, runs
+inside your own network — air-gapped included — and is licensed by annual agreement.
+
+| | **Community** | **Enterprise** (self-hosted) | **Cloud** |
+|---|---|---|---|
+| What it is | The proxy (this repo) | Control plane for your edges, on your infrastructure | The same control plane, run for you |
+| Licence | Apache-2.0 | Annual agreement + offline licence key | — |
+| Availability | Now | Now, with a 30-day trial | **Not available yet** |
+| Auth, rate limits, WAF-lite, headers, TLS + ACME + rotation, DLP, LLM metering and budgets | ✓ | ✓ (every edge runs Community) | planned |
+| Central policy: versioned, edges pull it and hot-reload, no restart | — | ✓ | planned |
+| Fleet view: every edge's version, liveness, policy drift and the certificate it serves | — | ✓ | planned |
+| Certificate inventory with expiry alerts, following edge renewals | — | ✓ | planned |
+| Fleet-wide ACME rate-limit coordination across edges | — | ✓ | planned |
+| Usage and quotas across edges, enforced at the edge | — | ✓ | planned |
+| Alert routing to webhooks (Slack- and Teams-compatible) | — | ✓ | planned |
+| Operator SSO (any OIDC provider) with per-app roles | — | ✓ | planned |
+| Tamper-evident audit log with export | — | ✓ | planned |
+| Console, including an assistant on your own model provider | — | ✓ | planned |
+| Postgres-backed; Helm chart and Kubernetes operator | — | ✓ | — |
+
+The licence key is verified offline against a public key built into the control plane — nothing
+calls home — and a lapsed licence turns the control plane **read-only**; it never stops your edges,
+which keep serving on their last policy. The table lists only what ships today; nothing on it is a
+roadmap item.
+
+**To evaluate Enterprise**, [open an issue with the `enterprise` label](https://github.com/lucheeseng827/eggrd/issues/new?labels=enterprise&title=Enterprise%20trial)
+saying what you run and roughly how many edges. A trial is the full Enterprise edition for 30 days.
 
 ## Build & test
 

@@ -6,7 +6,79 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **Certificates rotate on their own, and a running proxy picks up a new certificate without a
+  restart.** Up to 0.4.0 the listener read its certificate once at boot and kept it for the life
+  of the process: nothing renewed an ACME certificate, nothing regenerated a self-signed one, and a
+  certificate replaced on disk by cert-manager, Vault Agent or certbot was ignored until someone
+  restarted. Every one of those ends the same way — a running proxy serving an expired certificate
+  it could have replaced. The 90-day self-signed certificates 0.4.0 generates would have started
+  expiring in December.
+
+  - **Hot swap.** The listener now serves from a live certificate store (a rustls
+    `ResolvesServerCert` over an `ArcSwap`). New handshakes get the current certificate;
+    established connections keep theirs. Proven against a live listener under concurrent traffic:
+    zero failed requests across the swap.
+  - **`[tls] watch`** (on by default) reloads `cert_path`/`key_path` when they change on disk. It
+    watches the directories rather than the files, so atomic renames and a Kubernetes secret's
+    `..data` symlink flip are both seen. A pair that does not load — including the moment between
+    another tool writing the certificate and writing its key — is refused and the current pair keeps
+    serving, the same contract as config hot-reload. An hourly re-read is the backstop for
+    filesystems that deliver no change events.
+  - **ACME renewal** (`[tls.acme] renew`, on by default) at two-thirds of the certificate's
+    lifetime — day 60 of 90 — through the same issuance budget and control-plane lease as the first
+    order. With `redirect_port = 80` the redirect listener now answers the renewal's HTTP-01
+    challenge from a shared token map, rather than the order trying to bind a port the listener
+    already holds; any other path under `/.well-known/acme-challenge/` is still `404`. Failed
+    attempts keep serving the current certificate and retry from 5 minutes, doubling to 12 hours.
+    Proven against Pebble: issue, then renew while the redirect listener holds `:80`, then serve
+    the renewed certificate with no restart.
+  - **Self-signed renewal** (`self_signed_renew`, on by default) at the same point, **signed with
+    the existing key** so anything that trusted the certificate by public key keeps trusting it
+    (`self_signed_rotate_key = true` to rotate). Only a certificate that is itself self-signed is
+    ever replaced: a CA-issued certificate at `cert_path` is left alone and logged, not overwritten
+    with an untrusted one.
+  - **Visibility.** `GET /__edgeguard/tls` (an ops endpoint, so admin-port only in split mode)
+    reports source, serial, validity, days left, whether renewal is due and the last renewal
+    attempt with its error. New series: `edgeguard_tls_cert_not_after_seconds{source}`,
+    `…_not_before_seconds`, `…_reloads_total{outcome}`, `…_renewals_total{source,outcome}`.
+    `monitoring/` gains `EdgeGuardCertExpiringSoon` (14 days), `EdgeGuardCertExpiringCritical`
+    (3 days), `EdgeGuardCertRenewalFailing`, and two dashboard panels. `doctor` now reads the
+    certificate at `cert_path` and reports an expired or under-7-day certificate as an error, and
+    under 21 days as a warning when nothing in the process renews it.
+
+  **Build cost: no new crates.** Certificate validity is read by a ~100-line DER walker rather than
+  `x509-parser`, which is not otherwise in the graph; `arc-swap` and `notify` were already
+  dependencies for config hot-reload.
+
+- **Managed mode reports the certificate this edge serves.** With `[control_plane]` enabled and TLS
+  on, the usage report carries the served certificate's expiry and source (and, for ACME, the ordered
+  domains), so the control plane can show which edges are about to serve an expired certificate and
+  follow renewals of the certificates it manages. The fields are omitted when TLS is off, so an older
+  control plane receives exactly the body it always did.
+
+- **Editions, stated in the README.** What this repository is (the Community edition: the whole
+  proxy, Apache-2.0, nothing withheld) and what eggrd Enterprise adds above a fleet of edges — a
+  self-hosted control plane, licensed by annual agreement with a 30-day trial. Only shipped
+  capabilities are listed; the hosted option is marked as not available yet.
+
+### Changed
+- **An idle edge in managed mode now reports every interval.** The usage report is also the edge's
+  heartbeat, and it used to be skipped when no traffic had arrived — so a quiet edge went "stale" in
+  the fleet view after three minutes, and its certificate was never reported, exactly when nobody was
+  watching its traffic. Idle reports carry a zero delta, which the control plane does not record as
+  usage.
+
 ### Fixed
+- **The ACME challenge listener could still hold `:80` after an order returned.** It was torn down
+  by aborting its task, and an aborted task only drops its listener when the runtime next polls it
+  — so whatever bound `:80` immediately afterwards could fail with `AddrInUse`. That includes the
+  redirect listener, which binds `:80` straight after first-boot issuance with `redirect_port = 80`.
+  Found by the renewal test, which binds `:80` the same way. The order now waits for the listener
+  to close before returning, on success and failure alike.
+- **ACME wrote the certificate and key as two separate, non-atomic writes**, so a crash or I/O
+  error between them could leave a new certificate on disk against the old key. It now goes through
+  the same stage-both-then-rename writer self-signed generation uses: both files change, or neither.
 - Windows CI: `clippy -D warnings` failed on `src/selfsigned.rs` (`unused variable: private`) —
   the parameter is only read inside the `#[cfg(unix)]` chmod-0600 blocks, so it was genuinely
   unused on the Windows build. No behavior change on any platform; the private-key file still

@@ -189,6 +189,10 @@ pub struct Metrics {
     /// it rides the object the response path already holds rather than a parameter added to
     /// `finish`'s 38 call sites.
     span_shipper: std::sync::OnceLock<crate::telemetry::SpanShipper>,
+    /// The live TLS certificate, when the listener terminates TLS. Installed once at startup (the
+    /// store is built after the registry) so its expiry, reload and renewal series render with
+    /// everything else, and `GET /__edgeguard/tls` can find it through the state it already has.
+    cert_store: std::sync::OnceLock<std::sync::Arc<crate::certstore::CertStore>>,
     /// One counter per [`OUTCOMES`] entry (parallel index).
     requests: Vec<AtomicU64>,
     /// One counter per [`RL_SCOPES`] entry (parallel index).
@@ -281,6 +285,7 @@ impl Default for Metrics {
         Metrics {
             log_shipper: std::sync::OnceLock::new(),
             span_shipper: std::sync::OnceLock::new(),
+            cert_store: std::sync::OnceLock::new(),
             requests: OUTCOMES.iter().map(|_| AtomicU64::new(0)).collect(),
             ratelimit_hits: RL_SCOPES.iter().map(|_| AtomicU64::new(0)).collect(),
             waf_hits: WAF_RULES.iter().map(|_| AtomicU64::new(0)).collect(),
@@ -452,6 +457,16 @@ impl Metrics {
     /// path: with tracing off, nothing about a span is computed.
     pub fn span_shipper(&self) -> Option<&crate::telemetry::SpanShipper> {
         self.span_shipper.get()
+    }
+
+    /// Install the live certificate store. Called once at startup, when TLS is enabled.
+    pub fn set_cert_store(&self, store: std::sync::Arc<crate::certstore::CertStore>) -> bool {
+        self.cert_store.set(store).is_ok()
+    }
+
+    /// The live certificate store, if this process terminates TLS.
+    pub fn cert_store(&self) -> Option<&std::sync::Arc<crate::certstore::CertStore>> {
+        self.cert_store.get()
     }
 
     /// Count one finished request under its `outcome` label.
@@ -991,6 +1006,10 @@ impl Metrics {
             "edgeguard_llm_dlp_blocked_total {}\n",
             self.dlp_blocked.load(Ordering::Relaxed)
         ));
+
+        if let Some(store) = self.cert_store.get() {
+            store.render_metrics(&mut out);
+        }
 
         out
     }

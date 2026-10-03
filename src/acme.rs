@@ -50,7 +50,19 @@ use tracing::{info, warn};
 use crate::config::{AcmeCfg, TlsCfg};
 
 /// The TCP port the ACME CA connects to for an HTTP-01 challenge. Fixed by RFC 8555 §8.3.
-const HTTP01_PORT: u16 = 80;
+pub const HTTP01_PORT: u16 = 80;
+
+/// HTTP-01 challenge responses in flight: token → key authorization.
+///
+/// An order fills this in as it walks its authorizations and clears its own tokens when it ends.
+/// Whatever is serving `:80` answers from it — the order's own temporary listener on first boot,
+/// or the redirect listener during a renewal, when that listener already holds the port.
+pub type ChallengeMap = Arc<RwLock<HashMap<String, String>>>;
+
+/// The key authorization for `token`, if an order is currently waiting on it.
+pub fn challenge_response(map: &ChallengeMap, token: &str) -> Option<String> {
+    map.read().ok().and_then(|m| m.get(token).cloned())
+}
 
 /// Which set of books refused an order. The remedies are different, so the distinction is worth
 /// carrying all the way to the operator's log line.
@@ -242,6 +254,21 @@ pub async fn obtain_certificate(
     tls: &TlsCfg,
     cp: Option<&crate::cp::CpClient>,
 ) -> Result<Issuance> {
+    obtain_certificate_via(acme, tls, cp, None).await
+}
+
+/// [`obtain_certificate`], choosing who answers the HTTP-01 challenge.
+///
+/// With `challenges: None` the order binds `:80` itself for its duration — the first-boot path,
+/// which runs before any other listener exists. With `Some(map)` the order publishes its tokens to
+/// `map` and binds nothing: a renewal uses this when the redirect listener already holds `:80` and
+/// answers from the same map.
+pub async fn obtain_certificate_via(
+    acme: &AcmeCfg,
+    tls: &TlsCfg,
+    cp: Option<&crate::cp::CpClient>,
+    challenges: Option<&ChallengeMap>,
+) -> Result<Issuance> {
     anyhow::ensure!(
         !acme.domains.is_empty(),
         "tls.acme.domains must list at least one domain"
@@ -262,7 +289,7 @@ pub async fn obtain_certificate(
         Err(deferred) => return Ok(deferred),
     };
 
-    let result = run_order(acme, tls, budget.as_ref()).await;
+    let result = run_order(acme, tls, budget.as_ref(), challenges).await;
 
     // Tell the control plane how the leased order ended, on EVERY path out of `run_order`.
     //
@@ -288,6 +315,7 @@ async fn run_order(
     acme: &AcmeCfg,
     tls: &TlsCfg,
     budget: Option<&crate::acme_budget::IssuanceBudget>,
+    shared: Option<&ChallengeMap>,
 ) -> Result<()> {
     info!(domains = ?acme.domains, directory = %acme.directory_url, "starting ACME order");
 
@@ -308,65 +336,95 @@ async fn run_order(
     // iteration, so responses cannot all be gathered first and served afterwards. Publishing
     // each response *then* signalling ready also closes a window the old two-pass version had,
     // where the CA could validate a token that was not being served yet.
-    let responses: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
-    let _server = AbortOnDrop(spawn_challenge_server(Arc::clone(&responses)).await?);
+    let responses: ChallengeMap = match shared {
+        Some(map) => Arc::clone(map),
+        None => ChallengeMap::default(),
+    };
+    let server = match shared {
+        // Someone else (the redirect listener) is answering on :80 from the shared map.
+        Some(_) => None,
+        None => Some(AbortOnDrop(Some(
+            spawn_challenge_server(Arc::clone(&responses)).await?,
+        ))),
+    };
+    let result = async {
+        // Remove this order's tokens on every exit path, so a shared map does not keep answering
+        // for an order that has finished.
+        let mut published = ClearTokens {
+            map: Arc::clone(&responses),
+            tokens: Vec::new(),
+        };
 
-    let mut authorizations = order.authorizations();
-    while let Some(result) = authorizations.next().await {
-        let mut authz = result.context("fetching authorizations")?;
-        match authz.status {
-            AuthorizationStatus::Pending => {}
-            AuthorizationStatus::Valid => continue,
-            other => anyhow::bail!("unexpected authorization status: {other:?}"),
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result.context("fetching authorizations")?;
+            match authz.status {
+                AuthorizationStatus::Pending => {}
+                AuthorizationStatus::Valid => continue,
+                other => anyhow::bail!("unexpected authorization status: {other:?}"),
+            }
+            let mut challenge = authz
+                .challenge(ChallengeType::Http01)
+                .context("CA offered no http-01 challenge")?;
+            // `ChallengeHandle` derefs to `Challenge`, so the token is still readable here.
+            let token = challenge.token.clone();
+            let key_auth = challenge.key_authorization().as_str().to_string();
+            responses
+                .write()
+                .expect("challenge response map poisoned")
+                .insert(token.clone(), key_auth);
+            published.tokens.push(token);
+            challenge
+                .set_ready()
+                .await
+                .context("signaling challenge ready")?;
         }
-        let mut challenge = authz
-            .challenge(ChallengeType::Http01)
-            .context("CA offered no http-01 challenge")?;
-        // `ChallengeHandle` derefs to `Challenge`, so the token is still readable here.
-        let token = challenge.token.clone();
-        let key_auth = challenge.key_authorization().as_str().to_string();
-        responses
-            .write()
-            .expect("challenge response map poisoned")
-            .insert(token, key_auth);
-        challenge
-            .set_ready()
+
+        let status = order
+            .poll_ready(&RetryPolicy::default())
             .await
-            .context("signaling challenge ready")?;
-    }
+            .context("waiting for the ACME order to become ready")?;
+        anyhow::ensure!(
+            status == OrderStatus::Ready,
+            "ACME order did not become ready (status: {status:?})"
+        );
 
-    let status = order
-        .poll_ready(&RetryPolicy::default())
-        .await
-        .context("waiting for the ACME order to become ready")?;
-    anyhow::ensure!(
-        status == OrderStatus::Ready,
-        "ACME order did not become ready (status: {status:?})"
-    );
+        // 0.8 generates the key pair and CSR itself and hands back the private key, so there is no
+        // rcgen step here any more.
+        let key_pem = order.finalize().await.context("finalizing ACME order")?;
+        let cert_chain_pem = order
+            .poll_certificate(&RetryPolicy::default())
+            .await
+            .context("waiting for the issued certificate")?;
 
-    // 0.8 generates the key pair and CSR itself and hands back the private key, so there is no
-    // rcgen step here any more.
-    let key_pem = order.finalize().await.context("finalizing ACME order")?;
-    let cert_chain_pem = order
-        .poll_certificate(&RetryPolicy::default())
-        .await
-        .context("waiting for the issued certificate")?;
-
-    write_pem(&tls.cert_path, &cert_chain_pem)?;
-    write_key_pem(&tls.key_path, &key_pem)?;
-    info!(cert = %tls.cert_path, key = %tls.key_path, "ACME certificate stored");
-    if let Some(b) = budget {
-        for (bucket, key, left) in b.remaining(&acme.domains, crate::acme_budget::now_unix()) {
-            info!(
-                ca = b.ca_name(),
-                bucket = bucket.label(),
-                key = %key,
-                remaining = left,
-                "ACME issuance budget after this order"
-            );
+        // Both files land together or not at all — the same writer self-signed generation uses — so
+        // the certificate watcher never sees a new certificate paired with the old key.
+        crate::selfsigned::publish_pair(&cert_chain_pem, &key_pem, &tls.cert_path, &tls.key_path)
+            .context("storing the issued certificate")?;
+        info!(cert = %tls.cert_path, key = %tls.key_path, "ACME certificate stored");
+        if let Some(b) = budget {
+            for (bucket, key, left) in b.remaining(&acme.domains, crate::acme_budget::now_unix()) {
+                info!(
+                    ca = b.ca_name(),
+                    bucket = bucket.label(),
+                    key = %key,
+                    remaining = left,
+                    "ACME issuance budget after this order"
+                );
+            }
         }
+        Ok::<(), anyhow::Error>(())
     }
-    Ok(())
+    .await;
+
+    // Release :80 before returning, on success and failure alike. Aborting is not enough on its
+    // own: an aborted task drops its listener only when the runtime next polls it, so whatever
+    // binds :80 straight after an order — the redirect listener after first-boot issuance, or the
+    // next attempt after a failure — could still find the port taken and fail with AddrInUse.
+    if let Some(server) = server {
+        server.stop().await;
+    }
+    result
 }
 
 /// Restore the ACME account from cached credentials, or create and cache a new one (so renewals
@@ -411,9 +469,7 @@ async fn account(acme: &AcmeCfg) -> Result<Account> {
 }
 
 /// Start a minimal HTTP-01 responder on `:80` serving `token -> key authorization`.
-async fn spawn_challenge_server(
-    responses: Arc<RwLock<HashMap<String, String>>>,
-) -> Result<tokio::task::JoinHandle<()>> {
+async fn spawn_challenge_server(responses: ChallengeMap) -> Result<tokio::task::JoinHandle<()>> {
     let app = Router::new()
         .route("/.well-known/acme-challenge/:token", get(challenge_handler))
         .with_state(responses);
@@ -428,56 +484,30 @@ async fn spawn_challenge_server(
 }
 
 async fn challenge_handler(
-    State(responses): State<Arc<RwLock<HashMap<String, String>>>>,
+    State(responses): State<ChallengeMap>,
     AxPath(token): AxPath<String>,
 ) -> (StatusCode, String) {
     // The map is filled in as each authorization is walked, so this reads under a
     // lock rather than from a snapshot taken before the order started.
-    let found = responses.read().ok().and_then(|m| m.get(&token).cloned());
-    match found {
+    match challenge_response(&responses, &token) {
         Some(key_auth) => (StatusCode::OK, key_auth),
         None => (StatusCode::NOT_FOUND, String::new()),
     }
 }
 
-fn create_parent(path: &str) -> Result<()> {
-    if let Some(parent) = Path::new(path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating directory for {path}"))?;
-    }
-    Ok(())
+/// Removes an order's challenge tokens from the map when the order ends, however it ends.
+struct ClearTokens {
+    map: ChallengeMap,
+    tokens: Vec<String>,
 }
 
-fn write_pem(path: &str, contents: &str) -> Result<()> {
-    create_parent(path)?;
-    std::fs::write(path, contents).with_context(|| format!("writing {path}"))
-}
-
-/// Write the private key with owner-only permissions (`0600` on Unix) rather than inheriting
-/// the process umask, which could otherwise leave the key group/world-readable.
-fn write_key_pem(path: &str, contents: &str) -> Result<()> {
-    create_parent(path)?;
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("creating {path} (mode 0600)"))?;
-        file.write_all(contents.as_bytes())
-            .with_context(|| format!("writing {path}"))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents).with_context(|| format!("writing {path}"))
+impl Drop for ClearTokens {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.write() {
+            for t in &self.tokens {
+                m.remove(t);
+            }
+        }
     }
 }
 
@@ -485,11 +515,26 @@ fn write_key_pem(path: &str, contents: &str) -> Result<()> {
 /// exit path from [`obtain_certificate`] — including the early `?` returns during ordering —
 /// not just the happy path. Otherwise a failed issuance would leave a stray `:80` listener
 /// that blocks the next attempt from binding.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+///
+/// On the normal path, call [`AbortOnDrop::stop`] instead, which also waits for the listener to be
+/// gone; the drop is the backstop for the order future itself being cancelled.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    /// Abort the task and wait until it has finished, so its listener is closed on return.
+    async fn stop(mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
     }
 }
 
@@ -579,6 +624,95 @@ mod tests {
         );
         let key = std::fs::read_to_string(&key_path).expect("private key written");
         assert!(key.contains("BEGIN"), "private key PEM present");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Renewal, end to end, while the redirect listener holds :80 — the situation every renewal on
+    // a `redirect_port = 80` deployment is in. The first order binds :80 itself (first boot, before
+    // any listener exists); the renewal must NOT try to, or it fails with "address in use". It
+    // publishes its tokens to the shared map, the redirect listener answers Pebble from it, and the
+    // live store swaps to the new certificate. Same rig and recipe as the test above.
+    #[tokio::test]
+    #[ignore = "requires a live test ACME CA (Pebble) + :80 — see the module test comment"]
+    async fn acme_renewal_through_the_redirect_listener_against_pebble() {
+        let Ok(directory_url) = std::env::var("EDGEGUARD_TEST_ACME_DIR") else {
+            eprintln!("skipping: set EDGEGUARD_TEST_ACME_DIR");
+            return;
+        };
+        let domain =
+            std::env::var("EDGEGUARD_TEST_ACME_DOMAIN").unwrap_or_else(|_| "edgeguard.test".into());
+        crate::tls::init_crypto();
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("eg-acme-renew-{stamp}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let cert_path = base.join("cert.pem").to_string_lossy().into_owned();
+        let key_path = base.join("key.pem").to_string_lossy().into_owned();
+        let acme = AcmeCfg {
+            enabled: true,
+            domains: vec![domain],
+            email: "ci@example.test".into(),
+            directory_url,
+            cache_dir: base.to_string_lossy().into_owned(),
+            accept_tos: true,
+            ..AcmeCfg::default()
+        };
+        let tls = TlsCfg {
+            enabled: true,
+            cert_path: cert_path.clone(),
+            key_path: key_path.clone(),
+            acme: acme.clone(),
+            ..TlsCfg::default()
+        };
+
+        // First boot: no listener yet, the order binds :80 for itself.
+        obtain_certificate(&acme, &tls, None)
+            .await
+            .expect("initial issuance");
+        let store = crate::certstore::CertStore::load(
+            &cert_path,
+            &key_path,
+            crate::certstore::CertSource::Acme,
+        )
+        .unwrap();
+        let first = store.info();
+        assert!(!first.self_issued, "Pebble issued it, not us");
+
+        // Now the redirect listener takes :80, as it does for the rest of the process's life.
+        let challenges = ChallengeMap::default();
+        let listener = TcpListener::bind(("0.0.0.0", HTTP01_PORT)).await.unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let redirect = tokio::spawn(crate::tls::serve_redirect(
+            listener,
+            443,
+            308,
+            vec![],
+            Some(challenges.clone()),
+            stop_rx,
+        ));
+
+        // The renewal: through the shared map, binding nothing.
+        let issued = obtain_certificate_via(&acme, &tls, None, Some(&challenges))
+            .await
+            .expect("renewal answered by the redirect listener");
+        assert!(matches!(issued, Issuance::Issued));
+        assert_eq!(
+            store.reload().unwrap(),
+            crate::certstore::Reload::Swapped,
+            "the live store serves the renewed certificate"
+        );
+        let second = store.info();
+        assert_ne!(first.serial, second.serial);
+        assert!(
+            challenges.read().unwrap().is_empty(),
+            "the order cleared its tokens from the shared map"
+        );
+
+        stop_tx.send(true).unwrap();
+        redirect.await.unwrap().unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 }

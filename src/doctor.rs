@@ -73,6 +73,7 @@ pub fn lint(cfg: &Config) -> Vec<Finding> {
     lint_auth(cfg, &mut f);
     lint_ratelimit(cfg, &mut f);
     lint_tls(cfg, &mut f);
+    lint_cert_expiry(cfg, &mut f);
     lint_cors(cfg, &mut f);
     lint_forwarded(cfg, &mut f);
     lint_secrets(cfg, &mut f);
@@ -242,6 +243,80 @@ fn lint_tls(cfg: &Config, f: &mut Vec<Finding>) {
             }
         }
     }
+}
+
+/// The certificate on disk, judged against when it expires and whether anything here renews it.
+///
+/// Reads the file, so it is the one lint that is not purely config — but "TLS is configured
+/// correctly and the certificate expires on Thursday" is exactly what an operator runs `doctor`
+/// to find out. A missing or unreadable file is not reported here: self-signed and ACME create it
+/// at startup, and a file-sourced pair that cannot load already fails `edgeguard` on boot.
+fn lint_cert_expiry(cfg: &Config, f: &mut Vec<Finding>) {
+    if !cfg.tls.enabled || cfg.tls.cert_path.is_empty() {
+        return;
+    }
+    let Ok(certs) = crate::tls::load_certs(&cfg.tls.cert_path) else {
+        return;
+    };
+    let Ok(info) = crate::certstore::CertInfo::from_der(&certs[0]) else {
+        return;
+    };
+    let plan = crate::certstore::RenewPlan::from_cfg(&cfg.tls);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    f.extend(cert_expiry_findings(&cfg.tls.cert_path, &info, plan, now));
+    if cfg.tls.acme.enabled && !cfg.tls.acme.renew {
+        f.push(Finding::warn(
+            "tls.acme.renew = false: the ACME certificate is issued once and never renewed, so it \
+             expires in at most 90 days. Leave renew on unless something else renews it.",
+        ));
+    }
+}
+
+/// Expiry findings for one certificate. Split out so the thresholds are testable without files.
+pub fn cert_expiry_findings(
+    path: &str,
+    info: &crate::certstore::CertInfo,
+    plan: crate::certstore::RenewPlan,
+    now: i64,
+) -> Vec<Finding> {
+    use crate::certstore::RenewPlan;
+    let days = info.days_left(now);
+    let renews = plan != RenewPlan::None;
+    let mut f = Vec::new();
+    if info.not_after <= now {
+        f.push(Finding::error(format!(
+            "the certificate at {path} has expired; clients will refuse it.{}",
+            if renews {
+                " Renewal is configured but has not succeeded — check the log for renewal errors."
+            } else {
+                " Replace it — the running proxy reloads the new files without a restart."
+            }
+        )));
+    } else if days < 7 {
+        f.push(Finding::error(format!(
+            "the certificate at {path} expires in {days} day(s).{}",
+            if renews {
+                " Renewal should have happened at two-thirds of its lifetime; check the log and \
+                 GET /__edgeguard/tls for the last renewal error."
+            } else {
+                " Nothing in this process renews it; replace the files before then."
+            }
+        )));
+    } else if days < 21 && !renews {
+        f.push(Finding::warn(format!(
+            "the certificate at {path} expires in {days} days and nothing in this process renews \
+             it; replace the files (they are reloaded automatically) or use [tls.acme]."
+        )));
+    } else if crate::certstore::renewal_due(info.not_before, info.not_after, now) && renews {
+        f.push(Finding::info(format!(
+            "the certificate at {path} is past two-thirds of its lifetime ({days} days left); the \
+             running proxy renews it on its next check."
+        )));
+    }
+    f
 }
 
 fn lint_cors(cfg: &Config, f: &mut Vec<Finding>) {
@@ -476,5 +551,31 @@ mod tests {
         std::env::set_var("EDGEGUARD_JWT_SECRET", "shhh");
         assert!(!mentions_secret(&lint(&cfg)));
         std::env::remove_var("EDGEGUARD_JWT_SECRET");
+    }
+
+    #[test]
+    fn certificate_expiry_thresholds_depend_on_whether_anything_renews() {
+        use crate::certstore::{CertInfo, RenewPlan};
+        let day = 86_400;
+        let now = 1_000 * day;
+        let cert = |days_left: i64| CertInfo {
+            not_before: now - 80 * day,
+            not_after: now + days_left * day,
+            serial: "01".into(),
+            self_issued: true,
+        };
+        let levels = |days_left, plan| {
+            cert_expiry_findings("c.pem", &cert(days_left), plan, now)
+                .into_iter()
+                .map(|x| x.level)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(levels(-1, RenewPlan::SelfSigned), vec![Level::Error]);
+        assert_eq!(levels(3, RenewPlan::None), vec![Level::Error]);
+        assert_eq!(levels(3, RenewPlan::Acme), vec![Level::Error]);
+        assert_eq!(levels(14, RenewPlan::None), vec![Level::Warn]);
+        // Renewing, past the ⅔ point but with weeks left: only informational.
+        assert_eq!(levels(14, RenewPlan::Acme), vec![Level::Info]);
+        assert!(levels(200, RenewPlan::None).is_empty());
     }
 }

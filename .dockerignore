@@ -1,6 +1,7 @@
 # Keep the build context tiny + secret-free: only the crate sources are needed to build.
 .git
 target
+**/node_modules
 **/target
 loadtest
 docs

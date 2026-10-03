@@ -68,6 +68,25 @@ struct UsageReport<'a> {
     /// `Option`, not an empty string.
     policy_etag: Option<String>,
     uptime_secs: u64,
+    /// Expiry of the TLS certificate this edge is serving right now, when it terminates TLS. The
+    /// control plane counts edges about to serve an expired certificate from this, and advances its
+    /// managed-certificate records when the edge renews one. Omitted (not `null`) when TLS is off,
+    /// so an older control plane sees exactly the body it always did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cert_not_after: Option<i64>,
+    /// `acme`, `self_signed` or `file`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cert_source: Option<&'static str>,
+    /// The domains ordered over ACME, so the control plane can match this certificate to the
+    /// managed certificates the tenant owns. Empty (and omitted) for any other source.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    cert_domains: &'a [String],
+}
+
+/// The served certificate, as the usage report needs it.
+struct TlsReport {
+    store: Arc<crate::certstore::CertStore>,
+    acme_domains: Vec<String>,
 }
 
 /// The subset of the control plane's `PolicyDocument` the edge needs.
@@ -171,6 +190,9 @@ pub struct CpClient {
     /// policy, read by [`report_loop`] when it reports — the two run as independent tasks on
     /// different intervals, so this is the seam between them.
     policy_etag: arc_swap::ArcSwapOption<String>,
+    /// The live certificate store, when this edge terminates TLS. Installed once at startup — the
+    /// store is built after the client — and read on every report.
+    tls: std::sync::OnceLock<TlsReport>,
 }
 
 /// This edge's identity in the fleet view.
@@ -239,6 +261,7 @@ impl CpClient {
             edge_id,
             started_at: std::time::Instant::now(),
             policy_etag: arc_swap::ArcSwapOption::empty(),
+            tls: std::sync::OnceLock::new(),
         })))
     }
 
@@ -270,14 +293,37 @@ impl CpClient {
         self.policy_etag.store(Some(Arc::new(etag.to_string())));
     }
 
+    /// Report the certificate this edge serves on every usage report from now on. `acme_domains`
+    /// is `tls.acme.domains` when ACME is the source, and empty otherwise.
+    pub fn set_cert_store(
+        &self,
+        store: Arc<crate::certstore::CertStore>,
+        acme_domains: Vec<String>,
+    ) -> bool {
+        self.tls
+            .set(TlsReport {
+                store,
+                acme_domains,
+            })
+            .is_ok()
+    }
+
     /// Report a usage delta, with this edge's heartbeat on the same body.
     pub async fn report_usage(&self, delta: &UsageDelta) -> Result<()> {
+        let tls = self.tls.get();
+        let source = tls.map(|t| t.store.source());
         let report = UsageReport {
             delta,
             edge_id: &self.edge_id,
             agent_version: env!("CARGO_PKG_VERSION"),
             policy_etag: self.policy_etag.load().as_ref().map(|e| (**e).clone()),
             uptime_secs: self.started_at.elapsed().as_secs(),
+            cert_not_after: tls.map(|t| t.store.info().not_after),
+            cert_source: source.map(crate::certstore::CertSource::label),
+            cert_domains: match (tls, source) {
+                (Some(t), Some(crate::certstore::CertSource::Acme)) => &t.acme_domains,
+                _ => &[],
+            },
         };
         self.http
             .post(format!("{}/usage", self.edge_base))
@@ -468,16 +514,20 @@ pub async fn report_loop(
         if sleep_or_shutdown(&mut shutdown, interval).await {
             break;
         }
+        // Report even when idle. The usage report is also this edge's heartbeat — liveness, version,
+        // policy ETag and the certificate it serves — so skipping it on a quiet interval made an
+        // idle edge go "stale" in the fleet view after three minutes and hid its certificate from
+        // the expiry check, exactly when nobody is looking at its traffic. The control plane does not
+        // record an all-zero delta as usage, so an idle report costs one heartbeat upsert.
         let drained = metrics.drain_usage();
-        if drained.is_empty() {
-            continue;
-        }
         if let Err(e) = client.report_usage(&UsageDelta::from(drained)).await {
             warn!(
                 error = format!("{e:#}"),
                 "usage report failed; will retry next period"
             );
-            metrics.restore_usage(&drained);
+            if !drained.is_empty() {
+                metrics.restore_usage(&drained);
+            }
         }
     }
     // Best-effort final flush on graceful shutdown so billable usage isn't lost.
@@ -750,6 +800,9 @@ mod tests {
             agent_version: "9.9.9",
             policy_etag: Some("\"v2\"".into()),
             uptime_secs: 42,
+            cert_not_after: None,
+            cert_source: None,
+            cert_domains: &[],
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
@@ -759,6 +812,38 @@ mod tests {
         assert_eq!(v["agent_version"], "9.9.9");
         assert_eq!(v["policy_etag"], "\"v2\"");
         assert_eq!(v["uptime_secs"], 42);
+    }
+
+    #[test]
+    fn the_served_certificate_rides_on_the_report_and_is_absent_without_tls() {
+        let delta = UsageDelta::default();
+        let domains = vec!["shop.example.com".to_string()];
+        let with = UsageReport {
+            delta: &delta,
+            edge_id: "edge-a",
+            agent_version: "9.9.9",
+            policy_etag: None,
+            uptime_secs: 1,
+            cert_not_after: Some(1_800_000_000),
+            cert_source: Some("acme"),
+            cert_domains: &domains,
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["cert_not_after"], 1_800_000_000);
+        assert_eq!(v["cert_source"], "acme");
+        assert_eq!(v["cert_domains"][0], "shop.example.com");
+
+        // No TLS: the keys are absent, so an older control plane sees the body it always did.
+        let without = UsageReport {
+            cert_not_after: None,
+            cert_source: None,
+            cert_domains: &[],
+            ..with
+        };
+        let v = serde_json::to_value(&without).unwrap();
+        for k in ["cert_not_after", "cert_source", "cert_domains"] {
+            assert!(v.get(k).is_none(), "{k} must be omitted, got {v}");
+        }
     }
 
     #[test]
@@ -773,6 +858,9 @@ mod tests {
             agent_version: "9.9.9",
             policy_etag: None,
             uptime_secs: 1,
+            cert_not_after: None,
+            cert_source: None,
+            cert_domains: &[],
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();

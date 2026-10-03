@@ -45,6 +45,17 @@ pub struct SelfSigned {
 /// The CN is set to the first host for the benefit of old tooling that still reads it, but SANs
 /// are what every current client actually checks.
 pub fn generate(hosts: &[String], days: u32) -> Result<SelfSigned> {
+    let key = KeyPair::generate().context("generating the certificate key pair")?;
+    generate_with_key(hosts, days, key)
+}
+
+/// [`generate`], signing with an existing key pair instead of a fresh one.
+///
+/// This is what renewal uses by default: a client that was told to trust this certificate —
+/// pinned it, or added it to a trust store by public key — keeps working across the rotation,
+/// because only the validity window changes. Rotating the key as well is opt-in
+/// (`tls.self_signed_rotate_key`).
+pub fn generate_with_key(hosts: &[String], days: u32, key: KeyPair) -> Result<SelfSigned> {
     anyhow::ensure!(!hosts.is_empty(), "no hosts to put in the certificate");
     anyhow::ensure!(days > 0, "certificate validity must be at least one day");
 
@@ -78,7 +89,6 @@ pub fn generate(hosts: &[String], days: u32) -> Result<SelfSigned> {
         .checked_add(time::Duration::days(i64::from(days)))
         .context("certificate validity exceeds the supported date range")?;
 
-    let key = KeyPair::generate().context("generating the certificate key pair")?;
     let cert = params
         .self_signed(&key)
         .context("self-signing the certificate")?;
@@ -123,6 +133,32 @@ pub fn write_to(
     );
 
     let generated = generate(hosts, days)?;
+    publish_pair(&generated.cert_pem, &generated.key_pem, cert_path, key_path)?;
+
+    info!(
+        cert = %cert_path,
+        key = %key_path,
+        hosts = %hosts.join(", "),
+        days,
+        "generated a self-signed certificate (clients must trust it explicitly; \
+         use [tls.acme] for a publicly trusted one)"
+    );
+    Ok(generated)
+}
+
+/// Write a certificate chain and its private key to `cert_path`/`key_path` as one unit.
+///
+/// The single write path for every certificate source — first-boot self-signed generation,
+/// self-signed renewal and ACME issuance/renewal all land here — so the guarantees below hold
+/// whichever one produced the pair, and the file watcher in [`crate::certstore`] never has to
+/// tolerate a half-written pair from one of them. Either both files are replaced, or (on any
+/// failure) the existing pair is left exactly as it was. The key is written `0600` on Unix.
+pub fn publish_pair(cert_pem: &str, key_pem: &str, cert_path: &str, key_path: &str) -> Result<()> {
+    anyhow::ensure!(
+        cert_path != key_path,
+        "tls.cert_path and tls.key_path must be different files (both are {cert_path:?}); \
+         the key would overwrite the certificate"
+    );
 
     for path in [cert_path, key_path] {
         if let Some(parent) = Path::new(path).parent() {
@@ -139,9 +175,9 @@ pub fn write_to(
     // replaced the first: a new certificate live against the old key, with no crash required.
     // Writing both to temporary files first reduces the exposure to the gap between two
     // renames, which is a syscall apart and needs an actual crash to land in.
-    let cert_tmp = stage(cert_path, &generated.cert_pem, false)
+    let cert_tmp = stage(cert_path, cert_pem, false)
         .with_context(|| format!("staging certificate for {cert_path}"))?;
-    let key_tmp = match stage(key_path, &generated.key_pem, true) {
+    let key_tmp = match stage(key_path, key_pem, true) {
         Ok(tmp) => tmp,
         Err(e) => {
             // Nothing live has changed yet, so drop the staged certificate and leave the
@@ -189,16 +225,58 @@ pub fn write_to(
             });
         }
     }
+    Ok(())
+}
 
+/// Replace the self-signed certificate at `cert_path`/`key_path` with a fresh one, before the
+/// current one expires.
+///
+/// With `keep_key` (the default, via `tls.self_signed_rotate_key = false`) the new certificate is
+/// signed with the key already on disk, so anything that trusted the old certificate by its
+/// public key keeps trusting the new one. If that key cannot be read or parsed, renewal falls back
+/// to a new key rather than leaving the certificate to expire — an identity change is recoverable,
+/// an expired certificate on a running proxy is an outage.
+pub fn renew(
+    hosts: &[String],
+    days: u32,
+    cert_path: &str,
+    key_path: &str,
+    keep_key: bool,
+) -> Result<()> {
+    let existing = if keep_key {
+        match std::fs::read_to_string(key_path)
+            .map_err(anyhow::Error::from)
+            .and_then(|pem| KeyPair::from_pem(&pem).map_err(anyhow::Error::from))
+        {
+            Ok(key) => Some(key),
+            Err(e) => {
+                warn!(
+                    key = %key_path,
+                    error = format!("{e:#}"),
+                    "self-signed renewal: cannot reuse the existing key; generating a new one \
+                     (clients that pinned the old certificate will need the new one)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let key_reused = existing.is_some();
+    let key = match existing {
+        Some(k) => k,
+        None => KeyPair::generate().context("generating the certificate key pair")?,
+    };
+    let generated = generate_with_key(hosts, days, key)?;
+    publish_pair(&generated.cert_pem, &generated.key_pem, cert_path, key_path)?;
     info!(
         cert = %cert_path,
-        key = %key_path,
         hosts = %hosts.join(", "),
         days,
-        "generated a self-signed certificate (clients must trust it explicitly; \
-         use [tls.acme] for a publicly trusted one)"
+        key_reused,
+        "renewed the self-signed certificate"
     );
-    Ok(generated)
+    Ok(())
 }
 
 /// Write `contents` to a temporary file beside `path` and return that temporary path.

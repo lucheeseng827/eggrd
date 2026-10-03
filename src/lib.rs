@@ -12,6 +12,7 @@ pub mod acme_budget;
 pub mod alert;
 pub mod auth;
 pub mod budget;
+pub mod certstore;
 pub mod config;
 pub mod cors;
 pub mod cp;
@@ -268,12 +269,14 @@ fn public_routes() -> Router<AppState> {
         .fallback(any(proxy::handle))
 }
 
-/// Internal ops routes: liveness, readiness, and the Prometheus metrics scrape.
+/// Internal ops routes: liveness, readiness, the Prometheus metrics scrape, and the served TLS
+/// certificate's status.
 fn admin_routes() -> Router<AppState> {
     Router::new()
         .route("/__edgeguard/health", get(|| async { "ok" }))
         .route("/__edgeguard/ready", get(ready))
         .route("/__edgeguard/metrics", get(metrics_handler))
+        .route("/__edgeguard/tls", get(proxy::tls_status))
 }
 
 #[cfg(test)]

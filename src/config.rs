@@ -941,6 +941,20 @@ pub struct TlsCfg {
     /// a self-signed certificate is meant to be a stopgap, and an expiry that arrives is a
     /// better reminder to move to `[tls.acme]` than a decade-long one nobody revisits.
     pub self_signed_days: u32,
+    /// Regenerate the self-signed certificate before it expires — once two-thirds of its lifetime
+    /// has passed — instead of letting it lapse. On by default: a proxy that quietly starts
+    /// serving an expired certificate on day 91 is an outage nobody chose. Only a certificate
+    /// that is itself self-signed is ever replaced, so a CA-issued certificate the operator put
+    /// at `cert_path` is left alone.
+    pub self_signed_renew: bool,
+    /// Generate a new key pair at each self-signed renewal. Off by default, so a client that was
+    /// told to trust this certificate by its public key keeps trusting the renewed one.
+    pub self_signed_rotate_key: bool,
+    /// Reload the certificate when `cert_path`/`key_path` change on disk — written by
+    /// cert-manager, Vault Agent, certbot or a mounted Kubernetes secret — with no restart and no
+    /// dropped connections. A pair that does not load is rejected and the current one keeps
+    /// serving. On by default.
+    pub watch: bool,
     /// Plain-HTTP port to run an HTTP→HTTPS redirect listener on; `0` (default) disables it.
     /// Terminating TLS only protects traffic that reaches the TLS port, and a browser given a
     /// bare hostname tries `:80` first — so without this, the first request of every visit is
@@ -986,6 +1000,9 @@ impl Default for TlsCfg {
             // staging, short enough that "temporary" self-signed TLS cannot quietly become
             // permanent.
             self_signed_days: 90,
+            self_signed_renew: true,
+            self_signed_rotate_key: false,
+            watch: true,
             redirect_port: 0,
             // 308 over 301: it preserves method and body, so an API client's POST is not turned
             // into a GET by the upgrade.
@@ -998,9 +1015,9 @@ impl Default for TlsCfg {
 
 /// Automatic certificate management (ACME / Let's Encrypt) via the HTTP-01 challenge. The
 /// obtained certificate is written to `TlsCfg::cert_path`/`key_path` and served by the TLS
-/// listener. Issuance runs at startup only when no certificate exists at `cert_path`;
-/// there is **no automatic renewal yet** (see docs/ROADMAP.md) — delete the cert/key files
-/// and restart to re-issue.
+/// listener. Issuance runs at startup when no certificate exists at `cert_path`, and the running
+/// proxy renews it once two-thirds of its lifetime has passed (`renew`, on by default), serving
+/// the new certificate to new connections without a restart.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AcmeCfg {
@@ -1032,6 +1049,12 @@ pub struct AcmeCfg {
     /// registered domain are not this edge's to opt out of — one box turning this off would
     /// otherwise be able to spend the whole fleet's weekly allowance.
     pub budget_enabled: bool,
+    /// Renew the certificate while the proxy runs, once two-thirds of its lifetime has passed
+    /// (day 60 of a 90-day certificate). Each renewal goes through the same issuance budget and,
+    /// in managed mode, the same control-plane lease as the first order. When the redirect
+    /// listener holds port 80 it answers the HTTP-01 challenge, so renewal needs no second
+    /// listener. On by default.
+    pub renew: bool,
 }
 
 impl Default for AcmeCfg {
@@ -1045,6 +1068,7 @@ impl Default for AcmeCfg {
             cache_dir: "./acme".into(),
             accept_tos: false,
             budget_enabled: true,
+            renew: true,
         }
     }
 }

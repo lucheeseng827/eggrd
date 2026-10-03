@@ -126,3 +126,47 @@ groups:
             serving the certificates they already hold and no self-signed certificate is
             substituted, so this is not yet a serving outage — it becomes one when an existing
             certificate expires before the bucket refills. Check certificate expiry dates now.
+
+      # Certificate expiry. `edgeguard_tls_cert_not_after_seconds` is the certificate the listener
+      # is serving right now (it follows hot-swaps), so this fires on what clients actually see,
+      # not on whatever happens to be on disk.
+      - alert: EdgeGuardCertExpiringSoon
+        expr: (edgeguard_tls_cert_not_after_seconds - time()) < 14 * 86400
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS certificate on {{ $labels.instance }} expires in under 14 days"
+          description: >-
+            Renewal ({{ $labels.source }}) runs at two-thirds of the certificate's lifetime, so a
+            certificate this close to expiry means renewal is failing or nothing renews it. Check
+            GET /__edgeguard/tls for the last renewal attempt and its error. For source="file",
+            replace the files — the proxy reloads them without a restart.
+
+      - alert: EdgeGuardCertExpiringCritical
+        expr: (edgeguard_tls_cert_not_after_seconds - time()) < 3 * 86400
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TLS certificate on {{ $labels.instance }} expires in under 3 days"
+          description: >-
+            Clients will refuse this edge when the certificate expires. Replace the certificate
+            files now; the running proxy picks them up without a restart.
+
+      - alert: EdgeGuardCertRenewalFailing
+        # Matched on source too: every edge exports all (source, outcome) pairs, so an ACME edge
+        # also carries a self_signed "ok" series that never moves. Matched on instance alone, that
+        # idle series satisfies "no success" and the rule fires on any failure, even one a retry fixed.
+        expr: |
+          increase(edgeguard_tls_cert_renewals_total{outcome="failed"}[6h]) > 0
+            and on (instance, job, source)
+          increase(edgeguard_tls_cert_renewals_total{outcome="ok"}[6h]) == 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate renewal keeps failing on {{ $labels.instance }}"
+          description: >-
+            Renewal has been retried for six hours without success. The current certificate is
+            still being served; this is the early warning, with weeks left before expiry.

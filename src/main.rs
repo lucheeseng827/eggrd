@@ -27,8 +27,8 @@ use edgeguard::generate::{generate, Target};
 use edgeguard::logship;
 use edgeguard::telemetry;
 use edgeguard::{
-    acme, build_admin_router, build_public_router, build_router, build_runtime, build_state, cp,
-    doctor, hash_password, reload, scaffold, selfsigned, supervisor, tls,
+    acme, build_admin_router, build_public_router, build_router, build_runtime, build_state,
+    certstore, cp, doctor, hash_password, reload, scaffold, selfsigned, supervisor, tls,
 };
 
 /// The selected mode of operation. `serve` is the default; `hash` and `generate` are standalone
@@ -476,6 +476,9 @@ async fn main() -> Result<()> {
     // Also grabbed here, before `state` moves into the router below: the access-log shipper is
     // installed on the same registry the response path already holds.
     let log_metrics = state.metrics.clone();
+    // The TLS branch below installs the live certificate store on the same registry, so its
+    // series render with the rest and `/__edgeguard/tls` can reach it.
+    let tls_metrics = state.metrics.clone();
     let cp_quota = state.quota.clone();
 
     // Hard quota needs the managed-mode client to poll verdicts; without it the gate would stay
@@ -626,8 +629,8 @@ async fn main() -> Result<()> {
         // certificate on a public name.
         if cfg.tls.acme.enabled {
             // Only order a certificate when one isn't already on disk; re-ordering on every
-            // boot would burn ACME issuance rate limits. (Renewal before expiry is future
-            // work — see docs/ROADMAP.md.)
+            // boot would burn ACME issuance rate limits. Renewal before expiry is the job of
+            // `certstore::maintain`, started once the listener's certificate is loaded.
             // BOTH files, not just the certificate. A cert without its key is not a usable
             // pair: skipping issuance there used to hand the half-pair to `selfsigned::ensure`
             // below, which regenerates both — quietly serving a self-signed certificate on the
@@ -696,7 +699,49 @@ async fn main() -> Result<()> {
             )
             .context("generating a self-signed certificate")?;
         }
-        let server_config = tls::load_server_config(&cfg.tls.cert_path, &cfg.tls.key_path)?;
+        let cert_store = certstore::CertStore::load(
+            &cfg.tls.cert_path,
+            &cfg.tls.key_path,
+            certstore::CertSource::from_cfg(&cfg.tls),
+        )
+        .context("loading the TLS certificate (does the key match the certificate?)")?;
+        tls_metrics.set_cert_store(Arc::clone(&cert_store));
+        // Managed mode: report the served certificate on the usage heartbeat, so the control plane
+        // sees edges about to serve an expired certificate and follows renewals of managed ones.
+        if let Some(client) = &acme_cp {
+            let domains = if cfg.tls.acme.enabled {
+                cfg.tls.acme.domains.clone()
+            } else {
+                Vec::new()
+            };
+            client.set_cert_store(Arc::clone(&cert_store), domains);
+        }
+        let server_config = tls::server_config(Arc::clone(&cert_store))?;
+
+        // While the redirect listener holds the HTTP-01 port, ACME renewals publish their
+        // challenge tokens here and that listener answers them (see `tls::redirect_router`).
+        let challenges =
+            (cfg.tls.redirect_port == acme::HTTP01_PORT).then(acme::ChallengeMap::default);
+
+        if cfg.tls.watch {
+            let store = Arc::clone(&cert_store);
+            let rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = certstore::watch(store, rx).await {
+                    warn!(error = format!("{e:#}"), "certificate watcher stopped; changes on disk are picked up by the hourly check");
+                }
+            });
+        }
+        // Always running, whatever the source: it is also what warns when a certificate nothing
+        // here renews is nearing expiry, and the backstop reload for filesystems without events.
+        let renewer = certstore::Renewer {
+            store: Arc::clone(&cert_store),
+            plan: certstore::RenewPlan::from_cfg(&cfg.tls),
+            tls: cfg.tls.clone(),
+            cp: acme_cp.clone(),
+            challenges: challenges.clone(),
+        };
+        tokio::spawn(certstore::maintain(renewer, shutdown_rx.clone()));
 
         // HTTP→HTTPS redirect on a second, plaintext port. Bound after any ACME order above has
         // finished and dropped its own `:80` listener, so the two never contend for the port.
@@ -712,9 +757,15 @@ async fn main() -> Result<()> {
             let hosts = cfg.tls.redirect_hosts.clone();
             let redirect_rx = shutdown_rx.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    tls::serve_redirect(redirect_listener, tls_port, status, hosts, redirect_rx)
-                        .await
+                if let Err(e) = tls::serve_redirect(
+                    redirect_listener,
+                    tls_port,
+                    status,
+                    hosts,
+                    challenges,
+                    redirect_rx,
+                )
+                .await
                 {
                     warn!(error = %e, "HTTP→HTTPS redirect listener stopped");
                 }

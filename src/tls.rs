@@ -1,30 +1,24 @@
 //! TLS termination via `rustls` + `tokio-rustls`.
 //!
-//! axum 0.7 has no built-in TLS, so we run a small accept loop: take a TCP connection,
-//! complete the rustls handshake, then hand the encrypted stream to hyper, serving the same
-//! axum [`Router`] the plaintext path uses. Certificates come either from PEM files
-//! ([`load_server_config`]) or from ACME (which writes those same files; see [`crate::acme`]).
+//! axum 0.7 has no built-in TLS, so the shared accept loop in [`crate::serve`] completes the rustls
+//! handshake and hands the encrypted stream to hyper, serving the same axum [`Router`] the
+//! plaintext path uses. This module builds the [`ServerConfig`] for it. Certificates come either
+//! from PEM files ([`load_server_config`]) or from ACME (which writes those same files; see
+//! [`crate::acme`]).
 
 use std::fs::File;
 use std::io::BufReader;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::http::{HeaderValue, Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::Router;
-use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tokio_rustls::TlsAcceptor;
-use tower::{Service, ServiceExt};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 /// Install a process-wide default crypto provider (ring). Idempotent and best-effort: if a
 /// provider is already installed (e.g. by the JWKS HTTP client) this is a no-op.
@@ -62,12 +56,36 @@ pub fn server_config(store: Arc<crate::certstore::CertStore>) -> Result<Arc<Serv
 pub fn server_config_with(
     resolver: Arc<dyn rustls::server::ResolvesServerCert>,
 ) -> Result<Arc<ServerConfig>> {
-    let mut config =
+    server_config_with_client_auth(resolver, None)
+}
+
+/// [`server_config_with`], verifying client certificates with `client_auth` when given
+/// (`[tls.client_auth]`, mutual TLS).
+///
+/// With client authentication on, TLS session resumption is off: no session cache and no
+/// tickets. A resumed session is not verified again — rustls restores the certificate the
+/// original handshake accepted — so a client certificate revoked by a CRL reload would keep
+/// connecting for as long as its session lived. Every connection pays a full handshake instead,
+/// which keep-alive amortises.
+pub fn server_config_with_client_auth(
+    resolver: Arc<dyn rustls::server::ResolvesServerCert>,
+    client_auth: Option<Arc<crate::client_auth::ClientAuth>>,
+) -> Result<Arc<ServerConfig>> {
+    let builder =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
-            .context("selecting TLS protocol versions")?
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
+            .context("selecting TLS protocol versions")?;
+    let verifies_clients = client_auth.is_some();
+    let mut config = match client_auth {
+        Some(verifier) => builder
+            .with_client_cert_verifier(verifier)
+            .with_cert_resolver(resolver),
+        None => builder.with_no_client_auth().with_cert_resolver(resolver),
+    };
+    if verifies_clients {
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+    }
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
@@ -90,70 +108,24 @@ pub(crate) fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
         .with_context(|| format!("no private key found in {path}"))
 }
 
-/// Serve `app` over TLS on `listener` until `shutdown` flips true. Each connection is
-/// handshaked and served on its own task, so a slow handshake can't block new accepts and a
-/// graceful shutdown stops accepting while letting the listener drop.
+/// Serve `app` over TLS on `listener` until `shutdown` flips true, then drain, with the default
+/// `[server]` listener settings. See [`crate::serve::serve`], which this wraps, for the timeouts,
+/// the connection cap and the drain.
 pub async fn serve(
     listener: TcpListener,
     config: Arc<ServerConfig>,
     app: Router,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let acceptor = TlsAcceptor::from(config);
-    // `into_make_service_with_connect_info` injects `ConnectInfo(peer)` per connection, which
-    // the proxy handler relies on for client-IP resolution.
-    let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
-
     info!(listen = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "TLS listener up");
-
-    loop {
-        let (stream, peer) = tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
-                continue;
-            }
-            accepted = listener.accept() => match accepted {
-                Ok(v) => v,
-                Err(e) => { warn!(error = %e, "TLS accept error"); continue; }
-            },
-        };
-
-        let acceptor = acceptor.clone();
-        // Connection-scoped tower service carrying this peer's ConnectInfo.
-        let tower_service = unwrap_infallible(make_service.call(peer).await);
-
-        tokio::spawn(async move {
-            // Bound the handshake so a client that never completes it can't pin a task/socket
-            // indefinitely (this runs before any auth/rate-limit checks).
-            let tls_stream = match tokio::time::timeout(
-                Duration::from_secs(10),
-                acceptor.accept(stream),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    debug!(error = %e, %peer, "TLS handshake failed");
-                    return;
-                }
-                Err(_) => {
-                    debug!(%peer, "TLS handshake timed out");
-                    return;
-                }
-            };
-            let io = TokioIo::new(tls_stream);
-            let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
-                tower_service.clone().oneshot(request)
-            });
-            if let Err(e) = ConnBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(io, hyper_service)
-                .await
-            {
-                debug!(error = %e, %peer, "error serving TLS connection");
-            }
-        });
-    }
-    Ok(())
+    crate::serve::serve(
+        listener,
+        Some(config),
+        app,
+        crate::serve::ServeOpts::default(),
+        shutdown,
+    )
+    .await
 }
 
 /// The ACME HTTP-01 challenge prefix. The redirect listener never redirects here: a CA validating
@@ -320,7 +292,8 @@ pub fn parse_redirect_status(status: u16) -> Result<StatusCode> {
     Ok(parsed)
 }
 
-/// Serve plain-HTTP redirects to HTTPS on `listener` until `shutdown` flips.
+/// Serve plain-HTTP redirects to HTTPS on `listener` until `shutdown` flips, then drain, with the
+/// listener settings in `opts`.
 ///
 /// This exists because the common failure is not "the operator refused TLS" — it is a user typing
 /// a bare hostname, the browser trying `:80` first, and the request either failing or being
@@ -335,6 +308,7 @@ pub async fn serve_redirect(
     status: u16,
     allowed: Vec<String>,
     challenges: Option<crate::acme::ChallengeMap>,
+    opts: crate::serve::ServeOpts,
     shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let status = parse_redirect_status(status)?;
@@ -346,27 +320,15 @@ pub async fn serve_redirect(
         "HTTP→HTTPS redirect listener up"
     );
 
-    axum::serve(
+    crate::serve::serve(
         listener,
-        redirect_router(tls_port, status, allowed, challenges).into_make_service(),
+        None,
+        redirect_router(tls_port, status, allowed, challenges),
+        opts,
+        shutdown,
     )
-    .with_graceful_shutdown(async move {
-        let mut shutdown = shutdown;
-        while shutdown.changed().await.is_ok() {
-            if *shutdown.borrow() {
-                break;
-            }
-        }
-    })
     .await
     .context("HTTP→HTTPS redirect server error")
-}
-
-fn unwrap_infallible<T>(result: Result<T, std::convert::Infallible>) -> T {
-    match result {
-        Ok(value) => value,
-        Err(never) => match never {},
-    }
 }
 
 #[cfg(test)]
@@ -583,8 +545,16 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         // A typo'd `redirect_status = 200` must fail loudly at startup rather than answering
         // every plaintext request with an empty 200 that looks like the app.
-        assert!(serve_redirect(listener, 443, 200, vec![], None, rx)
-            .await
-            .is_err());
+        assert!(serve_redirect(
+            listener,
+            443,
+            200,
+            vec![],
+            None,
+            crate::serve::ServeOpts::default(),
+            rx
+        )
+        .await
+        .is_err());
     }
 }

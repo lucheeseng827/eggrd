@@ -331,6 +331,17 @@ fn stage(path: &str, contents: &str, private: bool) -> Result<String> {
     }
 }
 
+/// Replace the file at `path` with `contents`, created `0600`, atomically: a reader sees the old
+/// file or the new one, never a partial write. For a single file of secrets — the control-plane
+/// policy cache (`crate::policy`) — staged exactly as a private key is.
+pub(crate) fn replace_private(path: &str, contents: &str) -> Result<()> {
+    let tmp = stage(path, contents, true).with_context(|| format!("writing {path}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!(e).context(format!("replacing {path}"))
+    })
+}
+
 /// Where the previous certificate is parked while the new pair is published. Process-scoped so
 /// two runs cannot fight over the same name, and beside the original so the rename stays within
 /// one filesystem.

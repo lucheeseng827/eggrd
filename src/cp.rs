@@ -15,15 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::config::{Config, ControlPlaneCfg};
+use crate::config::ControlPlaneCfg;
 use crate::metrics::Metrics;
-use crate::proxy::Runtime;
 
 /// A usage delta reported to the control plane (matches its `/v3/edge/{id}/usage` wire shape).
 /// The LLM token fields (gateway L4) are only sent when the gateway is active; the control plane
@@ -193,6 +191,9 @@ pub struct CpClient {
     /// The live certificate store, when this edge terminates TLS. Installed once at startup — the
     /// store is built after the client — and read on every report.
     tls: std::sync::OnceLock<TlsReport>,
+    /// The client certificate presented to the control plane, if any. The TLS config holds the
+    /// same store as its resolver, so a reload is what the next handshake presents.
+    identity: Option<Arc<crate::certstore::CertStore>>,
 }
 
 /// This edge's identity in the fleet view.
@@ -239,7 +240,8 @@ impl CpClient {
             !cfg.edge_token.is_empty(),
             "control_plane.edge_token (or EDGEGUARD_CP_EDGE_TOKEN) is required when enabled"
         );
-        let http = reqwest::Client::builder()
+        let (http, identity) = crate::outbound::builder(&cfg.outbound, "control_plane", &cfg.url)?;
+        let http = http
             .timeout(Duration::from_secs(10))
             .build()
             .context("building control-plane HTTP client")?;
@@ -253,7 +255,14 @@ impl CpClient {
         } else {
             cfg.edge_id.trim().to_string()
         };
-        info!(edge_id, "control-plane managed mode enabled");
+        let settings = crate::outbound::Settings::of(&cfg.outbound, &cfg.url);
+        info!(
+            edge_id,
+            trust = settings.trust.label(),
+            client_cert = identity.is_some(),
+            proxy = %crate::outbound::redact_proxy(settings.proxy.0),
+            "control-plane managed mode enabled"
+        );
         Ok(Some(Arc::new(CpClient {
             http,
             edge_base,
@@ -262,7 +271,14 @@ impl CpClient {
             started_at: std::time::Instant::now(),
             policy_etag: arc_swap::ArcSwapOption::empty(),
             tls: std::sync::OnceLock::new(),
+            identity,
         })))
+    }
+
+    /// The client certificate this edge presents to the control plane
+    /// (`control_plane.client_cert_path`), for the caller to watch and reload.
+    pub fn identity(&self) -> Option<&Arc<crate::certstore::CertStore>> {
+        self.identity.as_ref()
     }
 
     /// Conditional policy pull. `200` → `Policy`; `304` → `NotModified`; other statuses → `Err`.
@@ -450,22 +466,26 @@ async fn sleep_or_shutdown(rx: &mut watch::Receiver<bool>, dur: Duration) -> boo
     }
 }
 
-/// Background loop: poll the control plane for policy and hot-reload it through `build_runtime` +
-/// the arc-swap, exactly like a local file edit. A parse/build failure keeps the current policy.
+/// Background loop: pull the policy every `interval` and apply it through `policy`, which also
+/// keeps its on-disk copy. `etag` is the policy already applied at startup (from
+/// `control_plane.cache_path`), so the first pull is a cheap `304` when nothing changed while
+/// the edge was down.
 pub async fn poll_loop(
     client: Arc<CpClient>,
-    base: Arc<Config>,
-    runtime: Arc<ArcSwap<Runtime>>,
+    policy: Arc<crate::policy::Policy>,
     interval: Duration,
+    mut etag: Option<String>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut etag: Option<String> = None;
     info!(?interval, "control-plane policy poller started");
     loop {
         match client.pull_policy(etag.as_deref()).await {
             Ok(PullResult::NotModified) => {}
             Ok(PullResult::Policy { body, etag: new }) => {
-                match apply_policy(&base, &body, &runtime) {
+                match policy.apply_pushed(crate::policy::Pushed {
+                    etag: new.clone(),
+                    body,
+                }) {
                     Ok(()) => {
                         // Publish to the report loop BEFORE updating our own cursor, so the next
                         // usage report cannot claim an ETag this edge failed to apply. On the error
@@ -491,14 +511,6 @@ pub async fn poll_loop(
             break;
         }
     }
-}
-
-/// Overlay a pushed policy onto the local base config, rebuild the runtime, and swap it in.
-fn apply_policy(base: &Config, body: &str, runtime: &ArcSwap<Runtime>) -> Result<()> {
-    let merged = base.with_policy_from(body)?;
-    let rt = crate::build_runtime(Arc::new(merged))?;
-    runtime.store(Arc::new(rt));
-    Ok(())
 }
 
 /// Background loop: flush the usage accumulator to the control plane each period. On a failed
@@ -778,6 +790,47 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+    }
+
+    fn managed(url: &str) -> ControlPlaneCfg {
+        ControlPlaneCfg {
+            enabled: true,
+            url: url.into(),
+            tenant_id: "t1".into(),
+            edge_token: "tok".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn private_tls_settings_are_refused_on_plain_http_and_must_load() {
+        let mut cfg = managed("http://cp.internal");
+        cfg.outbound.ca_path = "/etc/edgeguard/cp-ca.pem".into();
+        let e = format!("{:#}", CpClient::from_cfg(&cfg).err().unwrap());
+        assert!(e.contains("not https://"), "{e}");
+
+        let mut cfg = managed("http://cp.internal");
+        cfg.outbound.client_cert_path = "/etc/edgeguard/edge.pem".into();
+        cfg.outbound.client_key_path = "/etc/edgeguard/edge.key".into();
+        let e = format!("{:#}", CpClient::from_cfg(&cfg).err().unwrap());
+        assert!(
+            e.contains("not https://"),
+            "a client certificate alone: {e}"
+        );
+
+        let mut cfg = managed("https://cp.internal");
+        cfg.outbound.client_cert_path = "/etc/edgeguard/edge.pem".into();
+        let e = format!("{:#}", CpClient::from_cfg(&cfg).err().unwrap());
+        assert!(e.contains("set together"), "{e}");
+
+        cfg.outbound.client_key_path = "/no/such/edge.key".into();
+        let e = format!("{:#}", CpClient::from_cfg(&cfg).err().unwrap());
+        assert!(e.contains("control_plane.client_cert_path"), "{e}");
+
+        let mut cfg = managed("https://cp.internal");
+        cfg.outbound.ca_path = "/no/such/ca.pem".into();
+        let e = format!("{:#}", CpClient::from_cfg(&cfg).err().unwrap());
+        assert!(e.contains("control_plane.ca_path"), "{e}");
     }
 
     #[tokio::test]

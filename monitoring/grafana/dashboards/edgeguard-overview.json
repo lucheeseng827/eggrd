@@ -614,7 +614,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Days until the served TLS certificate expires. Renewal runs at two-thirds of its lifetime, so on a 90-day certificate this should never fall below ~30.",
+      "description": "Days until each certificate expires: the one served (no cert label), each [[tls.certs]] pair, each client certificate the edge presents (client:<path>) and each CA it trusts for client certificates (client-ca:<name>). Renewal runs at two-thirds of a served certificate's lifetime, so on a 90-day certificate it should never fall below ~30; nothing renews the others.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -672,7 +672,7 @@
             "uid": "${datasource}"
           },
           "expr": "(edgeguard_tls_cert_not_after_seconds - time()) / 86400",
-          "legendFormat": "{{instance}} ({{source}})",
+          "legendFormat": "{{instance}} {{cert}} ({{source}})",
           "refId": "A"
         }
       ],
@@ -755,6 +755,47 @@
       ],
       "title": "TLS certificate — renewals & reloads",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Hours until each CRL in tls.client_auth.crl_paths says the next one is due. Below zero the CRL is stale: it goes on being used, and revocations published since are not applied (alert EdgeGuardCrlStale).",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0 },
+              { "color": "green", "value": 24 }
+            ]
+          },
+          "unit": "h"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 34 },
+      "id": 15,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "value_and_name"
+      },
+      "pluginVersion": "11.2.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "(edgeguard_tls_crl_next_update_seconds - time()) / 3600",
+          "legendFormat": "{{instance}} {{crl}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Client-certificate CRLs — hours to next update",
+      "type": "stat"
     }
   ]
 }

@@ -30,23 +30,29 @@ pub struct AlertRuntime {
 impl AlertRuntime {
     /// Compile from config. `enabled` folds in "has a non-empty webhook_url" so a misconfigured
     /// switch (on, but no URL) is inert rather than trying to POST nowhere on every crossing.
-    pub fn build(cfg: &AlertsCfg) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(cfg.timeout_ms.max(1)))
-            .build()
-            .unwrap_or_default();
-        AlertRuntime {
-            enabled: cfg.enabled && !cfg.webhook_url.trim().is_empty(),
+    pub fn build(cfg: &AlertsCfg) -> anyhow::Result<Self> {
+        let enabled = cfg.enabled && !cfg.webhook_url.trim().is_empty();
+        let client = if enabled {
+            crate::outbound::builder(&cfg.outbound, "alerts", cfg.webhook_url.trim())?.0
+        } else {
+            reqwest::Client::builder()
+        }
+        .timeout(Duration::from_millis(cfg.timeout_ms.max(1)))
+        .build()
+        .map_err(|e| anyhow::anyhow!("building the alert webhook's HTTP client: {e}"))?;
+        Ok(AlertRuntime {
+            enabled,
             webhook_url: cfg.webhook_url.trim().to_string(),
             budget_threshold: cfg.budget_consumed_threshold,
             client,
             alerting: Mutex::new(HashMap::new()),
-        }
+        })
     }
 
     /// An inert runtime (alerting off) — the default when `[alerts]` is absent.
     pub fn disabled() -> Self {
-        Self::build(&AlertsCfg::default())
+        // Off, it builds a plain client, which fails only where `reqwest::Client::new` would panic.
+        Self::build(&AlertsCfg::default()).expect("a disabled alert runtime builds")
     }
 
     /// Decide whether a budget's `ratio` should fire an alert **now**, updating the edge-trigger
@@ -91,7 +97,10 @@ impl AlertRuntime {
             match client.post(&url).json(&body).send().await {
                 Ok(resp) if resp.status().is_success() => {}
                 Ok(resp) => tracing::debug!(status = %resp.status(), "alert webhook rejected"),
-                Err(e) => tracing::debug!(error = %e, "alert webhook failed"),
+                Err(e) => tracing::debug!(
+                    error = %crate::upstream::error_chain(&e),
+                    "alert webhook failed"
+                ),
             }
         });
     }
@@ -108,6 +117,7 @@ mod tests {
             budget_consumed_threshold: threshold,
             ..AlertsCfg::default()
         })
+        .unwrap()
     }
 
     #[test]
@@ -133,7 +143,8 @@ mod tests {
             enabled: true,
             webhook_url: "   ".into(), // whitespace-only → treated as unset → inert
             ..AlertsCfg::default()
-        });
+        })
+        .unwrap();
         assert!(!no_url.enabled);
         assert!(!no_url.decide_budget("b", 5.0));
     }

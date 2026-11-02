@@ -297,26 +297,28 @@ fn unix_nanos() -> u64 {
 
 /// Push the registry to `cfg.endpoint` every `cfg.interval_secs` until `shutdown` flips, then once
 /// more so the last interval is not lost. Returns `None` (nothing spawned) when export is off or has
-/// no endpoint. A failed push is logged and the next interval tries again; counters are cumulative,
-/// so a missed push loses resolution, not counts.
+/// no endpoint, and an error when its TLS or proxy settings do not load. A failed push is logged and
+/// the next interval tries again; counters are cumulative, so a missed push loses resolution, not
+/// counts.
 pub fn spawn_exporter(
     cfg: &crate::config::OtlpMetricsCfg,
     metrics: Arc<Metrics>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
     if !cfg.enabled || cfg.endpoint.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
-    let http = reqwest::Client::builder()
+    let (http, _) = crate::outbound::builder(&cfg.outbound, "metrics.otlp", cfg.endpoint.trim())?;
+    let http = http
         .timeout(Duration::from_millis(cfg.timeout_ms.max(100)))
         .build()
-        .ok()?;
+        .map_err(|e| anyhow::anyhow!("building the OTLP metrics HTTP client: {e}"))?;
     let endpoint = cfg.endpoint.clone();
     let service = cfg.service_name.clone();
     let interval = Duration::from_secs(cfg.interval_secs.max(1));
     let start = unix_nanos();
     tracing::info!(endpoint = %endpoint, ?interval, "OTLP metrics export enabled");
-    Some(tokio::spawn(async move {
+    Ok(Some(tokio::spawn(async move {
         let push = |http: reqwest::Client| {
             let body = to_otlp_json(&metrics.render(), &service, start, unix_nanos());
             let endpoint = endpoint.clone();
@@ -330,7 +332,10 @@ pub fn spawn_exporter(
                 {
                     Ok(_) => tracing::debug!("OTLP metrics pushed"),
                     Err(e) => {
-                        tracing::warn!(error = %e, "OTLP metrics push failed; retrying next interval")
+                        tracing::warn!(
+                            error = %crate::upstream::error_chain(&e),
+                            "OTLP metrics push failed; retrying next interval"
+                        )
                     }
                 }
             }
@@ -346,7 +351,7 @@ pub fn spawn_exporter(
                 }
             }
         }
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -494,7 +499,9 @@ edgeguard_untyped 5
             ..Default::default()
         };
         let (tx, rx) = tokio::sync::watch::channel(false);
-        let task = spawn_exporter(&cfg, Arc::clone(&metrics), rx).expect("enabled");
+        let task = spawn_exporter(&cfg, Arc::clone(&metrics), rx)
+            .unwrap()
+            .expect("enabled");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while received.lock().unwrap().is_empty() {
             assert!(tokio::time::Instant::now() < deadline, "no push within 5 s");
@@ -518,6 +525,10 @@ edgeguard_untyped 5
 
         // Off, or no endpoint: nothing is spawned.
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        assert!(spawn_exporter(&crate::config::OtlpMetricsCfg::default(), metrics, rx).is_none());
+        assert!(
+            spawn_exporter(&crate::config::OtlpMetricsCfg::default(), metrics, rx)
+                .unwrap()
+                .is_none()
+        );
     }
 }

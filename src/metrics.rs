@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::upstream::UpstreamResult;
+
 /// Request `outcome` label values. These mirror the `outcome` field already emitted on the
 /// JSON access log in [`crate::proxy`], so a metric series lines up 1:1 with a log line.
 /// Anything not in this list is bucketed under `other` rather than silently dropped.
@@ -34,6 +36,7 @@ const OUTCOMES: &[&str] = &[
     "upstream_timeout",
     "upstream_body_too_large",
     "upstream_body_error",
+    "no_policy",
     "other",
 ];
 
@@ -65,6 +68,130 @@ const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+/// Buckets for `edgeguard_edge_overhead_seconds`. What the edge adds is normally well under a
+/// millisecond, below request latency's first bucket, so these start at 100 µs.
+const OVERHEAD_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0,
+];
+
+/// The `route` label of a request no configured route matched.
+pub const DEFAULT_ROUTE: &str = "default";
+
+/// Per-route `method` label values. Anything else, extension methods included, is `OTHER`: the
+/// method is the client's to choose, so it cannot be a label value as sent.
+const ROUTE_METHODS: [&str; 8] = [
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "OTHER",
+];
+
+/// `status_class` label values.
+const STATUS_CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
+
+fn status_class(status: u16) -> usize {
+    usize::from((status / 100).clamp(1, 5)) - 1
+}
+
+/// The `consumer` label of a request with no authenticated principal.
+pub const ANON_CONSUMER: &str = "_anon";
+
+/// `metrics.consumer_series_max` when it is not set.
+pub const DEFAULT_CONSUMER_SERIES: usize = 100;
+
+/// One route's requests by method and status class, and its latency histogram. Atomics only, so
+/// recording a request takes no lock.
+#[derive(Debug)]
+pub struct RouteStats {
+    /// `[method * STATUS_CLASSES.len() + status_class]`.
+    requests: [AtomicU64; ROUTE_METHODS.len() * STATUS_CLASSES.len()],
+    buckets: Vec<AtomicU64>,
+    sum_micros: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Default for RouteStats {
+    fn default() -> Self {
+        RouteStats {
+            requests: std::array::from_fn(|_| AtomicU64::new(0)),
+            buckets: LATENCY_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect(),
+            sum_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RouteStats {
+    /// Count one request on this route: its method, the status the client got, and the time to
+    /// its response headers.
+    pub fn record(&self, method: &str, status: u16, elapsed: Duration) {
+        let m = ROUTE_METHODS
+            .iter()
+            .position(|known| *known == method)
+            .unwrap_or(ROUTE_METHODS.len() - 1);
+        self.requests[m * STATUS_CLASSES.len() + status_class(status)]
+            .fetch_add(1, Ordering::Relaxed);
+        observe_hist(&self.buckets, &self.sum_micros, &self.count, elapsed);
+    }
+}
+
+/// One upstream's exchanges by how they ended, and the time to its response headers. Atomics only,
+/// like [`RouteStats`].
+#[derive(Debug)]
+pub struct UpstreamStats {
+    /// By [`UpstreamResult::ALL`] order.
+    results: [AtomicU64; UpstreamResult::ALL.len()],
+    buckets: Vec<AtomicU64>,
+    sum_micros: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Default for UpstreamStats {
+    fn default() -> Self {
+        UpstreamStats {
+            results: std::array::from_fn(|_| AtomicU64::new(0)),
+            buckets: LATENCY_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect(),
+            sum_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl UpstreamStats {
+    /// Count one exchange, once, when it has ended as far as the edge waited for it.
+    pub fn record(&self, result: UpstreamResult) {
+        let i = UpstreamResult::ALL
+            .iter()
+            .position(|r| *r == result)
+            .expect("every result is in ALL");
+        self.results[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The time from sending the request to the upstream's response headers. Only exchanges that
+    /// got headers are timed: a refusal would sit at zero and a timeout at the deadline, and
+    /// either would say nothing about how fast the upstream answers.
+    pub fn observe_headers(&self, elapsed: Duration) {
+        observe_hist(&self.buckets, &self.sum_micros, &self.count, elapsed);
+    }
+}
+
+/// One consumer's requests by status class, and the bytes it sent and received.
+#[derive(Debug, Default)]
+pub struct ConsumerStats {
+    requests: [AtomicU64; 5],
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+}
+
+impl ConsumerStats {
+    pub fn record(&self, status: u16) {
+        self.requests[status_class(status)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Request bytes received from the consumer and response bytes sent to it.
+    pub fn add_bytes(&self, ingress: usize, egress: usize) {
+        self.bytes_in.fetch_add(ingress as u64, Ordering::Relaxed);
+        self.bytes_out.fetch_add(egress as u64, Ordering::Relaxed);
+    }
+}
+
 /// LLM metering `result` label values (per [`crate::llm`]): a request whose response carried usage
 /// for a priced model (`metered`), for an unpriced model (`unpriced`, tokens counted but no cost),
 /// or that reported no usage at all (`no_usage`, e.g. an error or a stream without `include_usage`).
@@ -77,7 +204,7 @@ const LLM_TOKEN_KINDS: &[&str] = &["input", "output", "cached", "reasoning"];
 
 /// Budget `scope` label values (which budget dimension blocked / was consumed). Mirrors
 /// [`crate::budget::BudgetScope`]; a scope not in this list is bucketed under `other`.
-const BUDGET_SCOPES: &[&str] = &["global", "key", "model", "team", "other"];
+const BUDGET_SCOPES: &[&str] = &["global", "key", "model", "team", "claim", "other"];
 
 /// Cap on the number of distinct `model` label values tracked for the per-model token/cost series.
 /// Clients can send an arbitrary `model` string, so the map is bounded to keep Prometheus cardinality
@@ -196,6 +323,24 @@ pub struct Metrics {
     /// The extra `[[tls.certs]]` pairs, served by hostname (SNI). Rendered as more series in the
     /// same families, labelled `cert="<first host>"`.
     sni_certs: std::sync::OnceLock<Vec<crate::certstore::SniCert>>,
+    /// The listener's client-certificate verifier, when `[tls.client_auth]` is on: its CAs join the
+    /// certificate series and its CRLs get `edgeguard_tls_crl_next_update_seconds`.
+    client_auth: std::sync::OnceLock<std::sync::Arc<crate::client_auth::ClientAuth>>,
+    /// `edgeguard_client_cert_header_total`, by [`HeaderResult::ALL`](crate::client_cert_header::HeaderResult::ALL)
+    /// order; rendered only when `[trusted_client_cert_header]` is on.
+    client_cert_header: [AtomicU64; 4],
+    /// The header's settings, when it is on: its `ca_path` CAs and CRLs join the certificate series.
+    trusted_header: std::sync::OnceLock<std::sync::Arc<crate::client_cert_header::TrustedHeader>>,
+    /// The hot-swapped runtime, for the upstream pool series ([`Metrics::watch_runtime`]).
+    runtime: std::sync::OnceLock<std::sync::Arc<arc_swap::ArcSwap<crate::proxy::Runtime>>>,
+    /// Report the process's client certificates (`outbound::in_use`). They are process-wide, not
+    /// this registry's, so only the registry `main` serves turns this on; a test building several
+    /// pipelines in one process would otherwise see the others' certificates.
+    client_certs: std::sync::atomic::AtomicBool,
+    /// Connection counts per listener (`public`, `redirect`, `admin`), registered at startup by
+    /// [`Metrics::listener_stats`]. Rendered only once one is registered, so a registry with no
+    /// listeners renders exactly as before.
+    listeners: Mutex<Vec<(&'static str, std::sync::Arc<crate::serve::ListenerStats>)>>,
     /// One counter per [`OUTCOMES`] entry (parallel index).
     requests: Vec<AtomicU64>,
     /// One counter per [`RL_SCOPES`] entry (parallel index).
@@ -281,6 +426,22 @@ pub struct Metrics {
     /// drifted (a leaked hold → phantom `BudgetExceededError`, or an uncharged settle → silent
     /// bypass). Surfaced so this drift is **observable** instead of only logged — alert on it.
     budget_reconcile_failures: AtomicU64,
+    /// Per-route series, by route label. Read on every request and written only when a route is
+    /// first seen, hence an `ArcSwap` rather than a lock. Lives here, outside the hot-swappable
+    /// runtime, so a config reload does not reset the counters.
+    routes: arc_swap::ArcSwap<BTreeMap<String, std::sync::Arc<RouteStats>>>,
+    /// Per-consumer series, by principal; same shape and reason as `routes`. Bounded by
+    /// `consumer_cap`: past it, new consumers fold into [`LLM_MODEL_OVERFLOW`].
+    consumers: arc_swap::ArcSwap<BTreeMap<String, std::sync::Arc<ConsumerStats>>>,
+    /// `metrics.consumer_series_max`; `0` turns per-consumer series off.
+    consumer_cap: std::sync::atomic::AtomicUsize,
+    /// Per-upstream series, by `scheme://host:port`; same shape and reason as `routes`. Bounded by
+    /// the configured upstreams, which is all a request can be sent to.
+    upstreams: arc_swap::ArcSwap<BTreeMap<String, std::sync::Arc<UpstreamStats>>>,
+    /// `edgeguard_edge_overhead_seconds`, parallel to [`OVERHEAD_BUCKETS`].
+    overhead_buckets: Vec<AtomicU64>,
+    overhead_sum_micros: AtomicU64,
+    overhead_count: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -290,6 +451,12 @@ impl Default for Metrics {
             span_shipper: std::sync::OnceLock::new(),
             cert_store: std::sync::OnceLock::new(),
             sni_certs: std::sync::OnceLock::new(),
+            client_auth: std::sync::OnceLock::new(),
+            client_certs: std::sync::atomic::AtomicBool::new(false),
+            client_cert_header: std::array::from_fn(|_| AtomicU64::new(0)),
+            trusted_header: std::sync::OnceLock::new(),
+            runtime: std::sync::OnceLock::new(),
+            listeners: Mutex::new(Vec::new()),
             requests: OUTCOMES.iter().map(|_| AtomicU64::new(0)).collect(),
             ratelimit_hits: RL_SCOPES.iter().map(|_| AtomicU64::new(0)).collect(),
             waf_hits: WAF_RULES.iter().map(|_| AtomicU64::new(0)).collect(),
@@ -326,6 +493,13 @@ impl Default for Metrics {
             dlp_findings: DLP_CATEGORIES.iter().map(|_| AtomicU64::new(0)).collect(),
             dlp_blocked: AtomicU64::new(0),
             budget_reconcile_failures: AtomicU64::new(0),
+            routes: arc_swap::ArcSwap::default(),
+            consumers: arc_swap::ArcSwap::default(),
+            consumer_cap: std::sync::atomic::AtomicUsize::new(DEFAULT_CONSUMER_SERIES),
+            upstreams: arc_swap::ArcSwap::default(),
+            overhead_buckets: OVERHEAD_BUCKETS.iter().map(|_| AtomicU64::new(0)).collect(),
+            overhead_sum_micros: AtomicU64::new(0),
+            overhead_count: AtomicU64::new(0),
         }
     }
 }
@@ -339,8 +513,19 @@ fn observe_hist(
     count: &AtomicU64,
     elapsed: Duration,
 ) {
+    observe_hist_in(LATENCY_BUCKETS, buckets, sum_micros, count, elapsed);
+}
+
+/// [`observe_hist`] over `bounds`, for a histogram whose range is not request latency's.
+fn observe_hist_in(
+    bounds: &[f64],
+    buckets: &[AtomicU64],
+    sum_micros: &AtomicU64,
+    count: &AtomicU64,
+    elapsed: Duration,
+) {
     let secs = elapsed.as_secs_f64();
-    for (i, bound) in LATENCY_BUCKETS.iter().enumerate() {
+    for (i, bound) in bounds.iter().enumerate() {
         if secs <= *bound {
             buckets[i].fetch_add(1, Ordering::Relaxed);
         }
@@ -359,9 +544,22 @@ fn render_hist(
     sum_micros: &AtomicU64,
     count: &AtomicU64,
 ) {
+    render_hist_in(out, name, help, LATENCY_BUCKETS, buckets, sum_micros, count);
+}
+
+/// [`render_hist`] over `bounds`.
+fn render_hist_in(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    bounds: &[f64],
+    buckets: &[AtomicU64],
+    sum_micros: &AtomicU64,
+    count: &AtomicU64,
+) {
     out.push_str(&format!("# HELP {name} {help}\n"));
     out.push_str(&format!("# TYPE {name} histogram\n"));
-    for (i, bound) in LATENCY_BUCKETS.iter().enumerate() {
+    for (i, bound) in bounds.iter().enumerate() {
         let v = buckets[i].load(Ordering::Relaxed);
         out.push_str(&format!("{name}_bucket{{le=\"{bound}\"}} {v}\n"));
     }
@@ -473,6 +671,162 @@ impl Metrics {
         self.sni_certs.set(certs).is_ok()
     }
 
+    /// Install the client-certificate verifier. Called once at startup, when client auth is on.
+    pub fn set_client_auth(&self, auth: std::sync::Arc<crate::client_auth::ClientAuth>) -> bool {
+        self.client_auth.set(auth).is_ok()
+    }
+
+    pub fn client_auth(&self) -> Option<&std::sync::Arc<crate::client_auth::ClientAuth>> {
+        self.client_auth.get()
+    }
+
+    /// Install `[trusted_client_cert_header]`: its counters render, and its verification CAs and
+    /// CRLs join the certificate series.
+    pub fn set_trusted_header(
+        &self,
+        header: std::sync::Arc<crate::client_cert_header::TrustedHeader>,
+    ) -> bool {
+        self.trusted_header.set(header).is_ok()
+    }
+
+    /// Read the upstream pools' series from `runtime`, whichever one is current when scraped.
+    pub fn watch_runtime(
+        &self,
+        runtime: std::sync::Arc<arc_swap::ArcSwap<crate::proxy::Runtime>>,
+    ) -> bool {
+        self.runtime.set(runtime).is_ok()
+    }
+
+    pub fn trusted_header(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::client_cert_header::TrustedHeader>> {
+        self.trusted_header.get()
+    }
+
+    /// Count what became of one request's forwarded client certificate.
+    pub fn record_client_cert_header(&self, result: crate::client_cert_header::HeaderResult) {
+        let all = crate::client_cert_header::HeaderResult::ALL;
+        if let Some(i) = all.iter().position(|r| *r == result) {
+            self.client_cert_header[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Report the client certificates this process presents, in the certificate series and
+    /// `GET /__edgeguard/tls`. Called once by `main` for the registry it serves.
+    pub fn report_client_certs(&self) {
+        self.client_certs.store(true, Ordering::Relaxed);
+    }
+
+    /// The client certificates in use, when this registry reports them.
+    pub fn client_certs(&self) -> Vec<crate::outbound::InUse> {
+        if self.client_certs.load(Ordering::Relaxed) {
+            crate::outbound::in_use()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The connection counts for the listener called `name`, created and registered on first use.
+    /// Pass them to the listener in [`ServeOpts`](crate::serve::ServeOpts) so they are exported.
+    pub fn listener_stats(
+        &self,
+        name: &'static str,
+    ) -> std::sync::Arc<crate::serve::ListenerStats> {
+        let mut listeners = self.listeners.lock().expect("listeners mutex poisoned");
+        if let Some((_, stats)) = listeners.iter().find(|(n, _)| *n == name) {
+            return std::sync::Arc::clone(stats);
+        }
+        let stats = std::sync::Arc::default();
+        listeners.push((name, std::sync::Arc::clone(&stats)));
+        stats
+    }
+
+    /// The counters for `route`, created on first use. Lock-free once the route exists.
+    pub fn route_stats(&self, route: &str) -> std::sync::Arc<RouteStats> {
+        if let Some(stats) = self.routes.load().get(route) {
+            return std::sync::Arc::clone(stats);
+        }
+        let mut created = None;
+        self.routes.rcu(|map| {
+            let mut map = BTreeMap::clone(map);
+            let stats = map.entry(route.to_string()).or_default();
+            created = Some(std::sync::Arc::clone(stats));
+            map
+        });
+        created.expect("rcu runs its closure")
+    }
+
+    /// The counters for the upstream `upstream` (`scheme://host:port`), created on first use.
+    /// An upstream's requests by result, in [`UpstreamResult::ALL`] order; zeros for one never
+    /// sent a request. Unlike [`Metrics::upstream_stats`], creates no series.
+    pub fn upstream_results(&self, upstream: &str) -> [u64; UpstreamResult::ALL.len()] {
+        match self.upstreams.load().get(upstream) {
+            Some(stats) => std::array::from_fn(|i| stats.results[i].load(Ordering::Relaxed)),
+            None => [0; UpstreamResult::ALL.len()],
+        }
+    }
+
+    pub fn upstream_stats(&self, upstream: &str) -> std::sync::Arc<UpstreamStats> {
+        if let Some(stats) = self.upstreams.load().get(upstream) {
+            return std::sync::Arc::clone(stats);
+        }
+        let mut created = None;
+        self.upstreams.rcu(|map| {
+            let mut map = BTreeMap::clone(map);
+            let stats = map.entry(upstream.to_string()).or_default();
+            created = Some(std::sync::Arc::clone(stats));
+            map
+        });
+        created.expect("rcu runs its closure")
+    }
+
+    /// The counters for the consumer `principal` (`None`: unauthenticated, [`ANON_CONSUMER`]), or
+    /// `None` when per-consumer series are off. Past `metrics.consumer_series_max` distinct
+    /// consumers, a new one shares the overflow series.
+    pub fn consumer_stats(&self, principal: Option<&str>) -> Option<std::sync::Arc<ConsumerStats>> {
+        let cap = self.consumer_cap.load(Ordering::Relaxed);
+        if cap == 0 {
+            return None;
+        }
+        let key = principal.unwrap_or(ANON_CONSUMER);
+        // The anonymous series and the overflow series do not count against the cap.
+        let named = |map: &BTreeMap<String, std::sync::Arc<ConsumerStats>>| {
+            map.keys()
+                .filter(|k| *k != ANON_CONSUMER && *k != LLM_MODEL_OVERFLOW)
+                .count()
+        };
+        let current = self.consumers.load();
+        if let Some(stats) = current.get(key) {
+            return Some(std::sync::Arc::clone(stats));
+        }
+        // Past the cap, a new consumer is counted on the overflow series as it stands: no copy of
+        // the map per request, which a stream of new principals would otherwise cost.
+        if key != ANON_CONSUMER && named(&current) >= cap {
+            if let Some(overflow) = current.get(LLM_MODEL_OVERFLOW) {
+                return Some(std::sync::Arc::clone(overflow));
+            }
+        }
+        let mut found = None;
+        self.consumers.rcu(|map| {
+            let mut map = BTreeMap::clone(map);
+            let key = if key == ANON_CONSUMER || named(&map) < cap {
+                key
+            } else {
+                LLM_MODEL_OVERFLOW
+            };
+            found = Some(std::sync::Arc::clone(
+                map.entry(key.to_string()).or_default(),
+            ));
+            map
+        });
+        found
+    }
+
+    /// Set `metrics.consumer_series_max`. Called once at startup.
+    pub fn set_consumer_series_max(&self, max: usize) {
+        self.consumer_cap.store(max, Ordering::Relaxed);
+    }
+
     /// The extra SNI pairs (empty when none are configured).
     pub fn sni_certs(&self) -> &[crate::certstore::SniCert] {
         self.sni_certs.get().map(Vec::as_slice).unwrap_or(&[])
@@ -493,6 +847,18 @@ impl Metrics {
     }
 
     /// Observe a request's end-to-end latency into the histogram.
+    /// Time the edge itself added to a proxied request the upstream answered: its time to response
+    /// headers, less the time spent waiting on the upstream.
+    pub fn observe_edge_overhead(&self, overhead: Duration) {
+        observe_hist_in(
+            OVERHEAD_BUCKETS,
+            &self.overhead_buckets,
+            &self.overhead_sum_micros,
+            &self.overhead_count,
+            overhead,
+        );
+    }
+
     pub fn observe_latency(&self, elapsed: Duration) {
         observe_hist(
             &self.latency_buckets,
@@ -775,6 +1141,99 @@ impl Metrics {
             self.csp_reports.load(Ordering::Relaxed)
         ));
 
+        // Connections per listener. `rejected` climbing means `server.max_connections` is turning
+        // clients away: raise it, or find out who is holding connections open.
+        let listeners = self
+            .listeners
+            .lock()
+            .expect("listeners mutex poisoned")
+            .clone();
+        if !listeners.is_empty() {
+            out.push_str(
+                "# HELP edgeguard_connections_open Client connections open now, by listener.\n\
+                 # TYPE edgeguard_connections_open gauge\n",
+            );
+            for (name, stats) in &listeners {
+                out.push_str(&format!(
+                    "edgeguard_connections_open{{listener=\"{name}\"}} {}\n",
+                    stats.open()
+                ));
+            }
+            out.push_str(
+                "# HELP edgeguard_connections_rejected_total Connections closed at accept because \
+                 the listener was at server.max_connections.\n\
+                 # TYPE edgeguard_connections_rejected_total counter\n",
+            );
+            for (name, stats) in &listeners {
+                out.push_str(&format!(
+                    "edgeguard_connections_rejected_total{{listener=\"{name}\"}} {}\n",
+                    stats.rejected()
+                ));
+            }
+            // Only listeners with a cap, so `open / max` is defined wherever `max` exists.
+            let capped: Vec<_> = listeners.iter().filter(|(_, s)| s.max() > 0).collect();
+            if !capped.is_empty() {
+                out.push_str(
+                    "# HELP edgeguard_connections_max server.max_connections, for listeners that \
+                     have a cap.\n\
+                     # TYPE edgeguard_connections_max gauge\n",
+                );
+                for (name, stats) in capped {
+                    out.push_str(&format!(
+                        "edgeguard_connections_max{{listener=\"{name}\"}} {}\n",
+                        stats.max()
+                    ));
+                }
+            }
+            // TLS listeners only. `client_cert` is the one to watch with `[tls.client_auth]` on:
+            // clients refused for their certificate never reach the request log.
+            let tls: Vec<_> = listeners.iter().filter(|(_, s)| s.is_tls()).collect();
+            if !tls.is_empty() {
+                out.push_str(
+                    "# HELP edgeguard_tls_handshake_failures_total Failed TLS handshakes, by \
+                     listener and reason (client_cert = refused for its client certificate).\n\
+                     # TYPE edgeguard_tls_handshake_failures_total counter\n",
+                );
+                for (name, stats) in tls {
+                    for (reason, v) in crate::serve::TLS_FAILURE_REASONS
+                        .iter()
+                        .zip(stats.tls_failures())
+                    {
+                        out.push_str(&format!(
+                            "edgeguard_tls_handshake_failures_total{{listener=\"{name}\",reason=\"{reason}\"}} {v}\n"
+                        ));
+                    }
+                }
+            }
+            // Listeners with `server.proxy_protocol` only. `untrusted` climbing means a balancer
+            // outside `proxy_protocol_trusted` (a new address, or one that preserves client IPs)
+            // is having its connections closed; `missing` without `proxied`, that the balancer
+            // is not sending headers, so every client looks like it.
+            let pp: Vec<_> = listeners
+                .iter()
+                .filter(|(_, s)| s.reads_proxy_protocol())
+                .collect();
+            if !pp.is_empty() {
+                out.push_str(
+                    "# HELP edgeguard_proxy_protocol_total Connections by their PROXY protocol \
+                     header, by listener and result (proxied: the header named the client; \
+                     untrusted, invalid and timeout: closed).\n\
+                     # TYPE edgeguard_proxy_protocol_total counter\n",
+                );
+                for (name, stats) in pp {
+                    for (outcome, v) in crate::proxy_protocol::Outcome::ALL
+                        .iter()
+                        .zip(stats.proxy_protocol_outcomes())
+                    {
+                        out.push_str(&format!(
+                            "edgeguard_proxy_protocol_total{{listener=\"{name}\",result=\"{}\"}} {v}\n",
+                            outcome.label()
+                        ));
+                    }
+                }
+            }
+        }
+
         // Access-log shipping. `dropped` is the important one: a log pipeline that silently drops
         // is worse than no pipeline, because the gap is invisible in the destination and the
         // absence of records reads as an absence of traffic. Alert on it.
@@ -1021,18 +1480,242 @@ impl Metrics {
             self.dlp_blocked.load(Ordering::Relaxed)
         ));
 
-        if let Some(store) = self.cert_store.get() {
-            store.render_metrics_with(self.sni_certs(), &mut out);
+        self.render_certs(&mut out);
+        if self.trusted_header.get().is_some() {
+            out.push_str(
+                "# HELP edgeguard_client_cert_header_total Requests carrying \
+                 [trusted_client_cert_header], by what became of it: accepted, untrusted_peer \
+                 (dropped: not from trusted_proxies or trusted_proxy_names), invalid, unverified (refused by its ca_path).\n\
+                 # TYPE edgeguard_client_cert_header_total counter\n",
+            );
+            for (i, result) in crate::client_cert_header::HeaderResult::ALL
+                .iter()
+                .enumerate()
+            {
+                out.push_str(&format!(
+                    "edgeguard_client_cert_header_total{{result=\"{}\"}} {}\n",
+                    result.label(),
+                    self.client_cert_header[i].load(Ordering::Relaxed)
+                ));
+            }
         }
 
+        self.render_routes(&mut out);
+        self.render_consumers(&mut out);
+        self.render_upstreams(&mut out);
+        if let Some(runtime) = self.runtime.get() {
+            crate::pool::render(&mut out, runtime.load().pools());
+        }
+        render_hist_in(
+            &mut out,
+            "edgeguard_edge_overhead_seconds",
+            "Time the edge added to a proxied request the upstream answered: from receiving it to \
+             sending the response headers, less the time spent waiting on the upstream (its headers \
+             and, for a buffered response, its body).",
+            OVERHEAD_BUCKETS,
+            &self.overhead_buckets,
+            &self.overhead_sum_micros,
+            &self.overhead_count,
+        );
         out
+    }
+
+    /// Every certificate the edge serves, presents or trusts, in the certificate series (see
+    /// [`crate::certstore::render_cert_series`]), and the CRLs' `nextUpdate`.
+    fn render_certs(&self, out: &mut String) {
+        let clients: Vec<(String, std::sync::Arc<crate::certstore::CertStore>)> = self
+            .client_certs()
+            .into_iter()
+            .map(|c| (format!("client:{}", c.store.cert_path()), c.store))
+            .collect();
+        // The listener's client-auth CAs, and the ones the forwarded-certificate header is verified
+        // against: the same kind of dependency, told apart by prefix.
+        let trusts: Vec<(&str, std::sync::Arc<crate::client_auth::TrustInfo>)> = self
+            .client_auth
+            .get()
+            .map(|a| ("client-ca", a.trust()))
+            .into_iter()
+            .chain(
+                self.trusted_header
+                    .get()
+                    .and_then(|h| h.verifier())
+                    .map(|v| ("header-ca", v.trust())),
+            )
+            .collect();
+        let cas: Vec<(String, crate::certstore::CertInfo)> = trusts
+            .iter()
+            .flat_map(|(prefix, t)| t.cas.iter().map(move |ca| (prefix, ca)))
+            .map(|(prefix, ca)| (format!("{prefix}:{}", ca.name), ca.info.clone()))
+            .collect();
+        crate::certstore::render_cert_series(
+            out,
+            self.cert_store.get().map(|s| &**s),
+            self.sni_certs(),
+            &clients,
+            &cas,
+        );
+        // A CRL past its nextUpdate goes on being used, so revocations published since are not
+        // applied: this is the series to alert on (`EdgeGuardCrlStale`).
+        // One series per file, though both may name the same one.
+        let mut crls: Vec<(&str, i64)> = trusts
+            .iter()
+            .flat_map(|(_, t)| t.crls.iter())
+            .filter_map(|c| Some((c.name.as_str(), c.info.next_update?)))
+            .collect();
+        crls.sort();
+        crls.dedup_by(|a, b| a.0 == b.0);
+        if !crls.is_empty() {
+            out.push_str(
+                "# HELP edgeguard_tls_crl_next_update_seconds When each CRL in \
+                 tls.client_auth.crl_paths says the next one is due (unix seconds).\n\
+                 # TYPE edgeguard_tls_crl_next_update_seconds gauge\n",
+            );
+            for (name, next) in crls {
+                out.push_str(&format!(
+                    "edgeguard_tls_crl_next_update_seconds{{crl=\"{}\"}} {next}\n",
+                    escape_label(name)
+                ));
+            }
+        }
+    }
+
+    /// Per-upstream series. Every result is written, zeros included, for each upstream that has
+    /// been sent a request, so an error ratio has a denominator and a numerator from the start.
+    fn render_upstreams(&self, out: &mut String) {
+        let upstreams = self.upstreams.load();
+        if upstreams.is_empty() {
+            return;
+        }
+        out.push_str(
+            "# HELP edgeguard_upstream_requests_total Requests forwarded to each upstream              (scheme://host:port), by how the exchange ended: ok, http_5xx, connect_error,              tls_error, timeout, reset or error.\n\
+             # TYPE edgeguard_upstream_requests_total counter\n",
+        );
+        for (upstream, stats) in upstreams.iter() {
+            let upstream = escape_label(upstream);
+            for (i, result) in UpstreamResult::ALL.iter().enumerate() {
+                let v = stats.results[i].load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "edgeguard_upstream_requests_total{{upstream=\"{upstream}\",result=\"{}\"}} {v}\n",
+                    result.label()
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP edgeguard_upstream_duration_seconds Time from sending the request to the \
+             upstream's response headers, for exchanges that got them.\n\
+             # TYPE edgeguard_upstream_duration_seconds histogram\n",
+        );
+        for (upstream, stats) in upstreams.iter() {
+            let upstream = escape_label(upstream);
+            let name = "edgeguard_upstream_duration_seconds";
+            for (i, bound) in LATENCY_BUCKETS.iter().enumerate() {
+                let v = stats.buckets[i].load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "{name}_bucket{{upstream=\"{upstream}\",le=\"{bound}\"}} {v}\n"
+                ));
+            }
+            let c = stats.count.load(Ordering::Relaxed);
+            let sum = stats.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+            out.push_str(&format!(
+                "{name}_bucket{{upstream=\"{upstream}\",le=\"+Inf\"}} {c}\n\
+                 {name}_sum{{upstream=\"{upstream}\"}} {sum}\n\
+                 {name}_count{{upstream=\"{upstream}\"}} {c}\n"
+            ));
+        }
+    }
+
+    /// Per-route series. Only routes that have seen a request are present, and within one only the
+    /// method and status-class pairs that have occurred, so an idle route costs nothing.
+    fn render_routes(&self, out: &mut String) {
+        let routes = self.routes.load();
+        if routes.is_empty() {
+            return;
+        }
+        out.push_str(
+            "# HELP edgeguard_route_requests_total Proxied requests by route (its configured name \
+             or prefix, `default` for the rest), method and status class.\n\
+             # TYPE edgeguard_route_requests_total counter\n",
+        );
+        for (route, stats) in routes.iter() {
+            let route = escape_label(route);
+            for (m, method) in ROUTE_METHODS.iter().enumerate() {
+                for (s, class) in STATUS_CLASSES.iter().enumerate() {
+                    let v = stats.requests[m * STATUS_CLASSES.len() + s].load(Ordering::Relaxed);
+                    if v > 0 {
+                        out.push_str(&format!(
+                            "edgeguard_route_requests_total{{route=\"{route}\",method=\"{method}\",status_class=\"{class}\"}} {v}\n"
+                        ));
+                    }
+                }
+            }
+        }
+        out.push_str(
+            "# HELP edgeguard_route_request_duration_seconds Time to response headers, by route.\n\
+             # TYPE edgeguard_route_request_duration_seconds histogram\n",
+        );
+        for (route, stats) in routes.iter() {
+            let route = escape_label(route);
+            let name = "edgeguard_route_request_duration_seconds";
+            for (i, bound) in LATENCY_BUCKETS.iter().enumerate() {
+                let v = stats.buckets[i].load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "{name}_bucket{{route=\"{route}\",le=\"{bound}\"}} {v}\n"
+                ));
+            }
+            let c = stats.count.load(Ordering::Relaxed);
+            let sum = stats.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+            out.push_str(&format!(
+                "{name}_bucket{{route=\"{route}\",le=\"+Inf\"}} {c}\n\
+                 {name}_sum{{route=\"{route}\"}} {sum}\n\
+                 {name}_count{{route=\"{route}\"}} {c}\n"
+            ));
+        }
+    }
+
+    /// Per-consumer series: `_anon` for requests with no authenticated principal, `_over_cap`
+    /// for consumers past `metrics.consumer_series_max`.
+    fn render_consumers(&self, out: &mut String) {
+        let consumers = self.consumers.load();
+        if consumers.is_empty() {
+            return;
+        }
+        out.push_str(
+            "# HELP edgeguard_consumer_requests_total Requests by consumer (the authenticated \
+             principal; _anon without one) and status class.\n\
+             # TYPE edgeguard_consumer_requests_total counter\n",
+        );
+        for (consumer, stats) in consumers.iter() {
+            let consumer = escape_label(consumer);
+            for (s, class) in STATUS_CLASSES.iter().enumerate() {
+                let v = stats.requests[s].load(Ordering::Relaxed);
+                if v > 0 {
+                    out.push_str(&format!(
+                        "edgeguard_consumer_requests_total{{consumer=\"{consumer}\",status_class=\"{class}\"}} {v}\n"
+                    ));
+                }
+            }
+        }
+        out.push_str(
+            "# HELP edgeguard_consumer_bytes_total Bytes proxied by consumer: in = request, out = \
+             response, headers included.\n\
+             # TYPE edgeguard_consumer_bytes_total counter\n",
+        );
+        for (consumer, stats) in consumers.iter() {
+            let consumer = escape_label(consumer);
+            out.push_str(&format!(
+                "edgeguard_consumer_bytes_total{{consumer=\"{consumer}\",direction=\"in\"}} {}\n\
+                 edgeguard_consumer_bytes_total{{consumer=\"{consumer}\",direction=\"out\"}} {}\n",
+                stats.bytes_in.load(Ordering::Relaxed),
+                stats.bytes_out.load(Ordering::Relaxed)
+            ));
+        }
     }
 }
 
 /// Escape a dynamic label *value* for the Prometheus text format: backslash, double-quote, and
 /// newline must be escaped (per the exposition spec) so a client-chosen `model` or operator-chosen
 /// budget name can't inject a line break or unbalanced quote into the output.
-fn escape_label(s: &str) -> String {
+pub(crate) fn escape_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -1048,6 +1731,142 @@ fn escape_label(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_series_render_every_result_once_an_upstream_is_used() {
+        let m = Metrics::new();
+        assert!(!m.render().contains("edgeguard_upstream_"));
+        let up = m.upstream_stats("http://api.internal:8080");
+        up.record(UpstreamResult::Ok);
+        up.record(UpstreamResult::ConnectError);
+        up.observe_headers(Duration::from_millis(30));
+        assert!(std::sync::Arc::ptr_eq(
+            &up,
+            &m.upstream_stats("http://api.internal:8080")
+        ));
+        let text = m.render();
+        let label = "upstream=\"http://api.internal:8080\"";
+        for (result, v) in [
+            ("ok", 1),
+            ("http_5xx", 0),
+            ("connect_error", 1),
+            ("tls_error", 0),
+            ("timeout", 0),
+            ("reset", 0),
+            ("error", 0),
+        ] {
+            let line =
+                format!("edgeguard_upstream_requests_total{{{label},result=\"{result}\"}} {v}");
+            assert!(text.contains(&line), "{line}\n{text}");
+        }
+        assert!(text.contains(&format!(
+            "edgeguard_upstream_duration_seconds_count{{{label}}} 1"
+        )));
+        assert!(text.contains(&format!(
+            "edgeguard_upstream_duration_seconds_bucket{{{label},le=\"0.05\"}} 1"
+        )));
+    }
+
+    #[test]
+    fn listener_connection_series_render_once_a_listener_registers() {
+        let m = Metrics::new();
+        assert!(
+            !m.render().contains("edgeguard_connections_open"),
+            "no listener, no connection series"
+        );
+        let public = m.listener_stats("public");
+        // The same name hands back the same counts rather than a second series.
+        assert!(std::sync::Arc::ptr_eq(&public, &m.listener_stats("public")));
+        m.listener_stats("admin");
+        let text = m.render();
+        assert!(
+            text.contains("# TYPE edgeguard_connections_open gauge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("edgeguard_connections_open{listener=\"public\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("edgeguard_connections_open{listener=\"admin\"} 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE edgeguard_connections_rejected_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("edgeguard_connections_rejected_total{listener=\"public\"} 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn route_series_fold_unknown_methods_and_render_only_what_occurred() {
+        let m = Metrics::new();
+        assert!(!m.render().contains("edgeguard_route_requests_total"));
+        let api = m.route_stats("api");
+        api.record("GET", 200, Duration::from_millis(3));
+        api.record("GET", 204, Duration::from_millis(3));
+        api.record("BREW", 503, Duration::from_millis(30));
+        m.route_stats("we\"ird")
+            .record("POST", 404, Duration::from_millis(1));
+        let text = m.render();
+        assert!(
+            text.contains(
+                "edgeguard_route_requests_total{route=\"api\",method=\"GET\",status_class=\"2xx\"} 2"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "edgeguard_route_requests_total{route=\"api\",method=\"OTHER\",status_class=\"5xx\"} 1"
+            ),
+            "a client-chosen method is not a label value: {text}"
+        );
+        assert!(
+            !text.contains("method=\"GET\",status_class=\"4xx\""),
+            "no zero series"
+        );
+        assert!(
+            text.contains("route=\"we\\\"ird\""),
+            "labels are escaped: {text}"
+        );
+        assert!(text.contains("edgeguard_route_request_duration_seconds_count{route=\"api\"} 3"));
+        // The same route hands back the same counters.
+        assert!(std::sync::Arc::ptr_eq(&api, &m.route_stats("api")));
+    }
+
+    #[test]
+    fn consumers_past_the_cap_share_one_series_and_zero_turns_them_off() {
+        let m = Metrics::new();
+        m.set_consumer_series_max(2);
+        for who in ["alice", "bob", "carol", "dave"] {
+            m.consumer_stats(Some(who)).unwrap().record(200);
+        }
+        m.consumer_stats(None).unwrap().record(401);
+        let text = m.render();
+        for line in [
+            "edgeguard_consumer_requests_total{consumer=\"alice\",status_class=\"2xx\"} 1",
+            "edgeguard_consumer_requests_total{consumer=\"bob\",status_class=\"2xx\"} 1",
+            "edgeguard_consumer_requests_total{consumer=\"_over_cap\",status_class=\"2xx\"} 2",
+            "edgeguard_consumer_requests_total{consumer=\"_anon\",status_class=\"4xx\"} 1",
+        ] {
+            assert!(text.contains(line), "{line} in {text}");
+        }
+        assert!(!text.contains("carol"));
+        // A consumer already counted keeps its own series.
+        assert!(std::sync::Arc::ptr_eq(
+            &m.consumer_stats(Some("alice")).unwrap(),
+            &m.consumer_stats(Some("alice")).unwrap()
+        ));
+
+        let off = Metrics::new();
+        off.set_consumer_series_max(0);
+        assert!(off.consumer_stats(Some("alice")).is_none());
+        assert!(off.consumer_stats(None).is_none());
+        assert!(!off.render().contains("edgeguard_consumer_"));
+    }
 
     #[test]
     fn records_and_renders_request_outcomes() {

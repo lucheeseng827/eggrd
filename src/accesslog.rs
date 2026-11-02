@@ -22,6 +22,60 @@
 
 use serde::{Deserialize, Serialize};
 
+/// How the access log records who made a request (`log.principal`): the authenticated principal,
+/// and the client certificate's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrincipalLogMode {
+    /// As authenticated: `apikey:<id>` (a hash of the key, never the key), the Basic username, the
+    /// JWT `sub`, the certificate's name. The default: an access log that cannot say who called is
+    /// half an access log, and these are identifiers, not credentials.
+    #[default]
+    Full,
+    /// `sha256:<first 16 hex>` of it. Lines from one caller still correlate, but the log does not
+    /// carry the name. Pseudonymous, not anonymous: anyone holding a list of candidate names can
+    /// hash them and match.
+    Hash,
+    /// Not recorded.
+    Off,
+}
+
+impl PrincipalLogMode {
+    /// `name` as this mode records it.
+    pub fn apply(self, name: &str) -> Option<String> {
+        match self {
+            PrincipalLogMode::Full => Some(name.to_string()),
+            PrincipalLogMode::Hash => {
+                let digest = ring::digest::digest(&ring::digest::SHA256, name.as_bytes());
+                let hex: String = digest.as_ref()[..8]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                Some(format!("sha256:{hex}"))
+            }
+            PrincipalLogMode::Off => None,
+        }
+    }
+}
+
+/// Longest `User-Agent` the access log keeps, in bytes. The header is the client's to write, so it
+/// is bounded rather than copied whole into every record.
+pub const USER_AGENT_MAX: usize = 256;
+
+/// A `User-Agent` value as the access log records it: at most [`USER_AGENT_MAX`] bytes, cut on a
+/// character boundary, with bytes that are not UTF-8 replaced.
+pub fn user_agent(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    if text.len() <= USER_AGENT_MAX {
+        return text.into_owned();
+    }
+    let mut end = USER_AGENT_MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 /// What to do with the query string in the access log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -223,6 +277,41 @@ pub fn sanitize_target<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_principal_is_recorded_whole_hashed_or_not_at_all() {
+        assert_eq!(
+            PrincipalLogMode::Full.apply("alice@example.com").as_deref(),
+            Some("alice@example.com")
+        );
+        let hashed = PrincipalLogMode::Hash.apply("alice@example.com").unwrap();
+        assert!(hashed.starts_with("sha256:") && hashed.len() == "sha256:".len() + 16);
+        assert!(!hashed.contains("alice"));
+        // Stable, so one caller's lines still correlate; distinct for distinct callers.
+        assert_eq!(
+            PrincipalLogMode::Hash.apply("alice@example.com").unwrap(),
+            hashed
+        );
+        assert_ne!(
+            PrincipalLogMode::Hash.apply("bob@example.com").unwrap(),
+            hashed
+        );
+        assert_eq!(PrincipalLogMode::Off.apply("alice@example.com"), None);
+    }
+
+    #[test]
+    fn a_long_user_agent_is_cut_on_a_character_boundary() {
+        assert_eq!(user_agent(b"curl/8.5.0"), "curl/8.5.0");
+        let long = "é".repeat(200); // 400 bytes, two per character
+        let cut = user_agent(long.as_bytes());
+        assert!(cut.len() <= USER_AGENT_MAX && cut.len() >= USER_AGENT_MAX - 1);
+        assert!(
+            cut.chars().all(|c| c == 'é'),
+            "no half character at the end"
+        );
+        // Not UTF-8: kept, with the bad bytes replaced rather than the field dropped.
+        assert_eq!(user_agent(b"bot\xff/1"), "bot\u{fffd}/1");
+    }
 
     fn red(target: &str) -> String {
         sanitize_target(target, QueryLogMode::Redact, &[]).into_owned()

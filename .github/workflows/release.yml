@@ -300,11 +300,15 @@ jobs:
           n=$(ls -1 | wc -l)
           # Two digests, or the manifest would silently ship one architecture.
           [ "$n" -eq 2 ] || { echo "::error::expected 2 digests, found $n"; exit 1; }
-          major_minor="${VERSION%.*}"
-          docker buildx imagetools create \
-            -t "${IMAGE}:${VERSION}" \
-            -t "${IMAGE}:${major_minor}" \
-            -t "${IMAGE}:latest" \
+          # A prerelease (`0.6.0-beta.1`) gets its exact tag only. Moving `latest` or the `X.Y` tag to
+          # it would hand a beta to everyone who pulls without pinning, and `${VERSION%.*}` of a
+          # prerelease is not a minor version at all (`0.6.0-beta`).
+          tags=(-t "${IMAGE}:${VERSION}")
+          case "$VERSION" in
+            *-*) echo "Prerelease ${VERSION}: not moving latest or the minor tag." ;;
+            *) tags+=(-t "${IMAGE}:${VERSION%.*}" -t "${IMAGE}:latest") ;;
+          esac
+          docker buildx imagetools create "${tags[@]}" \
             $(printf "${IMAGE}@sha256:%s " *)
 
       - name: Verify both architectures are really in the manifest
@@ -335,5 +339,8 @@ jobs:
             echo
             echo "- \`linux/amd64\` built natively on \`ubuntu-24.04\`"
             echo "- \`linux/arm64\` built natively on \`ubuntu-24.04-arm\` (no QEMU)"
-            echo "- tags: \`${VERSION}\`, \`${VERSION%.*}\`, \`latest\`"
+            case "$VERSION" in
+              *-*) echo "- tags: \`${VERSION}\` only (prerelease: \`latest\` and the minor tag stay put)" ;;
+              *) echo "- tags: \`${VERSION}\`, \`${VERSION%.*}\`, \`latest\`" ;;
+            esac
           } >> "$GITHUB_STEP_SUMMARY"

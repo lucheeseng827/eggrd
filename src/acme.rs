@@ -562,6 +562,79 @@ pub async fn renewal_window(
     }
 }
 
+/// The client every ACME request goes out on: the directory, the account, orders, challenges,
+/// the certificate download and renewal information.
+///
+/// instant-acme's own client is a bare hyper client: no proxy (not even `HTTPS_PROXY`), and only
+/// the operating system's trust store. This one is built like every other outbound client, from
+/// `[tls.acme]`'s `proxy`, `ca_path` and client certificate (and `[outbound]` for what those leave
+/// empty), so an edge behind an egress proxy can get a certificate. With nothing set it still
+/// trusts the operating system's store, as before; `HTTPS_PROXY`/`NO_PROXY` now apply.
+#[derive(Clone)]
+pub struct AcmeHttp(reqwest::Client);
+
+/// The ACME client for `acme`. Fails, naming the setting, when a CA bundle, certificate or proxy
+/// URL will not load; `main` builds one at startup for that reason, before any order needs it.
+pub fn http_client(acme: &AcmeCfg) -> Result<AcmeHttp> {
+    anyhow::ensure!(
+        acme.directory_url.trim().starts_with("https://"),
+        "tls.acme.directory_url {:?} is not https://: an ACME server is reached over https only \
+         (RFC 8555)",
+        acme.directory_url
+    );
+    let (http, _) = crate::outbound::builder_trusting(
+        &acme.outbound,
+        "tls.acme",
+        &acme.directory_url,
+        crate::outbound::PublicRoots::System,
+    )?;
+    // instant-acme's client had no timeout at all, so a proxy that accepted and never answered
+    // would hang issuance and every renewal behind it. And it spoke only https://, as RFC 8555
+    // requires of an ACME server; so does this one.
+    let http = http
+        .https_only(true)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("building the ACME client")?;
+    Ok(AcmeHttp(http))
+}
+
+impl instant_acme::HttpClient for AcmeHttp {
+    fn request(
+        &self,
+        req: axum::http::Request<instant_acme::BodyWrapper<bytes::Bytes>>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<instant_acme::BytesResponse, instant_acme::Error>,
+                > + Send,
+        >,
+    > {
+        use http_body_util::BodyExt;
+        let http = self.0.clone();
+        Box::pin(async move {
+            let other = |e: reqwest::Error| instant_acme::Error::Other(Box::new(e));
+            let (parts, body) = req.into_parts();
+            // The JWS body, or nothing: instant-acme builds it whole, so this cannot fail.
+            let body = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(never) => match never {},
+            };
+            let req = reqwest::Request::try_from(axum::http::Request::from_parts(parts, body))
+                .map_err(other)?;
+            let rsp = http.execute(req).await.map_err(other)?;
+            Ok(instant_acme::BytesResponse::from(axum::http::Response::<
+                reqwest::Body,
+            >::from(rsp)))
+        })
+    }
+}
+
+fn account_builder(acme: &AcmeCfg) -> Result<instant_acme::AccountBuilder> {
+    Ok(Account::builder_with_http(Box::new(http_client(acme)?)))
+}
+
 /// The account restored from cached credentials, if there are any.
 async fn cached_account(acme: &AcmeCfg) -> Result<Option<Account>> {
     let creds_path = Path::new(&acme.cache_dir).join("account.json");
@@ -572,8 +645,7 @@ async fn cached_account(acme: &AcmeCfg) -> Result<Option<Account>> {
         .with_context(|| format!("reading cached ACME account {}", creds_path.display()))?;
     let creds: AccountCredentials =
         serde_json::from_str(&raw).context("parsing cached ACME account credentials")?;
-    Account::builder()
-        .context("building ACME client")?
+    account_builder(acme)?
         .from_credentials(creds)
         .await
         .context("restoring ACME account from cached credentials")
@@ -590,8 +662,7 @@ async fn account(acme: &AcmeCfg) -> Result<Account> {
 
     let mailto = (!acme.email.is_empty()).then(|| format!("mailto:{}", acme.email));
     let contact: Vec<&str> = mailto.as_deref().into_iter().collect();
-    let (account, credentials) = Account::builder()
-        .context("building ACME client")?
+    let (account, credentials) = account_builder(acme)?
         .create(
             &NewAccount {
                 contact: &contact,
@@ -866,8 +937,9 @@ mod tests {
     //      by `https://localhost:15000/roots/0` (that one signs the certs Pebble issues):
     //        curl -sL https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/pebble.minica.pem     //          | sudo tee /usr/local/share/ca-certificates/pebble.crt >/dev/null
     //        sudo update-ca-certificates
-    //      instant-acme 0.8 verifies against the platform store, so this is enough. Under 0.7
-    //      it used compiled-in roots and no amount of trust configuration could work.
+    //      The ACME client verifies against the platform store, so this is enough (or set
+    //      `tls.acme.ca_path` to the minica root instead). Under instant-acme 0.7 it used
+    //      compiled-in roots and no amount of trust configuration could work.
     //   3. Run it:
     //        EDGEGUARD_TEST_ACME_DIR=https://localhost:14000/dir \
     //        EDGEGUARD_TEST_ACME_DOMAIN=edgeguard.test \
@@ -1074,6 +1146,7 @@ mod tests {
             308,
             vec![],
             Some(challenges.clone()),
+            crate::serve::ServeOpts::default(),
             stop_rx,
         ));
 

@@ -11,18 +11,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arc_swap::ArcSwap;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::build_runtime;
 use crate::config::Config;
-use crate::proxy::Runtime;
+use crate::policy::Policy;
 
 /// Watch `path` and hot-reload on every change. Runs until the channel closes; spawn it as a
-/// background task. `path` is the config file the binary was started with.
-pub async fn watch(path: PathBuf, runtime: Arc<ArcSwap<Runtime>>) -> Result<()> {
+/// background task. `path` is the config file the binary was started with. In managed mode the
+/// file is only the bottom layer: `policy` rebuilds with the control-plane policy on top, so an
+/// edit to the file never drops what the control plane pushed.
+pub async fn watch(path: PathBuf, policy: Arc<Policy>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<()>(8);
 
     // We watch the directory (see below), so filter events down to ones that touch the config
@@ -61,7 +61,7 @@ pub async fn watch(path: PathBuf, runtime: Arc<ArcSwap<Runtime>>) -> Result<()> 
         tokio::time::sleep(Duration::from_millis(200)).await;
         while rx.try_recv().is_ok() {}
 
-        match reload(&path, &runtime) {
+        match reload(&path, &policy) {
             Ok(()) => info!(path = %path.display(), "config reloaded"),
             Err(e) => {
                 error!(
@@ -74,13 +74,11 @@ pub async fn watch(path: PathBuf, runtime: Arc<ArcSwap<Runtime>>) -> Result<()> 
     Ok(())
 }
 
-/// Reload the config file and swap in a freshly-built runtime. Pure enough to unit-test: it
-/// takes the same `ArcSwap` the request path reads from.
-fn reload(path: &Path, runtime: &ArcSwap<Runtime>) -> Result<()> {
+/// Reload the config file and rebuild the runtime on it. Pure enough to unit-test: `policy` holds
+/// the same `ArcSwap` the request path reads from.
+fn reload(path: &Path, policy: &Policy) -> Result<()> {
     let cfg = Config::load(path.to_str()).context("reloading config")?;
-    let new_runtime = build_runtime(Arc::new(cfg)).context("rebuilding runtime")?;
-    runtime.store(Arc::new(new_runtime));
-    Ok(())
+    policy.set_local(cfg).context("rebuilding runtime")
 }
 
 fn is_modifying(event: &Event) -> bool {
@@ -109,9 +107,11 @@ mod tests {
 
         // Initial config: rate limiting disabled.
         std::fs::write(&path, "[ratelimit]\nenabled = false\n").unwrap();
-        let initial = build_runtime(Arc::new(Config::load(path.to_str()).unwrap())).unwrap();
+        let local = Arc::new(Config::load(path.to_str()).unwrap());
+        let initial = crate::build_runtime(Arc::clone(&local)).unwrap();
         assert!(initial.ip_limiter.is_none());
-        let swap = ArcSwap::from_pointee(initial);
+        let swap = Arc::new(arc_swap::ArcSwap::from_pointee(initial));
+        let policy = Policy::new(local, Arc::clone(&swap), Arc::default()).unwrap();
 
         // A good reload turns rate limiting on — the swap reflects it.
         std::fs::write(
@@ -119,7 +119,7 @@ mod tests {
             "[ratelimit]\nenabled = true\nrate = \"10/sec\"\nburst = 5\n",
         )
         .unwrap();
-        reload(&path, &swap).unwrap();
+        reload(&path, &policy).unwrap();
         assert!(swap.load().ip_limiter.is_some());
 
         // A broken reload (invalid rate) is an error and must NOT clobber the live policy.
@@ -130,7 +130,7 @@ mod tests {
         )
         .unwrap();
         drop(f);
-        assert!(reload(&path, &swap).is_err());
+        assert!(reload(&path, &policy).is_err());
         assert!(swap.load().ip_limiter.is_some()); // previous (working) policy retained
 
         let _ = std::fs::remove_dir_all(&dir);

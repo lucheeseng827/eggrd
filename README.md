@@ -35,7 +35,7 @@ hardening) in a single static binary.
 ```bash
 cargo install eggrd && edgeguard init && edgeguard doctor
 # or
-docker run -p 8080:8080 mancube/eggrd:0.4.0
+docker run -p 8080:8080 mancube/eggrd:0.5.0
 ```
 
 ## Status
@@ -596,9 +596,9 @@ edge DLP, compiled in only with `--features ner`).
 
 ### Request / response pipeline
 
-**Request:** client-IP resolution (honors `X-Forwarded-For` only when
-`server.trust_forwarded_for = true`; disabled by default so clients cannot spoof
-their IP) → IP access control (`[access]`, allow-all by default) → header-size limit →
+**Request:** client-IP resolution (the client a trusted balancer's PROXY protocol header names,
+with `server.proxy_protocol`; `X-Forwarded-For` only when `server.trust_forwarded_for = true`,
+disabled by default so clients cannot spoof their IP) → IP access control (`[access]`, allow-all by default) → header-size limit →
 pooled-quota hard-stop (managed mode only, when `control_plane.enforce_quota` is on —
 `429` + `Retry-After`) → rate-limit (per-IP / per-route) → CORS preflight
 (answered before auth, when `[cors]` is on) → auth → per-key
@@ -799,6 +799,11 @@ order whatever its outcome. `propagation_secs` (default 30) is the wait before t
 Renewal uses the same challenge. `edgeguard doctor` reports a wildcard over HTTP-01, a missing
 provider or zone, and an unset token variable before any order is sent.
 
+**Behind an egress proxy.** ACME requests go out like everything else the edge calls: through
+`tls.acme.proxy`, the `[outbound]` default, or `HTTPS_PROXY`, as a `CONNECT` tunnel. The directory
+is verified against the operating system's trust store, so a private ACME CA whose root is
+installed on the host works as before. `tls.acme.ca_path` trusts only one bundle instead.
+
 > ⚠️ ACME requires a real public domain and inbound port 80, so it can't be exercised by the
 > default in-process test suite. Issuance and renewal are proven against **Pebble**, a real test
 > CA, in CI on every change — `bash scripts/acme-pebble-test.sh` runs the same check locally. The default directory
@@ -822,7 +827,10 @@ taken at boot:
   last renewal attempt with its error. `/__edgeguard/metrics` carries
   `edgeguard_tls_cert_not_after_seconds`, `…_reloads_total` and `…_renewals_total`, and
   `monitoring/` ships expiry alerts and dashboard panels for them. `edgeguard doctor` reports the
-  days left on the certificate at `cert_path`.
+  days left on the certificate at `cert_path`. The same series, endpoint and lint cover the client
+  certificates the edge presents (`cert="client:<path>"`) and the CAs it checks client
+  certificates against (`cert="client-ca:<name>"`), with `edgeguard_tls_crl_next_update_seconds`
+  for CRL staleness.
 
 #### Several certificates on one listener (SNI)
 
@@ -854,6 +862,51 @@ already stops replicas from spending the CA's shared rate limit between them.
 
 For a managed-TLS platform (most PaaS) you typically leave TLS off and let the platform
 terminate it; TLS termination here is for the VPS / front-proxy path.
+
+### Client certificates (mutual TLS)
+
+`[tls.client_auth]` makes clients prove who they are with a certificate from your CA, at the
+handshake:
+
+```toml
+[tls.client_auth]
+mode = "required"                       # or "optional"
+ca_path = "/etc/eggrd/client-ca.pem"
+crl_paths = ["/etc/eggrd/client-ca.crl"]
+forward_client_cert = "xfcc"            # tell the app which certificate it was
+
+[auth]
+mode = "mtls"                           # the certificate is the credential
+[auth.mtls]
+allowed = ["spiffe://prod.example/ns/web/*"]
+```
+
+A client without an acceptable certificate never reaches the app, and the refusal is counted in
+`edgeguard_tls_handshake_failures_total{reason="client_cert"}`. With `auth.mode = "mtls"` the
+certificate's first allowed name — a SPIFFE ID, DNS or email name, or CN — is the principal that
+per-key rate limits and budgets key on. A CRL or CA bundle replaced on disk applies to the next
+connection without a restart, and TLS session resumption is off while this is on, so a revoked
+certificate cannot ride an old session back in. The app never sees an `X-Forwarded-Client-Cert`
+the client wrote. Combined with `[upstream_tls]`, both hops can be mutually authenticated. This
+needs EdgeGuard to terminate TLS itself: behind a load balancer that terminates TLS, the
+certificate never arrives. Use one that passes TCP through, or, if the balancer does the mTLS
+itself and forwards the certificate in a header, read it from there:
+
+```toml
+[trusted_client_cert_header]
+name = "X-Amzn-Mtls-Clientcert"         # what an ALB in mTLS verify mode writes
+format = "pem"                          # pem | der | xfcc (Envoy, Istio)
+trusted_proxies = ["10.0.0.0/20"]       # the balancer's addresses; anyone else's header is dropped
+```
+
+The forwarded certificate is then the request's client certificate for `auth.mode = "mtls"`,
+`forward_client_cert`, the access log and the metrics. It is trusted only from `trusted_proxies`,
+matched against the connection's own peer and never `X-Forwarded-For`, and the header itself never
+reaches the app. `ca_path` re-verifies it for a balancer that forwards without checking. See
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#client-certificates--where-they-can-be-verified) for which
+balancer writes what. On a shared edge network, where the address alone proves nothing, trust the
+balancer by its own TLS client certificate instead: `trusted_proxy_names =
+["spiffe://prod.example/ns/ingress/*"]`, with `[tls.client_auth]` on.
 
 ## WAF-lite (input rules)
 
@@ -895,6 +948,42 @@ inspect_body = false    # screen the (size-capped) request body (opt in)
   noisy. The path is matched both raw and percent-decoded, so `%2e%2e%2f` is caught as `../`.
 - **Where it runs.** After auth and the size/method checks, just before the request is
   forwarded — so the internal `/__edgeguard/*` endpoints are never inspected.
+
+## A workload's identity as the credential
+
+A CI job, or an agent's step, that asks a model through eggrd need not hold a key of any kind. With
+`auth.mode = "jwt"` against its CI system's issuer, the job presents the short-lived OIDC token its
+run was given, and the `[[llm.keys]]` entry its verified claims match has its provider key
+injected. The token never reaches the provider, and a `claim:run_id` budget caps what each run
+may spend:
+
+```toml
+[auth]
+mode = "jwt"
+
+[auth.jwt]
+algorithm = "RS256"
+jwks_url = "https://dagron.example.com/.well-known/jwks"   # the CI system's issuer
+issuer = "https://dagron.example.com"
+audience = "eggrd"                                          # what the job asks its token for
+
+[[llm.keys]]
+claims = { trust = ["trusted", "agent"], repository = ["acme/*"] }
+provider_key = "sk-real-..."
+allowed_models = ["gpt-4o-mini"]
+label = "ci-runs"
+
+[[llm.budgets]]
+name = "per-run"
+scope = "claim:run_id"
+unit = "tokens"
+limit = 200000
+window = "24h"
+```
+
+A hijacked job can spend its run's budget, for as long as its token lasts, and cannot take the
+provider key. dagron's runs get such tokens from an `identity: { oidc: { audience: eggrd } }`;
+GitHub Actions' from `permissions: id-token: write` (its `repository` claim is `owner/name` too).
 
 ## Edge DLP (PII / secret redaction)
 
@@ -1108,6 +1197,31 @@ the **resolved** client IP — the same one rate limiting uses — so behind a t
 `server.trust_forwarded_for = true` for this to see the real client rather than the proxy. A bad
 CIDR fails at startup/reload.
 
+### Behind an L4 load balancer (PROXY protocol)
+
+A balancer that passes TCP through without keeping the client's address cannot add
+`X-Forwarded-For`, so every connection seems to come from the balancer. Examples are an AWS NLB
+with IP targets, HAProxy `mode tcp`, nginx `stream` and a GCP TCP proxy. Such a balancer can
+instead send a PROXY protocol header at the start of the connection:
+
+```toml
+[server]
+proxy_protocol = true                    # read a v1 or v2 header on the public and redirect listeners
+proxy_protocol_trusted = ["10.0.0.0/20"] # the balancer's subnets; required, and a /0 is refused
+```
+
+The client it names is the address rate limits, `[access]`, the access log and the app's
+`X-Forwarded-For` see. On a TLS listener it is read before the handshake.
+
+The header is believed only from `proxy_protocol_trusted`. From any other peer, a connection that
+starts with one is closed, since its client would be choosing its own address. One that does not is
+served as it is, so in-cluster callers and probes keep working.
+
+`edgeguard_proxy_protocol_total{listener,result}` counts what each connection sent.
+`EdgeGuardProxyProtocolRefused` fires when the balancer's own connections are being closed. See
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#the-clients-address-behind-a-load-balancer) for each
+balancer's setting, and for NLB client IP preservation.
+
 ## Streaming
 
 By default EdgeGuard reads a whole request before forwarding it and a whole response before
@@ -1180,9 +1294,73 @@ target = "http://api.internal:4000"
 ```
 
 Longest matching prefix wins; anything unmatched goes to the default `server.upstream`/`app_port`.
-This is deliberately **not** a gateway — no service discovery, load balancing, health-based
-routing, or request rewriting (the path is forwarded unchanged). For those, keep EdgeGuard in front
-of one app and put a real gateway/mesh behind it. The readiness probe still tracks the default
+A target (or `server.upstream`) may be `https://`: the upstream is reached over TLS and its
+certificate verified against the public roots, or against your own CA with `[upstream_tls]
+ca_path`, which can also present a client certificate for upstreams that require mutual TLS — so
+traffic stays encrypted on the hop from EdgeGuard to the app, not only on the way in. See
+[`[upstream_tls]`](docs/CONFIG.md#upstream_tls--tls-to-https-upstreams).
+
+### Balancing and failover across upstreams
+
+Give a prefix `targets` instead of `target`, and it has a pool. Use one to spread load over
+several servers, or for on-prem servers with a cloud standby, say, without a load balancer in
+between:
+
+```toml
+[[upstreams]]
+path = "/"                               # everything: replaces server.upstream
+name = "app"
+targets = [{ url = "http://10.0.1.5:8080", weight = 2 }, "http://10.0.1.6:8080"]
+balance = "round_robin"                  # default "priority": the first takes everything
+backup = ["https://standby.example.com"] # only when no target in `targets` will
+[upstreams.health_check]
+path = "/healthz"                        # GET every 5s; out after 2 failures, back after 2 passes
+```
+
+- **Routing:** with `balance = "round_robin"`, requests take the targets in rotation in turn, as
+  many turns each as its `weight`: the bigger server above takes two requests for each one the
+  other takes. With `"priority"`, each request goes to the first target in rotation.
+- **Backup:** `backup` targets take requests only when none of `targets` will.
+- **Failover:** a request that cannot connect (refused, unreachable, past
+  `validation.upstream_connect_timeout`, a failed TLS handshake) is sent to the next target, the
+  backups last. That target is ejected for `eject_for` (30 s), so the requests after it don't try
+  it.
+- **Up but broken:** with `eject_after_5xx = 5`, a target that answers `5xx` five times in a row
+  is ejected too. It is never the last target in rotation, since when every target is broken,
+  rotation can't help.
+- **Repeat offenders:** a target ejected again soon after coming back stays out twice as long,
+  then three times, up to `eject_for_max` (5 minutes).
+- **Least connections:** `balance = "least_conn"` sends each request to the target with the
+  fewest requests in flight for its weight. It suits requests of very different cost, and
+  WebSockets.
+- **Hashing:** `balance = "hash"` with `hash_on = "header:x-tenant"` (or `"client_ip"`,
+  `"path"`, `"cookie:<name>"`, `"query:<name>"`) sends the same key to the same target, on every
+  edge. When a target leaves rotation, only its keys move.
+- **Sticky sessions:** `sticky_cookie = "eg_upstream"` sets a cookie naming the target that
+  answered, and keeps the client there while it is in rotation. `sticky_cookie_max_age` makes it
+  outlast the browser session, and `sticky_cookie_strip` keeps it from the upstream.
+- **Beyond a status:** `health_check.expect_body = '"status":"ok"'` (or `expect_body_regex`)
+  fails a target whose health endpoint answers `200` while saying it is degraded.
+  `health_check.method` and `headers` shape the request (`HEAD`, a `Host` the target routes by),
+  and `health_check.port` sends it to a separate management port.
+  `health_check.type = "tcp"` only connects, for a target with no health endpoint.
+- **Expected status:** `health_check.expect_status = "200,204"` says which answers pass
+  (default `"200-399"`).
+- **Health checks:** they take a target out before any request finds it gone, and bring it back.
+- **Nothing in rotation:** requests try every target anyway, and `/__edgeguard/ready` fails for a
+  `"/"` pool.
+- **Reload:** what is known about each target survives a reload.
+- **TLS:** each `https://` target takes its own `[[upstream_tls.targets]]` settings.
+- **Visibility:** `edgeguard_upstream_in_rotation{route,upstream}` says which targets take requests,
+  and `EdgeGuardUpstreamTargetOut` and `EdgeGuardUpstreamPoolDown` alert.
+  `GET /__edgeguard/upstreams` shows each route's targets, and for each one out of rotation, why:
+  its last health check, or the connection error that ejected it.
+
+This is still **not** a gateway: no service discovery, and no
+request rewriting (the path is forwarded unchanged). A request that reached a target and got an
+answer, even a `5xx`, is never retried, because the app may have acted on it. Neither is one whose
+body was streamed (`validation.stream_requests`). For more, keep EdgeGuard in front and put a real
+gateway or mesh behind it. Without a `"/"` pool, the readiness probe still tracks the default
 upstream.
 
 ## Response compression
@@ -1338,7 +1516,21 @@ report to — a central **control plane**:
   `GET` with an ETag, so an unchanged policy is a cheap `304`) and applies it through the *same*
   hot-reload path a local file edit uses — no restart, no dropped connections. The control plane
   pushes the **policy** sections (auth, rate limits, validation, headers, WAF); the edge keeps its
-  own local `[server]` / `[tls]` (its port, upstream, and certs are edge-specific).
+  own local `[server]` / `[tls]` (its port, upstream, and certs are edge-specific). A local edit
+  keeps the pushed policy on top.
+- **Last-known-good policy** (`cache_path`). Each applied policy is also written to disk (`0600`),
+  and read back at startup, so an edge restarted while the control plane is unreachable comes up
+  on the policy it last had rather than on its local file. `boot_without_policy = "refuse"`
+  answers `503` instead until a policy is available, for edges that must never serve on local
+  config.
+- **Private CA, client certificate, egress proxy** (`ca_path`, `client_cert_path`/`client_key_path`,
+  `proxy`). For a self-hosted control plane: trust its private CA instead of the public roots,
+  present this edge's client certificate (re-read on rotation, no restart), and reach it through
+  an `http://` `CONNECT` proxy with TLS end to end. The edge token is still sent. The same four
+  keys work in every section the edge sends from: log shipping, tracing, OTLP metrics, the JWKS
+  fetch, alerts. `[outbound]` sets the proxy, the client certificate and an extra CA once for all
+  of them. Its CA is added to the public roots, so public endpoints such as a chat webhook keep
+  working.
 - **Metrics reporting.** The edge accumulates per-period request and bandwidth counts and POSTs a
   delta to the control plane (for fleet visibility).
 - **Quota enforcement** (`enforce_quota`, off by default). Beyond *reporting* metrics, the edge can
@@ -1392,7 +1584,7 @@ inside your own network — air-gapped included — and is licensed by annual ag
 
 The licence key is verified offline against a public key built into the control plane — nothing
 calls home — and a lapsed licence turns the control plane **read-only**; it never stops your edges,
-which keep serving on their last policy. The table lists only what ships today; nothing on it is a
+which keep serving on their last policy — across restarts too, with `control_plane.cache_path`. The table lists only what ships today; nothing on it is a
 roadmap item.
 
 **To evaluate Enterprise**, [open an issue with the `enterprise` label](https://github.com/lucheeseng827/eggrd/issues/new?labels=enterprise&title=Enterprise%20trial)

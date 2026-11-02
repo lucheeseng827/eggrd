@@ -21,7 +21,7 @@ use crate::config::AccessCfg;
 /// A single CIDR rule: a base address and a prefix length, kept per family. A bare IP is stored
 /// as a full-length prefix (`/32` for v4, `/128` for v6).
 #[derive(Debug, Clone, Copy)]
-enum Cidr {
+pub(crate) enum Cidr {
     V4 { base: u32, prefix: u8 },
     V6 { base: u128, prefix: u8 },
 }
@@ -29,7 +29,7 @@ enum Cidr {
 impl Cidr {
     /// Parse `"10.0.0.0/8"`, `"203.0.113.7"`, `"2001:db8::/32"`, or `"::1"`. The host bits below
     /// the prefix are masked off, so `"10.1.2.3/8"` is accepted and treated as `10.0.0.0/8`.
-    fn parse(s: &str) -> Result<Cidr> {
+    pub(crate) fn parse(s: &str) -> Result<Cidr> {
         let s = s.trim();
         let (addr_part, prefix_part) = match s.split_once('/') {
             Some((a, p)) => (a, Some(p)),
@@ -66,7 +66,30 @@ impl Cidr {
         }
     }
 
-    fn contains(&self, ip: IpAddr) -> bool {
+    /// A `/0`: every address of its family.
+    pub(crate) fn is_everything(&self) -> bool {
+        matches!(
+            self,
+            Cidr::V4 { prefix: 0, .. } | Cidr::V6 { prefix: 0, .. }
+        )
+    }
+
+    /// Whether the two share an address.
+    pub(crate) fn overlaps(&self, other: &Cidr) -> bool {
+        match (*self, *other) {
+            (Cidr::V4 { base: a, prefix: p }, Cidr::V4 { base: b, prefix: q }) => {
+                let mask = mask_v4(p.min(q));
+                a & mask == b & mask
+            }
+            (Cidr::V6 { base: a, prefix: p }, Cidr::V6 { base: b, prefix: q }) => {
+                let mask = mask_v6(p.min(q));
+                a & mask == b & mask
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
         match (self, ip) {
             (Cidr::V4 { base, prefix }, IpAddr::V4(v4)) => {
                 u32::from(v4) & mask_v4(*prefix) == *base

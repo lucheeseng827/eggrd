@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "eggrd"
-version = "0.5.0"
+version = "0.7.0-rc.1"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -782,8 +782,10 @@ dependencies = [
  "redis",
  "regex",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-pemfile",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "time",
@@ -795,6 +797,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

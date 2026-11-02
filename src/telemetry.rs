@@ -90,30 +90,36 @@ pub struct TelemetryRuntime {
 impl TelemetryRuntime {
     /// Compile from config. `enabled` folds in "has a non-empty endpoint" so a misconfigured switch
     /// (on, but no endpoint) is inert rather than erroring on every request.
-    pub fn build(cfg: &TelemetryCfg) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(cfg.timeout_ms.max(1)))
-            .build()
-            .unwrap_or_default();
+    pub fn build(cfg: &TelemetryCfg) -> anyhow::Result<Self> {
+        let enabled = cfg.enabled && !cfg.endpoint.trim().is_empty();
+        let client = if enabled {
+            crate::outbound::builder(&cfg.outbound, "llm.telemetry", cfg.endpoint.trim())?.0
+        } else {
+            reqwest::Client::builder()
+        }
+        .timeout(Duration::from_millis(cfg.timeout_ms.max(1)))
+        .build()
+        .map_err(|e| anyhow::anyhow!("building the LLM telemetry HTTP client: {e}"))?;
         let service_name = if cfg.service_name.trim().is_empty() {
             "edgeguard".to_string()
         } else {
             cfg.service_name.trim().to_string()
         };
-        TelemetryRuntime {
-            enabled: cfg.enabled && !cfg.endpoint.trim().is_empty(),
+        Ok(TelemetryRuntime {
+            enabled,
             endpoint: cfg.endpoint.trim().to_string(),
             sample_rate: cfg.sample_rate.clamp(0.0, 1.0),
             service_name,
             capture_content: cfg.capture_content,
             max_content_bytes: cfg.max_content_bytes,
             client,
-        }
+        })
     }
 
     /// An inert runtime (emission off) — the default when `[llm.telemetry]` is absent.
     pub fn disabled() -> Self {
-        Self::build(&TelemetryCfg::default())
+        // Off, it builds a plain client, which fails only where `reqwest::Client::new` would panic.
+        Self::build(&TelemetryCfg::default()).expect("a disabled telemetry runtime builds")
     }
 
     /// Whether a trace id falls in the sampled fraction. Deterministic per trace (folding
@@ -148,7 +154,10 @@ impl TelemetryRuntime {
             match client.post(&endpoint).json(&body).send().await {
                 Ok(resp) if resp.status().is_success() => {}
                 Ok(resp) => tracing::debug!(status = %resp.status(), "otlp span emit rejected"),
-                Err(e) => tracing::debug!(error = %e, "otlp span emit failed"),
+                Err(e) => tracing::debug!(
+                    error = %crate::upstream::error_chain(&e),
+                    "otlp span emit failed"
+                ),
             }
         });
     }
@@ -772,14 +781,16 @@ mod tests {
             endpoint: "http://x/v1/traces".into(),
             sample_rate: 1.0,
             ..TelemetryCfg::default()
-        });
+        })
+        .unwrap();
         assert!(all.sampled(&[0xff; 16]));
         let none = TelemetryRuntime::build(&TelemetryCfg {
             enabled: true,
             endpoint: "http://x/v1/traces".into(),
             sample_rate: 0.0,
             ..TelemetryCfg::default()
-        });
+        })
+        .unwrap();
         assert!(!none.sampled(&[0xff; 16]));
         // Same trace id → same verdict, whatever the rate.
         let half = TelemetryRuntime::build(&TelemetryCfg {
@@ -787,7 +798,8 @@ mod tests {
             endpoint: "http://x/v1/traces".into(),
             sample_rate: 0.5,
             ..TelemetryCfg::default()
-        });
+        })
+        .unwrap();
         let id = [0x40u8; 16];
         assert_eq!(half.sampled(&id), half.sampled(&id));
     }
@@ -804,7 +816,8 @@ mod tests {
             endpoint: "http://x/v1/traces".into(),
             sample_rate: 0.5,
             ..TelemetryCfg::default()
-        });
+        })
+        .unwrap();
         let sampled_count = (0..2000)
             .filter(|_| half.sampled(uuid::Uuid::new_v4().as_bytes()))
             .count();
@@ -821,7 +834,8 @@ mod tests {
             enabled: true,
             endpoint: "   ".into(), // whitespace-only → treated as unset
             ..TelemetryCfg::default()
-        });
+        })
+        .unwrap();
         assert!(!rt.enabled);
     }
 
@@ -873,18 +887,20 @@ impl SpanShipper {
     }
 }
 
-/// Build the shipper and spawn its background task. `None` when tracing is off or unconfigured.
+/// Build the shipper and spawn its background task. `None` when tracing is off or unconfigured;
+/// an error when its TLS or proxy settings do not load.
 pub fn spawn_span_shipper(
     cfg: &crate::config::TracingCfg,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Option<SpanShipper> {
+) -> anyhow::Result<Option<SpanShipper>> {
     if !cfg.enabled || cfg.endpoint.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
-    let http = reqwest::Client::builder()
+    let (http, _) = crate::outbound::builder(&cfg.outbound, "tracing", cfg.endpoint.trim())?;
+    let http = http
         .timeout(std::time::Duration::from_millis(cfg.timeout_ms.max(100)))
         .build()
-        .ok()?;
+        .map_err(|e| anyhow::anyhow!("building the span shipper's HTTP client: {e}"))?;
     let stats = std::sync::Arc::new(SpanShipStats::default());
     let (tx, rx) = tokio::sync::mpsc::channel(cfg.queue_size.max(1));
     let task = SpanShipTask {
@@ -897,7 +913,7 @@ pub fn spawn_span_shipper(
     };
     tracing::info!(endpoint = %cfg.endpoint, batch = task.batch, "request tracing enabled");
     tokio::spawn(task.run(rx, shutdown));
-    Some(SpanShipper { tx, stats })
+    Ok(Some(SpanShipper { tx, stats }))
 }
 
 struct SpanShipTask {
@@ -974,7 +990,11 @@ impl SpanShipTask {
                     .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
-                tracing::debug!(error = %e, spans = n, "shipping a span batch failed");
+                tracing::debug!(
+                    error = %crate::upstream::error_chain(&e),
+                    spans = n,
+                    "shipping a span batch failed"
+                );
                 self.stats
                     .dropped_send_failed
                     .fetch_add(n, std::sync::atomic::Ordering::Relaxed);

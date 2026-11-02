@@ -14,6 +14,21 @@ port = 8080
 # the compose network (the listener has no auth — keep it on a trusted network in production).
 admin_port = 9090
 admin_addr = "0.0.0.0"
+# A cap, so the API-usage dashboard's "Connections vs cap" panel has one to measure against.
+max_connections = 1000
+
+# Two named routes for the API-usage dashboard: `api` to the stub, and `legacy` to a port nothing
+# listens on, so the per-upstream panels show a failing upstream (connect_error) beside a healthy
+# one. The traffic generator sends a little to each.
+[[upstreams]]
+path = "/api/"
+target = "http://upstream:80"
+name = "api"
+
+[[upstreams]]
+path = "/legacy/"
+target = "http://upstream:81"
+name = "legacy"
 
 [auth]
 # No auth so the demo traffic flows freely. Switch to "apikey"/"jwt"/"basic" for real use.

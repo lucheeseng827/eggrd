@@ -40,7 +40,7 @@ Grafana with the dashboard pre-provisioned. Within ~15s the dashboard is populat
 
 | Service | URL | Notes |
 |---|---|---|
-| **Grafana** | http://localhost:3000 | anonymous, no login → dashboard **EdgeGuard / eggrd — Overview** (folder *EdgeGuard*) |
+| **Grafana** | http://localhost:3000 | anonymous, no login → dashboards **EdgeGuard / eggrd — Overview** and **— API usage** (folder *EdgeGuard*) |
 | **Prometheus** | http://localhost:9091 | check **Status → Targets**: `edgeguard` should be **UP** |
 | **EdgeGuard proxy** | http://localhost:8080 | the public proxy port (try `curl localhost:8080/`) |
 
@@ -60,6 +60,12 @@ The traffic generator exercises every series, so the dashboard's panels all move
 - **WAF hits by rule** — `sqli`, `xss`, `path_traversal` register (WAF runs in `report` mode, so
   these are counted without blocking the demo traffic).
 - **Request latency percentiles** — p50/p90/p99 from the histogram.
+
+The **API usage** dashboard reads newer series than the pinned demo image exports: per route, per
+consumer and per upstream, the edge's own overhead, and the connection cap. Its panels fill in once
+the image pin in `compose.yaml` moves to a release that has them. The demo config and traffic are
+already set up for it. The `api` route answers, and the `legacy` route points at a closed port,
+so one upstream shows `connect_error` beside a healthy one.
 
 ## Monitor your own EdgeGuard
 
@@ -100,7 +106,10 @@ Prometheus datasource), so it imports cleanly anywhere:
 
 It assumes the standard EdgeGuard metric names (`edgeguard_requests_total`,
 `edgeguard_request_duration_seconds`, `edgeguard_ratelimit_hits_total`,
-`edgeguard_waf_hits_total`, `edgeguard_csp_reports_total`) — no relabeling required.
+`edgeguard_waf_hits_total`, `edgeguard_csp_reports_total`) — no relabeling required. The
+**API usage** dashboard
+([`grafana/dashboards/edgeguard-api-usage.json`](grafana/dashboards/edgeguard-api-usage.json))
+imports the same way.
 
 ### Metrics referenced
 
@@ -112,6 +121,57 @@ It assumes the standard EdgeGuard metric names (`edgeguard_requests_total`,
 | `edgeguard_waf_hits_total` | counter | `rule` (`sqli`/`xss`/`path_traversal`/`custom`) | WAF hits |
 | `edgeguard_csp_reports_total` | counter | — | CSP reports |
 | `up` | gauge | `job` | Targets up (scrape health) |
+
+API usage dashboard:
+
+| Metric | Type | Labels | Panels |
+|---|---|---|---|
+| `edgeguard_route_requests_total` | counter | `route`, `method`, `status_class` | requests and 5xx ratio by route |
+| `edgeguard_route_request_duration_seconds` | histogram | `route`, `le` | p99 latency by route |
+| `edgeguard_upstream_requests_total` | counter | `upstream`, `result` | upstream error ratio, failures by result |
+| `edgeguard_upstream_duration_seconds` | histogram | `upstream`, `le` | upstream p99 time to headers |
+| `edgeguard_edge_overhead_seconds` | histogram | `le` | edge overhead p50/p99/mean |
+| `edgeguard_connections_open` / `edgeguard_connections_max` | gauge | `listener` | connections vs cap |
+| `edgeguard_tls_handshake_failures_total` | counter | `listener`, `reason` | client certificates refused, handshake failures |
+| `edgeguard_consumer_requests_total` / `edgeguard_consumer_bytes_total` | counter | `consumer`, `status_class` / `direction` | top consumers by requests, bytes, errors |
+| `edgeguard_upstream_in_rotation` | gauge | `route`, `upstream` | pool targets in rotation |
+| `edgeguard_upstream_health_checks_total` | counter | `route`, `upstream`, `result` | failed health checks |
+| `edgeguard_upstream_ejections_total` | counter | `route`, `upstream`, `reason` | ejections |
+| `edgeguard_client_cert_header_total` | counter | `result` | forwarded client certificates |
+| `edgeguard_proxy_protocol_total` | counter | `listener`, `result` | PROXY protocol headers |
+
+## Alerts
+
+[`prometheus/alerts.yml`](prometheus/alerts.yml) carries three groups:
+- **`edgeguard`**: request-level availability, latency, abuse signals and limiter health.
+- **`edgeguard-api`**: per upstream, route and listener, the group the API usage dashboard
+  pairs with.
+- **`edgeguard-acme-budget`**: certificate issuance and expiry. The expiry alerts read the whole
+  `edgeguard_tls_cert_not_after_seconds` family, so they cover the client certificates the edge
+  presents and the CAs it trusts for client certificates (`cert="client:…"`, `cert="client-ca:…"`).
+  `EdgeGuardCrlStale` fires for a client-auth CRL past its `nextUpdate`.
+
+The `edgeguard-api` alerts:
+
+| Alert | Fires when |
+|---|---|
+| `EdgeGuardUpstreamErrorRatio` | more than 5% of one upstream's requests fail or are answered 5xx for 5m, at more than 0.1 req/s |
+| `EdgeGuardUpstreamNotAnswering` | requests are sent to an upstream and none is answered for 5m, at any traffic level |
+| `EdgeGuardRouteLatencyRegression` | a route's p99 is over 250ms and more than double the same hour yesterday, for 15m |
+| `EdgeGuardConnectionsNearCap` | a listener's open connections are above 80% of `server.max_connections` for 5m |
+| `EdgeGuardClientCertRejectSpike` | more than one handshake every 5s is refused for its client certificate, for 10m |
+| `EdgeGuardClientCertHeaderRefused` | more than one request every 10s has its `[trusted_client_cert_header]` refused, per reason, for 10m |
+| `EdgeGuardUpstreamPoolDown` (critical) | no target of a pool is in rotation, for 1m |
+| `EdgeGuardUpstreamTargetOut` | one target of a pool is out of rotation while another is in, for 5m |
+| `EdgeGuardUpstreamTargetFlapping` | a pool target is ejected 3 times or more in 15m, for 5m |
+| `EdgeGuardProxyProtocolRefused` (critical) | more than one connection every 10s is closed for an `untrusted` or `invalid` PROXY header, for 5m |
+| `EdgeGuardProxyProtocolMissing` | connections from `proxy_protocol_trusted` arrive without a PROXY header and none with one, for 15m |
+
+Each has a unit test in [`prometheus/alerts.test.yml`](prometheus/alerts.test.yml), as do
+`EdgeGuardCrlStale` and the expiry alert on a client certificate: an input that
+makes it fire, and inputs that must not, such as a quiet upstream under the traffic guard or a
+listener under the threshold. Run them with
+`promtool test rules monitoring/prometheus/alerts.test.yml`.
 
 ## The versioned bundle
 
@@ -139,11 +199,13 @@ monitoring/
 ├── VERSION                      # the bundle version (alerts.yml + dashboards)
 ├── prometheus/
 │   ├── prometheus.yml           # scrape config (bundled demo + commented host-gateway target)
-│   └── alerts.yml               # alerting rules (part of the bundle)
+│   ├── alerts.yml               # alerting rules (part of the bundle)
+│   └── alerts.test.yml          # promtool unit tests for the edgeguard-api alerts
 └── grafana/
     ├── provisioning/
     │   ├── datasources/prometheus.yml   # auto-wired Prometheus datasource
     │   └── dashboards/edgeguard.yml     # dashboard provider
     └── dashboards/
-        └── edgeguard-overview.json      # the reference dashboard (publishable template)
+        ├── edgeguard-overview.json      # the reference dashboard (publishable template)
+        └── edgeguard-api-usage.json     # routes, upstreams, edge overhead, consumers
 ```

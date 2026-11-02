@@ -4,7 +4,7 @@
 # the /__edgeguard/* namespace, and `use edgeguard::` in tests/benches are all unchanged — only the
 # crates.io package id differs. Install with `cargo install eggrd` (installs the `edgeguard` binary).
 name = "eggrd"
-version = "0.5.0"
+version = "0.7.0-rc.1"
 edition = "2021"
 description = "A drop-in Rust edge proxy that gives any app a secure front door: auth, rate limiting, and hardened response headers, with zero changes to the upstream app."
 license = "Apache-2.0"
@@ -55,6 +55,17 @@ jsonwebtoken = "9"
 # Already ring-only, no change needed: `rustls-tls` => `rustls-tls-webpki-roots` => `__rustls-ring`,
 # and reqwest declares rustls/tokio-rustls/hyper-rustls with `default-features = false`.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# The default trust store for `https://` upstreams (`[upstream_tls]` with no `ca_path`): the
+# Mozilla root set, compiled in, so verification needs no system CA bundle — which a distroless or
+# static-musl image does not have. The same roots reqwest's `rustls-tls` uses for the JWKS and
+# control-plane clients, so it is already compiled into every build: a direct edge to a node in the
+# graph, no new crate. The upstream TLS itself is tokio-rustls, already a dependency.
+webpki-roots = "1"
+# SHA-256 of a client certificate, for its fingerprint (`[tls.client_auth]`: the `Hash=` the app
+# receives in `X-Forwarded-Client-Cert`, and the principal of a certificate with no names). ring is
+# the crypto provider every rustls dependency here is pinned to, so this is a direct edge to a node
+# already in the graph. `default-features = false` so it cannot change ring's feature set.
+ring = { version = "0.17", default-features = false }
 # Distributed (shared-store) rate limiter for multi-replica deployments: a Redis-backed GCRA
 # store (`ratelimit.store = "redis"`). `tokio-comp` for async, `connection-manager` for
 # auto-reconnect, `tokio-rustls-comp` so `rediss://` TLS uses rustls (no system OpenSSL),
@@ -107,6 +118,11 @@ tower-http = { version = "0.6", features = ["compression-gzip"] }
 # default we still need for the ACME HTTP client. hyper-rustls and rustls-platform-verifier
 # come in transitively from here and need no entry of their own — this covers both.
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "time"] }
+# The operating system's trust store, for the ACME directory client: instant-acme's own client
+# verified against it, and EdgeGuard now sends ACME requests through its own outbound client (for
+# the proxy and CA settings) without changing what it trusts. Already in the graph through
+# hyper-rustls (instant-acme, reqwest); no features, so nothing new is compiled.
+rustls-platform-verifier = "0.7"
 # Self-signed certificate generation for `[tls] self_signed` / `edgeguard cert`, so TLS can be
 # turned on without obtaining a certificate first. The 0.3.0 notes say rcgen was "dropped" — true
 # of DIRECT use (instant-acme 0.8 builds its own key and CSR in `finalize()`), but instant-acme

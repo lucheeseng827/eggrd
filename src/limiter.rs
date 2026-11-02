@@ -498,6 +498,7 @@ mod tests {
                 path: "/api/".into(),
                 rate: "1/min".into(),
                 burst: 1,
+                ..Default::default()
             }],
             store: "memory".into(),
             ..Default::default()

@@ -155,7 +155,7 @@ fn bench_authorize(c: &mut Criterion) {
         let headers = bearer_headers(&sign_hs256(secret));
         assert!(matches!(
             runtime.block_on(engine.authorize(&cfg, &headers)),
-            Decision::Allow(_)
+            Decision::AllowJwt(..)
         ));
         group.bench_function(BenchmarkId::from_parameter("jwt_hs256"), |b| {
             b.iter(|| runtime.block_on(engine.authorize(&cfg, &headers)));

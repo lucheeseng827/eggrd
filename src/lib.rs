@@ -14,6 +14,8 @@ pub mod alert;
 pub mod auth;
 pub mod budget;
 pub mod certstore;
+pub mod client_auth;
+pub mod client_cert_header;
 pub mod config;
 pub mod cors;
 pub mod cp;
@@ -26,14 +28,20 @@ pub mod llm;
 pub mod logship;
 pub mod metrics;
 pub mod otlp_metrics;
+pub mod outbound;
+pub mod policy;
+pub mod pool;
 pub mod proxy;
+pub mod proxy_protocol;
 pub mod reload;
 pub mod scaffold;
 pub mod selfsigned;
+pub mod serve;
 pub mod stream_inspect;
 pub mod supervisor;
 pub mod telemetry;
 pub mod tls;
+pub mod upstream;
 pub mod waf;
 
 use std::num::NonZeroU32;
@@ -80,6 +88,9 @@ fn quota(rate: &str, burst: u32) -> Result<Quota> {
 /// or on reload — rather than per-request. The HTTP client and metric registry live outside
 /// the runtime (in [`AppState`]) so a reload preserves the connection pool and counters.
 pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
+    // Checked whether or not a section inherits it now, so a broken default fails here and not on
+    // the reload that first turns on a client using it.
+    crate::outbound::check_defaults(&cfg.outbound)?;
     let rl = &cfg.ratelimit;
 
     // Pick the limiter backend. `local` keeps the in-process `governor` limiters below; a
@@ -127,8 +138,8 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
         None
     };
 
-    // Per-path upstream overrides ([[upstreams]]): normalize each target like `upstream_base`
-    // (trim a trailing '/'). A bad/empty entry fails here so it surfaces at startup/reload.
+    // Per-path upstream overrides ([[upstreams]]), each a target or a pool, with each URL's
+    // trailing '/' trimmed. A bad/empty entry fails here so it surfaces at startup/reload.
     let mut upstream_routes = Vec::with_capacity(cfg.upstreams.len());
     for route in &cfg.upstreams {
         anyhow::ensure!(!route.path.is_empty(), "upstreams[].path must not be empty");
@@ -140,16 +151,42 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
             "upstreams[].path must start with '/' (got {:?})",
             route.path
         );
-        anyhow::ensure!(
-            !route.target.is_empty(),
-            "upstreams[].target must not be empty (path {:?})",
-            route.path
-        );
-        let base = route.target.trim_end_matches('/').to_string();
-        upstream_routes.push((route.path.clone(), std::sync::Arc::new(base)));
+        let label = if route.name.is_empty() {
+            &route.path
+        } else {
+            &route.name
+        };
+        upstream_routes.push((
+            route.path.clone(),
+            crate::pool::Pool::from_route(route, label)?,
+        ));
     }
+    crate::pool::check_url(&cfg.upstream_base()).context("server.upstream")?;
+    // Read once, by the connector at startup; parsed here too so a reload or `doctor` reports a typo.
+    parse_duration(&cfg.validation.upstream_connect_timeout)
+        .context("validation.upstream_connect_timeout")?;
 
     let auth = AuthEngine::build(&cfg.auth)?;
+    // `[tls]` is edge-local and fixed for the process, but `auth.mode` can arrive in a pushed
+    // policy: refuse one that authenticates by a client certificate this listener never asks for.
+    let from_header = !cfg.trusted_client_cert_header.name.trim().is_empty();
+    let client_cert_header =
+        crate::client_auth::ForwardPolicy::from_cfg(&cfg.tls.client_auth, from_header)?;
+    anyhow::ensure!(
+        cfg.auth.mode != "mtls" || client_cert_header.strip_inbound,
+        "auth.mode = \"mtls\" needs [tls.client_auth] mode = \"optional\" or \"required\", or \
+         [trusted_client_cert_header]: without one no request carries a client certificate"
+    );
+    // The balancer's names are read from the certificate it presents in its TLS handshake, which
+    // the listener asks for only with client authentication on (itself refused without `[tls]`).
+    let header = &cfg.trusted_client_cert_header;
+    anyhow::ensure!(
+        !from_header || header.trusted_proxy_names.is_empty() || cfg.tls.client_auth.mode != "off",
+        "trusted_client_cert_header.trusted_proxy_names needs [tls.client_auth] mode = \
+         \"optional\" or \"required\": the names are read from the certificate the balancer \
+         presents in its TLS handshake, and the listener asks for one only with client \
+         authentication on"
+    );
     // Compile the WAF here too, so a bad custom pattern fails fast at startup/reload rather
     // than per-request (and a broken hot-reload keeps the previous policy).
     let waf = Arc::new(crate::waf::WafEngine::build(&cfg.waf)?);
@@ -166,8 +203,26 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
     let upstream_timeout = parse_duration(&cfg.validation.upstream_timeout)?;
     let upstream_timeout = (!upstream_timeout.is_zero()).then_some(upstream_timeout);
 
+    // Route labels for the per-route metrics. A prefix listed in both tables keeps the upstream's
+    // label; either may name it.
+    let mut route_labels: Vec<(String, String)> = Vec::new();
+    let routes = cfg
+        .upstreams
+        .iter()
+        .map(|u| (&u.path, &u.name))
+        .chain(cfg.ratelimit.routes.iter().map(|r| (&r.path, &r.name)));
+    for (path, name) in routes {
+        if path.is_empty() || route_labels.iter().any(|(p, _)| p == path) {
+            continue;
+        }
+        let label = if name.is_empty() { path } else { name };
+        route_labels.push((path.clone(), label.clone()));
+    }
+
     Ok(Runtime {
-        upstream_base: Arc::new(cfg.upstream_base()),
+        client_cert_header,
+        route_labels,
+        default_upstream: crate::pool::Pool::single(&cfg.upstream_base()),
         upstream_routes,
         auth,
         waf,
@@ -195,29 +250,57 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
             Arc::new(crate::llm::LlmRuntime::build(&cfg.llm))
         },
         budgets: crate::budget::BudgetEngine::build(&cfg.llm)?.map(Arc::new),
-        keyvault: crate::keyvault::KeyVault::build(&cfg.llm)?.map(Arc::new),
+        keyvault: {
+            crate::keyvault::check_claims_auth(&cfg.auth, &cfg.llm)?;
+            crate::keyvault::KeyVault::build(&cfg.llm)?.map(Arc::new)
+        },
         dlp: crate::dlp::DlpEngine::build(&cfg.llm.dlp)?.map(Arc::new),
         telemetry: Arc::new(crate::telemetry::TelemetryRuntime::build(
             &cfg.llm.telemetry,
-        )),
-        alerts: Arc::new(crate::alert::AlertRuntime::build(&cfg.alerts)),
+        )?),
+        alerts: Arc::new(crate::alert::AlertRuntime::build(&cfg.alerts)?),
         cfg,
     })
 }
 
+/// An upstream base URL the client can dial: `http://` or `https://`, with a host. Anything else
+/// would load fine and then answer every request with `502`.
 /// Build the shared [`AppState`]: a fresh [`Runtime`] wrapped in an [`ArcSwap`] for
 /// hot-reload, the upstream HTTP client, and the metric registry.
 pub fn build_state(cfg: Arc<Config>) -> Result<AppState> {
     // Build the managed-mode client (if `[control_plane]` is enabled) before `cfg` is consumed.
     let cp = crate::cp::CpClient::from_cfg(&cfg.control_plane)?;
-    let runtime = build_runtime(cfg)?;
-    let client = Client::builder(TokioExecutor::new()).build_http::<axum::body::Body>();
+    let metrics = Metrics::new();
+    metrics.set_consumer_series_max(cfg.metrics.consumer_series_max);
+    let upstream_tls = Arc::new(crate::upstream::UpstreamTls::from_cfg(&cfg.upstream_tls)?);
+    // Edge-local and read once, like `upstream_tls`: which addresses may assert a client
+    // certificate is fixed for the process.
+    let cfg_header = cfg.trusted_client_cert_header.clone();
+    let connect_timeout = parse_duration(&cfg.validation.upstream_connect_timeout)
+        .context("validation.upstream_connect_timeout")?;
+    let runtime = Arc::new(ArcSwap::from_pointee(build_runtime(cfg)?));
+    // The pool series are read from whichever runtime is current.
+    metrics.watch_runtime(Arc::clone(&runtime));
+    let connector = crate::upstream::UpstreamConnector::new(
+        Arc::clone(&upstream_tls),
+        (!connect_timeout.is_zero()).then_some(connect_timeout),
+    );
+    let client = Client::builder(TokioExecutor::new()).build(connector.clone());
+    let client_cert_header = crate::client_cert_header::TrustedHeader::from_cfg(&cfg_header)?;
+    if let Some(header) = &client_cert_header {
+        metrics.set_trusted_header(Arc::clone(header));
+    }
     Ok(AppState {
         client,
-        metrics: Arc::new(Metrics::new()),
-        runtime: Arc::new(ArcSwap::from_pointee(runtime)),
+        connector,
+        upstream_tls,
+        client_cert_header,
+        metrics: Arc::new(metrics),
+        runtime,
         cp,
         quota: Arc::new(crate::cp::QuotaState::default()),
+        draining: Arc::default(),
+        policy_pending: Arc::default(),
     })
 }
 
@@ -284,6 +367,7 @@ fn admin_routes() -> Router<AppState> {
         .route("/__edgeguard/ready", get(ready))
         .route("/__edgeguard/metrics", get(metrics_handler))
         .route("/__edgeguard/tls", get(proxy::tls_status))
+        .route("/__edgeguard/upstreams", get(proxy::upstreams_status))
 }
 
 #[cfg(test)]
@@ -301,6 +385,59 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn route_labels_come_from_both_route_tables_and_the_longest_prefix_wins() {
+        use crate::config::{RouteRateLimit, UpstreamRoute};
+        let mut cfg = Config {
+            upstreams: vec![UpstreamRoute {
+                path: "/api/".into(),
+                target: "http://api:4000".into(),
+                name: "api".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg.ratelimit.routes = vec![
+            RouteRateLimit {
+                path: "/api/login".into(),
+                ..Default::default()
+            },
+            // Also an upstream prefix: the upstream's label stands.
+            RouteRateLimit {
+                path: "/api/".into(),
+                name: "ignored".into(),
+                ..Default::default()
+            },
+        ];
+        let rt = build_runtime(Arc::new(cfg)).unwrap();
+        assert_eq!(rt.route_label("/api/users?page=2"), "api");
+        assert_eq!(rt.route_label("/api/login?next=/"), "/api/login");
+        assert_eq!(rt.route_label("/apiary"), "default", "segment boundaries");
+        assert_eq!(rt.route_label("/"), "default");
+        assert_eq!(rt.route_labels.len(), 2);
+    }
+
+    #[test]
+    fn build_runtime_rejects_an_upstream_the_client_cannot_dial() {
+        for bad in ["127.0.0.1:3000", "ftp://files.example", "https://"] {
+            let cfg = Config {
+                upstreams: vec![crate::config::UpstreamRoute {
+                    path: "/api/".into(),
+                    target: bad.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            assert!(
+                build_runtime(Arc::new(cfg)).is_err(),
+                "{bad} should be refused"
+            );
+        }
+        let mut cfg = Config::default();
+        cfg.server.upstream = "https://app.example.com".into();
+        assert!(build_runtime(Arc::new(cfg)).is_ok());
     }
 
     #[test]
@@ -322,6 +459,7 @@ mod tests {
             path: "/api/".into(),
             rate: "10/sec".into(),
             burst: 5,
+            ..Default::default()
         }];
         cfg.ratelimit.per_key = crate::config::PerKeyRateLimit {
             enabled: true,
@@ -341,6 +479,7 @@ mod tests {
             path: "/api/".into(),
             rate: "0/sec".into(),
             burst: 5,
+            ..Default::default()
         }];
         assert!(build_runtime(Arc::new(cfg)).is_err());
     }
@@ -352,6 +491,7 @@ mod tests {
             upstreams: vec![crate::config::UpstreamRoute {
                 path: "api/".into(),
                 target: "http://api:4000".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -362,11 +502,15 @@ mod tests {
             upstreams: vec![crate::config::UpstreamRoute {
                 path: "/api/".into(),
                 target: "http://api:4000/".into(),
+                ..Default::default()
             }],
             ..Default::default()
         };
         let rt = build_runtime(Arc::new(ok)).unwrap();
-        assert_eq!(rt.pick_upstream("/api/x"), "http://api:4000");
-        assert_eq!(rt.pick_upstream("/other"), rt.upstream_base.as_str());
+        assert_eq!(rt.pick_upstream("/api/x").primary(), "http://api:4000");
+        assert_eq!(
+            rt.pick_upstream("/other").primary(),
+            rt.default_upstream.primary()
+        );
     }
 }

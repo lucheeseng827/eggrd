@@ -63,6 +63,9 @@ pub enum BudgetScope {
     /// One budget per team/tag (from the team header/claim) — the chargeback dimension a
     /// multi-tenant deployment bills on.
     PerTeam,
+    /// One budget per value of a claim of the request's verified JWT (`claim:<name>`, the claim
+    /// on the budget): `claim:run_id` gives each run of a CI system its own.
+    PerClaim,
 }
 
 impl BudgetScope {
@@ -72,8 +75,11 @@ impl BudgetScope {
             "key" | "per_key" | "per-key" => Ok(BudgetScope::PerKey),
             "model" | "per_model" | "per-model" => Ok(BudgetScope::PerModel),
             "team" | "per_team" | "per-team" | "tag" => Ok(BudgetScope::PerTeam),
+            other if other.starts_with("claim:") => Ok(BudgetScope::PerClaim),
             other => {
-                anyhow::bail!("invalid llm budget scope {other:?} (expected global|key|model|team)")
+                anyhow::bail!(
+                    "invalid llm budget scope {other:?} (expected global|key|model|team|claim:<name>)"
+                )
             }
         }
     }
@@ -86,8 +92,30 @@ impl BudgetScope {
             BudgetScope::PerKey => "key",
             BudgetScope::PerModel => "model",
             BudgetScope::PerTeam => "team",
+            BudgetScope::PerClaim => "claim",
         }
     }
+}
+
+/// The longest a claim's value is kept as a budget's key: a value past it is a claim no run's
+/// identity has, and is cut, so that a token cannot grow the store's keys without end.
+const CLAIM_KEY_MAX: usize = 200;
+
+/// The value of the claim `name` as a budget keys it: a string, number or boolean as written, with
+/// `:` and control characters (which the store key is built with) replaced, cut to
+/// [`CLAIM_KEY_MAX`]. `_none` where the request has no such claim.
+fn claim_key(claims: Option<&serde_json::Value>, name: &str) -> String {
+    let value = match claims.and_then(|c| c.get(name)) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        _ => return "_none".to_string(),
+    };
+    value
+        .chars()
+        .map(|c| if c == ':' || c.is_control() { '_' } else { c })
+        .take(CLAIM_KEY_MAX)
+        .collect()
 }
 
 /// One compiled budget: a `limit` (in `unit`) over `window_secs`, keyed by `scope`.
@@ -95,6 +123,8 @@ impl BudgetScope {
 struct Budget {
     name: String,
     scope: BudgetScope,
+    /// The claim a `claim:<name>` budget is keyed by.
+    claim: Option<String>,
     unit: BudgetUnit,
     limit: u64,
     window_secs: u64,
@@ -110,6 +140,18 @@ impl Budget {
         );
         let unit = BudgetUnit::parse(&cfg.unit)?;
         let scope = BudgetScope::parse(&cfg.scope)?;
+        let claim = match scope {
+            BudgetScope::PerClaim => {
+                let name = cfg.scope.trim()["claim:".len()..].trim();
+                anyhow::ensure!(
+                    !name.is_empty(),
+                    "llm budget {:?} scope names no claim: claim:<name>, e.g. claim:run_id",
+                    cfg.name
+                );
+                Some(name.to_string())
+            }
+            _ => None,
+        };
         let window_secs = crate::config::parse_duration(&cfg.window)
             .with_context(|| format!("llm budget {:?} window", cfg.name))?
             .as_secs();
@@ -135,6 +177,7 @@ impl Budget {
         Ok(Budget {
             name: cfg.name.clone(),
             scope,
+            claim,
             unit,
             limit,
             window_secs,
@@ -145,11 +188,16 @@ impl Budget {
     /// window index (`now / window_secs`) is part of the key, so the budget resets at the window
     /// boundary with no sweeper — the previous window's key simply ages out via TTL.
     fn key(&self, prefix: &str, dims: &Dims, now_secs: u64) -> String {
+        let claimed;
         let dim = match self.scope {
             BudgetScope::Global => "_",
             BudgetScope::PerKey => dims.principal.unwrap_or("_anon"),
             BudgetScope::PerModel => dims.model,
             BudgetScope::PerTeam => dims.team.unwrap_or("_none"),
+            BudgetScope::PerClaim => {
+                claimed = claim_key(dims.claims, self.claim.as_deref().unwrap_or_default());
+                claimed.as_str()
+            }
         };
         let window = now_secs / self.window_secs;
         format!("{prefix}:budget:{}:{dim}:{window}", self.name)
@@ -179,6 +227,8 @@ pub struct Dims<'a> {
     pub model: &'a str,
     /// Team/tag — the `team` scope (chargeback dimension).
     pub team: Option<&'a str>,
+    /// The verified claims of the request's JWT — the `claim:<name>` scope.
+    pub claims: Option<&'a serde_json::Value>,
 }
 
 /// The pure admission decision: may `amount` be reserved against `used` without exceeding `limit`?
@@ -722,7 +772,7 @@ mod tests {
         Dims {
             principal,
             model,
-            team: None,
+            ..Default::default()
         }
     }
 
@@ -968,6 +1018,71 @@ mod tests {
         ));
     }
 
+    /// `claim:run_id` gives each run its own budget, by the verified token's claim: one run
+    /// spending all of its own holds back no other run, and a request with no such claim shares
+    /// the `_none` budget.
+    #[tokio::test]
+    async fn per_claim_scope_is_keyed_by_the_claim_s_value() {
+        let eng = engine(vec![BudgetCfg {
+            name: "per-run".into(),
+            scope: "claim:run_id".into(),
+            unit: "tokens".into(),
+            limit: 100.0,
+            window: "24h".into(),
+        }]);
+        let est = Spend {
+            tokens: 60,
+            cost_micros: 0,
+        };
+        let run = |id: &str| serde_json::json!({ "sub": "repo:acme/widgets", "run_id": id });
+        let (one, two) = (run("run-1"), run("run-2"));
+        let of = |claims| Dims {
+            principal: Some("repo:acme/widgets"),
+            model: "gpt-4o",
+            claims: Some(claims),
+            ..Default::default()
+        };
+        assert!(matches!(eng.reserve(of(&one), est).await, Reserved::Ok(_)));
+        assert!(matches!(
+            eng.reserve(of(&one), est).await,
+            Reserved::Denied(d) if d.scope == BudgetScope::PerClaim
+        ));
+        // The same principal's other run has its own.
+        assert!(matches!(eng.reserve(of(&two), est).await, Reserved::Ok(_)));
+
+        assert_eq!(claim_key(Some(&one), "run_id"), "run-1");
+        assert_eq!(claim_key(Some(&one), "absent"), "_none");
+        assert_eq!(claim_key(None, "run_id"), "_none");
+        assert_eq!(claim_key(Some(&serde_json::json!({ "n": 7 })), "n"), "7");
+        assert_eq!(
+            claim_key(Some(&serde_json::json!({ "b": true })), "b"),
+            "true"
+        );
+        assert_eq!(
+            claim_key(Some(&serde_json::json!({ "o": {} })), "o"),
+            "_none"
+        );
+        assert_eq!(
+            claim_key(Some(&serde_json::json!({ "x": "a:b\nc" })), "x"),
+            "a_b_c"
+        );
+        let long = "x".repeat(500);
+        assert_eq!(
+            claim_key(Some(&serde_json::json!({ "x": long })), "x").len(),
+            CLAIM_KEY_MAX
+        );
+        // A scope that names no claim does not build.
+        assert!(Budget::build(&BudgetCfg {
+            name: "bad".into(),
+            scope: "claim:".into(),
+            unit: "tokens".into(),
+            limit: 1.0,
+            window: "1h".into(),
+        })
+        .is_err());
+        assert_eq!(BudgetScope::PerClaim.label(), "claim");
+    }
+
     #[tokio::test]
     async fn per_team_scope_is_keyed_by_team() {
         let eng = engine(vec![BudgetCfg {
@@ -985,6 +1100,7 @@ mod tests {
             principal: Some("alice"),
             model: "gpt-4o",
             team: Some("team-a"),
+            ..Default::default()
         };
         // team-a fills to 60, then 120 > 100 denies — even though the principal differs, the team
         // key is shared.
@@ -993,6 +1109,7 @@ mod tests {
             principal: Some("bob"),
             model: "gpt-4o",
             team: Some("team-a"),
+            ..Default::default()
         };
         assert!(matches!(
             eng.reserve(team_a_bob, est).await,
@@ -1003,6 +1120,7 @@ mod tests {
             principal: Some("alice"),
             model: "gpt-4o",
             team: Some("team-b"),
+            ..Default::default()
         };
         assert!(matches!(eng.reserve(team_b, est).await, Reserved::Ok(_)));
     }

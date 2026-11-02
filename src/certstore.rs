@@ -111,6 +111,29 @@ pub struct CertInfo {
     pub ari_id: Option<AriId>,
 }
 
+/// The validity of a certificate revocation list: when it was issued, and when the CA promises the
+/// next one. Past `next_update` it is stale: rustls goes on using it, so a revocation the CA has
+/// published since is not applied.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CrlInfo {
+    /// `thisUpdate`, unix seconds.
+    pub this_update: i64,
+    /// `nextUpdate`, unix seconds; `None` when the CRL does not say.
+    pub next_update: Option<i64>,
+}
+
+impl CrlInfo {
+    /// Read the validity out of a DER CRL. Like [`CertInfo::from_der`], not a validator.
+    pub fn from_der(der: &[u8]) -> Result<Self> {
+        der::crl(der)
+    }
+
+    /// Whether `now` is past `next_update`.
+    pub fn stale(&self, now: i64) -> bool {
+        self.next_update.is_some_and(|t| now >= t)
+    }
+}
+
 /// An ACME Renewal Information certificate identifier: the base64url (unpadded) `keyIdentifier` of
 /// the Authority Key Identifier extension and of the DER serial number's content octets, the two
 /// together naming a certificate uniquely within its CA.
@@ -348,99 +371,169 @@ impl CertStore {
     }
 
     /// [`render_metrics`](Self::render_metrics) for this (default) pair plus the extra SNI pairs.
-    /// Each family's `# HELP`/`# TYPE` is written once, as the exposition format requires; the
-    /// default pair's series keep their 0.5.0 labels, and each extra pair adds a series labelled
-    /// `cert="<its first host>"`. Renewal counters are the default pair's only: nothing here
-    /// renews an extra pair.
+    /// See [`render_cert_series`].
     pub fn render_metrics_with(&self, extras: &[SniCert], out: &mut String) {
-        let source = self.source.label();
-        let gauge = |out: &mut String, name: &str, pick: fn(&CertInfo) -> i64| {
-            out.push_str(&format!(
-                "edgeguard_{name}{{source=\"{source}\"}} {}\n",
-                pick(&self.info())
-            ));
-            for c in extras {
-                out.push_str(&format!(
-                    "edgeguard_{name}{{source=\"{}\",cert=\"{}\"}} {}\n",
-                    c.store.source.label(),
-                    escape_label(c.name()),
-                    pick(&c.store.info())
-                ));
-            }
-        };
-        out.push_str(
-            "# HELP edgeguard_tls_cert_not_after_seconds Expiry of the served TLS certificate (unix seconds).\n\
-             # TYPE edgeguard_tls_cert_not_after_seconds gauge\n",
-        );
-        gauge(out, "tls_cert_not_after_seconds", |i| i.not_after);
-        out.push_str(
-            "# HELP edgeguard_tls_cert_not_before_seconds Start of validity of the served TLS certificate (unix seconds).\n\
-             # TYPE edgeguard_tls_cert_not_before_seconds gauge\n",
-        );
-        gauge(out, "tls_cert_not_before_seconds", |i| i.not_before);
-        out.push_str(
-            "# HELP edgeguard_tls_cert_reloads_total Certificate reloads from disk, by outcome.\n\
-             # TYPE edgeguard_tls_cert_reloads_total counter\n",
-        );
-        for (outcome, own, pick) in [
-            (
-                "swapped",
-                &self.reloads_swapped,
-                (|s: &CertStore| &s.reloads_swapped) as fn(&CertStore) -> &AtomicU64,
-            ),
-            ("rejected", &self.reloads_rejected, |s: &CertStore| {
-                &s.reloads_rejected
-            }),
-        ] {
-            out.push_str(&format!(
-                "edgeguard_tls_cert_reloads_total{{outcome=\"{outcome}\"}} {}\n",
-                own.load(Ordering::Relaxed)
-            ));
-            for c in extras {
-                out.push_str(&format!(
-                    "edgeguard_tls_cert_reloads_total{{outcome=\"{outcome}\",cert=\"{}\"}} {}\n",
-                    escape_label(c.name()),
-                    pick(&c.store).load(Ordering::Relaxed)
-                ));
-            }
-        }
-        out.push_str(
-            "# HELP edgeguard_tls_cert_renewals_total Certificate renewal attempts, by source and outcome.\n\
-             # TYPE edgeguard_tls_cert_renewals_total counter\n",
-        );
-        for (s, src) in RENEW_SOURCES.iter().enumerate() {
-            for (o, outcome) in RENEW_OUTCOMES.iter().enumerate() {
-                let v = self.renewals[s * RENEW_OUTCOMES.len() + o].load(Ordering::Relaxed);
-                out.push_str(&format!(
-                    "edgeguard_tls_cert_renewals_total{{source=\"{src}\",outcome=\"{outcome}\"}} {v}\n"
-                ));
-            }
-        }
+        render_cert_series(out, Some(self), extras, &[], &[]);
     }
 
-    /// JSON body for `GET /__edgeguard/tls`.
+    /// JSON body for `GET /__edgeguard/tls`.    /// JSON body for `GET /__edgeguard/tls`.
     pub fn status_json(&self) -> serde_json::Value {
         let info = self.info();
         let now = now_unix();
+        let mut j = self.validity_json();
+        j["renewal_due"] = serde_json::json!(
+            renewal_due(info.not_before, info.not_after, now)
+                || self.ari_renew_at().is_some_and(|t| now >= t)
+        );
+        j["ari_renew_at"] = serde_json::json!(self.ari_renew_at());
+        j["last_renewal"] = serde_json::json!(self.last_renewal());
+        j
+    }
+
+    /// What the certificate is and how long it is good for, without the renewal fields: for a
+    /// certificate nothing here renews, such as a client certificate.
+    pub fn validity_json(&self) -> serde_json::Value {
+        let info = self.info();
         serde_json::json!({
             "source": self.source,
             "cert_path": self.cert_path,
             "serial": info.serial,
             "not_before": info.not_before,
             "not_after": info.not_after,
-            "days_left": info.days_left(now),
+            "days_left": info.days_left(now_unix()),
             "self_issued": info.self_issued,
-            "renewal_due": renewal_due(info.not_before, info.not_after, now)
-                || self.ari_renew_at().is_some_and(|t| now >= t),
-            "ari_renew_at": self.ari_renew_at(),
-            "last_renewal": self.last_renewal(),
         })
+    }
+}
+
+/// The certificate series, every certificate in one set of families, `# HELP`/`# TYPE` written
+/// once each as the exposition format requires:
+///
+/// * the pair the listener serves, with its 0.5.0 labels (no `cert`);
+/// * each extra SNI pair, `cert="<its first host>"`;
+/// * `clients`: each client certificate this edge presents, `cert="client:<cert path>"`;
+/// * `cas`: each CA trusted for client certificates, expiry only, `cert="client-ca:<name>"`.
+///
+/// One expiry family for all of them, so an alert on `edgeguard_tls_cert_not_after_seconds`
+/// covers every certificate the edge depends on with no rule change. Renewal counters are the
+/// listener pair's only: nothing here renews the others. Nothing is written when there is no
+/// certificate at all.
+pub fn render_cert_series(
+    out: &mut String,
+    listener: Option<&CertStore>,
+    sni: &[SniCert],
+    clients: &[(String, Arc<CertStore>)],
+    cas: &[(String, CertInfo)],
+) {
+    if listener.is_none() && clients.is_empty() && cas.is_empty() {
+        return;
+    }
+    let sni = if listener.is_some() { sni } else { &[] };
+    let gauge = |out: &mut String, name: &str, pick: fn(&CertInfo) -> i64| {
+        if let Some(l) = listener {
+            out.push_str(&format!(
+                "edgeguard_{name}{{source=\"{}\"}} {}\n",
+                l.source.label(),
+                pick(&l.info())
+            ));
+        }
+        let stores = sni
+            .iter()
+            .map(|c| (c.name(), &c.store))
+            .chain(clients.iter().map(|(label, store)| (label.as_str(), store)));
+        for (label, store) in stores {
+            out.push_str(&format!(
+                "edgeguard_{name}{{source=\"{}\",cert=\"{}\"}} {}\n",
+                store.source.label(),
+                escape_label(label),
+                pick(&store.info())
+            ));
+        }
+        for (label, info) in cas {
+            out.push_str(&format!(
+                "edgeguard_{name}{{source=\"file\",cert=\"{}\"}} {}\n",
+                escape_label(label),
+                pick(info)
+            ));
+        }
+    };
+    out.push_str(
+        "# HELP edgeguard_tls_cert_not_after_seconds Expiry (unix seconds) of each certificate the \
+         edge serves, presents or trusts for client certificates. The listener's own has no cert \
+         label; the others carry a [[tls.certs]] host, client:<path> or client-ca:<name>.\n\
+         # TYPE edgeguard_tls_cert_not_after_seconds gauge\n",
+    );
+    gauge(out, "tls_cert_not_after_seconds", |i| i.not_after);
+    out.push_str(
+        "# HELP edgeguard_tls_cert_not_before_seconds Start of validity (unix seconds) of the same \
+         certificates.\n\
+         # TYPE edgeguard_tls_cert_not_before_seconds gauge\n",
+    );
+    gauge(out, "tls_cert_not_before_seconds", |i| i.not_before);
+    out.push_str(
+        "# HELP edgeguard_tls_cert_reloads_total Certificate reloads from disk, by outcome.\n\
+         # TYPE edgeguard_tls_cert_reloads_total counter\n",
+    );
+    for (outcome, pick) in [
+        (
+            "swapped",
+            (|s: &CertStore| &s.reloads_swapped) as fn(&CertStore) -> &AtomicU64,
+        ),
+        ("rejected", |s: &CertStore| &s.reloads_rejected),
+    ] {
+        if let Some(l) = listener {
+            out.push_str(&format!(
+                "edgeguard_tls_cert_reloads_total{{outcome=\"{outcome}\"}} {}\n",
+                pick(l).load(Ordering::Relaxed)
+            ));
+        }
+        let stores = sni
+            .iter()
+            .map(|c| (c.name(), &c.store))
+            .chain(clients.iter().map(|(label, store)| (label.as_str(), store)));
+        for (label, store) in stores {
+            out.push_str(&format!(
+                "edgeguard_tls_cert_reloads_total{{outcome=\"{outcome}\",cert=\"{}\"}} {}\n",
+                escape_label(label),
+                pick(store).load(Ordering::Relaxed)
+            ));
+        }
+    }
+    if let Some(l) = listener {
+        out.push_str(
+            "# HELP edgeguard_tls_cert_renewals_total Certificate renewal attempts, by source and outcome.\n\
+             # TYPE edgeguard_tls_cert_renewals_total counter\n",
+        );
+        for (s, src) in RENEW_SOURCES.iter().enumerate() {
+            for (o, outcome) in RENEW_OUTCOMES.iter().enumerate() {
+                let v = l.renewals[s * RENEW_OUTCOMES.len() + o].load(Ordering::Relaxed);
+                out.push_str(&format!(
+                    "edgeguard_tls_cert_renewals_total{{source=\"{src}\",outcome=\"{outcome}\"}} {v}\n"
+                ));
+            }
+        }
     }
 }
 
 impl ResolvesServerCert for CertStore {
     fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(Arc::clone(&self.live.load().key))
+    }
+}
+
+/// The same store as the client certificate EdgeGuard presents to an upstream (`[upstream_tls]`),
+/// so it is loaded, checked, watched and swapped exactly like the listener's own.
+impl rustls::client::ResolvesClientCert for CertStore {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.live.load().key))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 
@@ -625,13 +718,37 @@ impl ResolvesServerCert for SniResolver {
 }
 
 /// Reload `store` whenever its certificate or key file changes. Runs until `shutdown` flips.
+pub async fn watch(store: Arc<CertStore>, shutdown: tokio_watch::Receiver<bool>) -> Result<()> {
+    let paths = vec![store.cert_path().to_string(), store.key_path().to_string()];
+    let cert = store.cert_path().to_string();
+    let reload = move || {
+        if let Err(e) = store.reload() {
+            warn!(
+                error = format!("{e:#}"),
+                "certificate files changed but do not load; still serving the previous certificate"
+            );
+        }
+    };
+    let watching = watch_paths(paths, reload, shutdown);
+    info!(cert = %cert, "certificate reload on change enabled");
+    watching.await
+}
+
+/// Call `on_change` whenever one of `paths` may have changed, until `shutdown` flips.
 ///
 /// Watches the parent *directories*, not the files, for the same reason config hot-reload does:
 /// atomic writers replace a file by renaming over it, which drops a watch on the old inode. It
 /// does not filter by file name either — a Kubernetes secret volume updates by flipping a `..data`
-/// symlink, so the events name `..data`, not `tls.crt`. Reacting to every change in the directory
-/// is safe because a reload of an unchanged pair is a no-op.
-pub async fn watch(store: Arc<CertStore>, mut shutdown: tokio_watch::Receiver<bool>) -> Result<()> {
+/// symlink, so the events name `..data`, not `tls.crt`. So `on_change` must be cheap and harmless
+/// when nothing it reads has changed, as a reload that compares before swapping is.
+pub async fn watch_paths<F>(
+    paths: Vec<String>,
+    on_change: F,
+    mut shutdown: tokio_watch::Receiver<bool>,
+) -> Result<()>
+where
+    F: Fn() + Send,
+{
     let (tx, mut rx) = mpsc::channel::<()>(8);
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| match res {
         Ok(event) if triggers_reload(&event.kind) => {
@@ -642,7 +759,7 @@ pub async fn watch(store: Arc<CertStore>, mut shutdown: tokio_watch::Receiver<bo
     })
     .context("creating certificate watcher")?;
 
-    let mut dirs: Vec<PathBuf> = [store.cert_path(), store.key_path()]
+    let mut dirs: Vec<PathBuf> = paths
         .iter()
         .map(|p| {
             Path::new(p)
@@ -652,13 +769,13 @@ pub async fn watch(store: Arc<CertStore>, mut shutdown: tokio_watch::Receiver<bo
                 .unwrap_or_else(|| PathBuf::from("."))
         })
         .collect();
+    dirs.sort();
     dirs.dedup();
     for dir in &dirs {
         watcher
             .watch(dir, RecursiveMode::NonRecursive)
             .with_context(|| format!("watching {}", dir.display()))?;
     }
-    info!(cert = %store.cert_path(), "certificate reload on change enabled");
 
     loop {
         tokio::select! {
@@ -671,13 +788,7 @@ pub async fn watch(store: Arc<CertStore>, mut shutdown: tokio_watch::Receiver<bo
                 // key separately); settle before reading.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 while rx.try_recv().is_ok() {}
-                match store.reload() {
-                    Ok(_) => {}
-                    Err(e) => warn!(
-                        error = format!("{e:#}"),
-                        "certificate files changed but do not load; still serving the previous certificate"
-                    ),
-                }
+                on_change();
             }
         }
     }
@@ -971,20 +1082,44 @@ fn jitter_secs(max: u64) -> u64 {
     (uuid::Uuid::new_v4().as_u128() % u128::from(max)) as u64
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
-/// Minimal DER reading for an X.509 certificate: the validity window, the serial, and whether
-/// issuer equals subject. Not a validator — rustls and the client do the validating; this only
-/// reads fields out of a certificate the TLS stack has already accepted as loadable.
+/// The names a certificate is issued to: its subject's common name and its subject alternative
+/// names, as read by the DER walker below. Used for client certificates, whose names are the
+/// client's identity (`[tls.client_auth]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CertNames {
+    /// The subject's first common name (CN), when it is text.
+    pub common_name: Option<String>,
+    /// `dNSName` alternative names, lowercased (DNS names compare case-insensitively).
+    pub dns: Vec<String>,
+    /// `uniformResourceIdentifier` alternative names, as written (a SPIFFE ID is one of these).
+    pub uris: Vec<String>,
+    /// `rfc822Name` (email) alternative names, lowercased.
+    pub emails: Vec<String>,
+}
+
+impl CertNames {
+    /// Read the names out of a DER certificate. Like [`CertInfo::from_der`], this is not a
+    /// validator: call it on a certificate rustls has already verified.
+    pub fn from_der(der: &[u8]) -> Result<Self> {
+        der::names(der)
+    }
+}
+
+/// Minimal DER reading for an X.509 certificate: the validity window, the serial, whether
+/// issuer equals subject, and the names it is issued to. Not a validator — rustls and the client
+/// do the validating; this only reads fields out of a certificate the TLS stack has already
+/// accepted as loadable.
 mod der {
     use anyhow::{bail, ensure, Context, Result};
 
-    use super::CertInfo;
+    use super::{CertInfo, CertNames};
 
     const SEQUENCE: u8 = 0x30;
     const INTEGER: u8 = 0x02;
@@ -1074,22 +1209,61 @@ mod der {
         })
     }
 
+    /// `thisUpdate` and `nextUpdate` of a CertificateList (RFC 5280 §5.1).
+    pub(super) fn crl(der: &[u8]) -> Result<super::CrlInfo> {
+        let list = expect(der, SEQUENCE, "CertificateList")?;
+        let tbs = expect(list.value, SEQUENCE, "TBSCertList")?;
+        let mut cur = tbs.value;
+        // `version` is optional, and a bare INTEGER here (v2 CRLs carry it).
+        if cur.first() == Some(&INTEGER) {
+            cur = read(cur)?.rest;
+        }
+        let sig = expect(cur, SEQUENCE, "signature AlgorithmIdentifier")?;
+        let issuer = expect(sig.rest, SEQUENCE, "issuer")?;
+        let this = read(issuer.rest).context("reading thisUpdate")?;
+        let next_update = match read(this.rest) {
+            Ok(next) if matches!(next.tag, UTC_TIME | GENERALIZED_TIME) => {
+                Some(time_to_unix(next.tag, next.value)?)
+            }
+            _ => None,
+        };
+        Ok(super::CrlInfo {
+            this_update: time_to_unix(this.tag, this.value)?,
+            next_update,
+        })
+    }
+
     fn b64url(bytes: &[u8]) -> String {
         use base64::Engine;
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
+    const OID: u8 = 0x06;
+
     /// The `keyIdentifier` octets of the Authority Key Identifier extension, reading from just after
     /// `subject` (so from `subjectPublicKeyInfo`). `None` when the certificate has no extensions,
     /// no AKI, or an AKI without a key identifier.
     fn authority_key_id(after_subject: &[u8]) -> Result<Option<&[u8]>> {
-        const EXPLICIT_3: u8 = 0xa3;
-        const OID: u8 = 0x06;
-        const BOOLEAN: u8 = 0x01;
-        const OCTET_STRING: u8 = 0x04;
         const IMPLICIT_0: u8 = 0x80;
         // id-ce-authorityKeyIdentifier, 2.5.29.35.
         const AKI_OID: &[u8] = &[0x55, 0x1d, 0x23];
+
+        let Some(value) = extension(after_subject, AKI_OID)? else {
+            return Ok(None);
+        };
+        let aki = expect(value, SEQUENCE, "AuthorityKeyIdentifier")?;
+        Ok(match aki.value.first() {
+            Some(&IMPLICIT_0) => Some(read(aki.value)?.value),
+            _ => None,
+        })
+    }
+
+    /// The `extnValue` contents of the extension with object identifier `oid`, reading from just
+    /// after `subject`. `None` when the certificate has no extensions or not that one.
+    fn extension<'a>(after_subject: &'a [u8], oid: &[u8]) -> Result<Option<&'a [u8]>> {
+        const EXPLICIT_3: u8 = 0xa3;
+        const BOOLEAN: u8 = 0x01;
+        const OCTET_STRING: u8 = 0x04;
 
         let spki = expect(after_subject, SEQUENCE, "subjectPublicKeyInfo")?;
         let mut cur = spki.rest;
@@ -1105,22 +1279,99 @@ mod der {
         while !exts.is_empty() {
             let ext = expect(exts, SEQUENCE, "extension")?;
             exts = ext.rest;
-            let oid = expect(ext.value, OID, "extnID")?;
-            if oid.value != AKI_OID {
+            let id = expect(ext.value, OID, "extnID")?;
+            if id.value != oid {
                 continue;
             }
-            let mut rest = oid.rest;
+            let mut rest = id.rest;
             if rest.first() == Some(&BOOLEAN) {
                 rest = read(rest)?.rest;
             }
-            let value = expect(rest, OCTET_STRING, "extnValue")?;
-            let aki = expect(value.value, SEQUENCE, "AuthorityKeyIdentifier")?;
-            return Ok(match aki.value.first() {
-                Some(&IMPLICIT_0) => Some(read(aki.value)?.value),
-                _ => None,
-            });
+            return Ok(Some(expect(rest, OCTET_STRING, "extnValue")?.value));
         }
         Ok(None)
+    }
+
+    /// The subject's common name and the subject alternative names. See [`CertNames`].
+    pub(super) fn names(der: &[u8]) -> Result<CertNames> {
+        const SET: u8 = 0x31;
+        // id-at-commonName, 2.5.4.3.
+        const CN_OID: &[u8] = &[0x55, 0x04, 0x03];
+        // id-ce-subjectAltName, 2.5.29.17.
+        const SAN_OID: &[u8] = &[0x55, 0x1d, 0x11];
+        // GeneralName choices, context-specific and implicitly tagged.
+        const RFC822_NAME: u8 = 0x81;
+        const DNS_NAME: u8 = 0x82;
+        const URI: u8 = 0x86;
+
+        let cert = expect(der, SEQUENCE, "Certificate")?;
+        let tbs = expect(cert.value, SEQUENCE, "TBSCertificate")?;
+        let mut cur = tbs.value;
+        if cur.first() == Some(&EXPLICIT_0) {
+            cur = read(cur)?.rest;
+        }
+        let serial = expect(cur, INTEGER, "serialNumber")?;
+        let sig = expect(serial.rest, SEQUENCE, "signature AlgorithmIdentifier")?;
+        let issuer = expect(sig.rest, SEQUENCE, "issuer")?;
+        let validity = expect(issuer.rest, SEQUENCE, "validity")?;
+        let subject = expect(validity.rest, SEQUENCE, "subject")?;
+
+        let mut names = CertNames::default();
+
+        // Name ::= SEQUENCE OF SET OF SEQUENCE { type OID, value ANY }.
+        let mut rdns = subject.value;
+        'rdns: while !rdns.is_empty() {
+            let rdn = expect(rdns, SET, "RelativeDistinguishedName")?;
+            rdns = rdn.rest;
+            let mut atvs = rdn.value;
+            while !atvs.is_empty() {
+                let atv = expect(atvs, SEQUENCE, "AttributeTypeAndValue")?;
+                atvs = atv.rest;
+                let kind = expect(atv.value, OID, "attribute type")?;
+                if kind.value == CN_OID {
+                    names.common_name = text(read(kind.rest)?);
+                    if names.common_name.is_some() {
+                        break 'rdns;
+                    }
+                }
+            }
+        }
+
+        if let Some(san) = extension(subject.rest, SAN_OID)? {
+            let mut general_names = expect(san, SEQUENCE, "GeneralNames")?.value;
+            while !general_names.is_empty() {
+                let name = read(general_names)?;
+                general_names = name.rest;
+                // IA5String contents: ASCII. Anything else is not a name this reads.
+                let Some(value) = std::str::from_utf8(name.value)
+                    .ok()
+                    .filter(|v| v.is_ascii() && !v.is_empty())
+                else {
+                    continue;
+                };
+                match name.tag {
+                    DNS_NAME => names.dns.push(value.to_ascii_lowercase()),
+                    URI => names.uris.push(value.to_string()),
+                    RFC822_NAME => names.emails.push(value.to_ascii_lowercase()),
+                    _ => {}
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// A directory-string value as text: UTF8String, PrintableString or IA5String.
+    fn text(value: Tlv<'_>) -> Option<String> {
+        const UTF8_STRING: u8 = 0x0c;
+        const PRINTABLE_STRING: u8 = 0x13;
+        const IA5_STRING: u8 = 0x16;
+        match value.tag {
+            UTF8_STRING | PRINTABLE_STRING | IA5_STRING => std::str::from_utf8(value.value)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            _ => None,
+        }
     }
 
     /// `UTCTime` (`YYMMDDHHMMSSZ`) or `GeneralizedTime` (`YYYYMMDDHHMMSSZ`) to unix seconds. RFC

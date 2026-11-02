@@ -89,6 +89,209 @@ groups:
           summary: "EdgeGuard: rate-limiter store errors"
           description: "The distributed limiter is returning 503 (store unreachable) for 5m+. Check Redis connectivity; with fail_open=false this is rejecting traffic."
 
+  # Per-upstream, per-route and per-listener health. Grouped by what is failing, so the alert says
+  # which upstream or route rather than "something behind this edge".
+  - name: edgeguard-api
+    rules:
+      # The minimum-traffic guard keeps a handful of failures on a quiet upstream (1 in 3 is 33%)
+      # from paging; EdgeGuardUpstreamNotAnswering covers a quiet upstream that is down.
+      - alert: EdgeGuardUpstreamErrorRatio
+        expr: |
+          (
+            sum by (upstream) (rate(edgeguard_upstream_requests_total{result!="ok"}[5m]))
+            /
+            sum by (upstream) (rate(edgeguard_upstream_requests_total[5m]))
+          ) > 0.05
+          and
+          sum by (upstream) (rate(edgeguard_upstream_requests_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Upstream {{ $labels.upstream }}: more than 5% of requests failing"
+          description: >-
+            More than 5% of the requests forwarded to {{ $labels.upstream }} over the last 5m
+            failed or were answered 5xx. edgeguard_upstream_requests_total by result says how:
+            connect_error is down or unreachable, tls_error a CA or client-certificate mismatch,
+            timeout slow past validation.upstream_timeout, reset a crash mid-response, http_5xx
+            the upstream's own error.
+
+      - alert: EdgeGuardUpstreamNotAnswering
+        # Requests are being sent and none is answered, at any traffic level. Not a pool's target:
+        # its requests go to the next one, and EdgeGuardUpstreamTargetOut says so.
+        expr: |
+          (
+            sum by (upstream) (rate(edgeguard_upstream_requests_total{result!~"ok|http_5xx"}[5m])) > 0
+            unless
+            sum by (upstream) (rate(edgeguard_upstream_requests_total{result=~"ok|http_5xx"}[5m])) > 0
+          )
+          unless on (upstream)
+          group by (upstream) (edgeguard_upstream_in_rotation)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Upstream {{ $labels.upstream }} is not answering"
+          description: >-
+            Every request forwarded to {{ $labels.upstream }} for 5m has failed without an
+            answer. Clients are getting 502 or 504. Check that it is running and reachable from
+            the edge; the result label on edgeguard_upstream_requests_total says whether the
+            connection, the TLS handshake or the response failed.
+
+      # A pool with no target in rotation. Requests still try each target in turn, but the edge
+      # has nothing it believes will answer, and /__edgeguard/ready fails for a pool serving `/`.
+      - alert: EdgeGuardUpstreamPoolDown
+        expr: max by (instance, route) (edgeguard_upstream_in_rotation) == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Every target of route {{ $labels.route }} on {{ $labels.instance }} is out of rotation"
+          description: >-
+            For 1m no target of the {{ $labels.route }} pool has passed its health check or
+            accepted a connection. Requests still try each in turn, and most likely fail with 502.
+            edgeguard_upstream_health_checks_total and the edge's log say why each one is out.
+
+      # One target out while another serves: failover is working, but the pool has lost its
+      # margin, and the standby taking the traffic may cost more or be farther away.
+      - alert: EdgeGuardUpstreamTargetOut
+        expr: |
+          edgeguard_upstream_in_rotation == 0
+          unless on (instance, route)
+          (max by (instance, route) (edgeguard_upstream_in_rotation) == 0)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Target {{ $labels.upstream }} of route {{ $labels.route }} on {{ $labels.instance }} is out of rotation"
+          description: >-
+            For 5m {{ $labels.upstream }} has been out of the {{ $labels.route }} pool: failing
+            its health check, or ejected by requests that could not connect to it or that it
+            answered 5xx. The pool's other targets are taking its requests.
+
+      # Ejected, back after eject_for, ejected again: a target that keeps failing may never stay
+      # out the 5m EdgeGuardUpstreamTargetOut waits for, and each return costs requests.
+      - alert: EdgeGuardUpstreamTargetFlapping
+        expr: sum by (instance, route, upstream) (increase(edgeguard_upstream_ejections_total[15m])) >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Target {{ $labels.upstream }} of route {{ $labels.route }} on {{ $labels.instance }} keeps being ejected"
+          description: >-
+            {{ $labels.upstream }} has been taken out of the {{ $labels.route }} pool at least 3
+            times in 15m, each time returning after eject_for and failing again. The reason label
+            on edgeguard_upstream_ejections_total says why: connect_error (requests could not
+            connect) or http_5xx (it answered 5xx eject_after_5xx times in a row).
+            GET /__edgeguard/upstreams shows the last error.
+
+      # Against the same hour a day earlier, not the last few hours: a p99 moves as soon as 1% of
+      # its window is slow, so a recent baseline would absorb a regression within minutes and the
+      # alert could never fire. No alert in a route's first day.
+      - alert: EdgeGuardRouteLatencyRegression
+        expr: |
+          (
+            histogram_quantile(0.99, sum by (route, le) (rate(edgeguard_route_request_duration_seconds_bucket[10m])))
+            >
+            2 * histogram_quantile(0.99, sum by (route, le) (rate(edgeguard_route_request_duration_seconds_bucket[1h] offset 1d)))
+          )
+          and
+          histogram_quantile(0.99, sum by (route, le) (rate(edgeguard_route_request_duration_seconds_bucket[10m]))) > 0.25
+          and
+          sum by (route) (rate(edgeguard_route_requests_total[10m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Route {{ $labels.route }}: p99 latency more than doubled since yesterday"
+          description: >-
+            The 99th-percentile time to response headers on route {{ $labels.route }} is over
+            250ms and more than twice what it was at this hour yesterday. Compare
+            edgeguard_upstream_duration_seconds for the upstream behind it (the upstream got
+            slower) with edgeguard_edge_overhead_seconds (the edge did).
+
+      - alert: EdgeGuardConnectionsNearCap
+        # Only listeners with server.max_connections set export edgeguard_connections_max.
+        expr: edgeguard_connections_open / edgeguard_connections_max > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Listener {{ $labels.listener }} on {{ $labels.instance }} is above 80% of its connection cap"
+          description: >-
+            Open connections on the {{ $labels.listener }} listener have been above 80% of
+            server.max_connections for 5m. Past the cap, new connections are closed at accept
+            (edgeguard_connections_rejected_total). Raise the cap, add replicas, or find what is
+            holding connections open.
+
+      - alert: EdgeGuardClientCertRejectSpike
+        # Refused handshakes never reach the access log, so this is the only place they show.
+        expr: |
+          sum by (instance, listener) (rate(edgeguard_tls_handshake_failures_total{reason="client_cert"}[5m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Listener {{ $labels.listener }} on {{ $labels.instance }} is refusing many client certificates"
+          description: >-
+            More than one TLS handshake every 5s has been refused for its client certificate
+            for 10m: none presented, an unknown CA, revoked or expired. Usual causes are client
+            certificates expiring together, clients moved to a CA missing from
+            tls.client_auth.ca_path, a revocation, or a scan.
+
+      # [trusted_client_cert_header] refusing certificates. Per result, because each has its own
+      # cause; a request whose certificate is refused carries none, so under auth.mode = "mtls" it
+      # is a 401.
+      - alert: EdgeGuardClientCertHeaderRefused
+        expr: |
+          sum by (instance, result) (rate(edgeguard_client_cert_header_total{result!="accepted"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} is refusing forwarded client certificates ({{ $labels.result }})"
+          description: >-
+            More than one request every 10s for 10m had its trusted_client_cert_header refused
+            ({{ $labels.result }}), so it carried no client certificate. untrusted_peer: the header
+            came from outside trusted_proxies, either a client forging it or a load balancer whose
+            addresses are no longer listed. invalid: the balancer writes a different format than
+            format says. unverified: the certificate failed the header's ca_path or crl_paths.
+
+      # server.proxy_protocol closing connections. untrusted is the outage case: every client of a
+      # balancer outside proxy_protocol_trusted gets no answer.
+      - alert: EdgeGuardProxyProtocolRefused
+        expr: |
+          sum by (instance, listener, result) (rate(edgeguard_proxy_protocol_total{result=~"untrusted|invalid"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Listener {{ $labels.listener }} on {{ $labels.instance }} is closing connections for their PROXY header ({{ $labels.result }})"
+          description: >-
+            More than one connection every 10s for 5m was closed for its PROXY protocol header
+            ({{ $labels.result }}), and the clients behind it got no answer. untrusted: the header
+            came from outside server.proxy_protocol_trusted, because the balancer's addresses
+            changed or it preserves client IPs, so the peer is the client. invalid: what the peer
+            sends is not a PROXY header.
+
+      # The trusted balancer connecting without headers and never with them. Health checks that
+      # send none (HAProxy without check-send-proxy) do not fire it while traffic carries headers.
+      - alert: EdgeGuardProxyProtocolMissing
+        expr: |
+          sum by (instance, listener) (rate(edgeguard_proxy_protocol_total{result="missing"}[15m])) > 0
+          unless
+          sum by (instance, listener) (rate(edgeguard_proxy_protocol_total{result="proxied"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The balancer in front of listener {{ $labels.listener }} on {{ $labels.instance }} sends no PROXY headers"
+          description: >-
+            For 15m, connections from server.proxy_protocol_trusted arrived without a PROXY
+            protocol header and none with one, so every client is served as the balancer: one
+            shared rate limit, and access rules and logs that see the balancer's address. Enable
+            proxy protocol on the balancer (the NLB target group, HAProxy's server line).
+
   # ACME issuance budget. The point of these is to fire while there is still time to act: a CA
   # rate limit, once hit, is a week-long wait with no certificate — there is no fast remedy, so an
   # alert at the moment of exhaustion is an alert about an outage that has already started.
@@ -153,6 +356,20 @@ groups:
           description: >-
             Clients will refuse this edge when the certificate expires. Replace the certificate
             files now; the running proxy picks them up without a restart.
+
+      # A CRL past its nextUpdate is not refused: rustls goes on checking client certificates
+      # against it, so a certificate the CA has revoked since keeps connecting.
+      - alert: EdgeGuardCrlStale
+        expr: edgeguard_tls_crl_next_update_seconds < time()
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CRL {{ $labels.crl }} on {{ $labels.instance }} is past its next update"
+          description: >-
+            The CA has published a newer revocation list than {{ $labels.crl }}. The edge goes on
+            using this one, so client certificates revoked since are still accepted. Fetch the
+            current CRL into the same file; it is reloaded without a restart.
 
       - alert: EdgeGuardCertRenewalFailing
         # Matched on source too: every edge exports all (source, outcome) pairs, so an ACME edge

@@ -434,6 +434,7 @@ async fn per_route_rate_limit_overrides_global() {
             path: "/api/".into(),
             rate: "1/min".into(),
             burst: 1,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -790,6 +791,34 @@ async fn readiness_reflects_upstream_reachability() {
     let proxy_down = spawn_proxy(base_cfg(format!("http://{}", dead_addr().await))).await;
     let r = send(proxy_down, "GET", "/__edgeguard/ready", None, Bytes::new()).await;
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn readiness_fails_while_draining_and_health_stays_ok() {
+    // A load balancer must stop sending new traffic the moment shutdown begins, while liveness
+    // stays green so the platform does not kill the process mid-drain.
+    let up = spawn_upstream().await;
+    let state = build_state(Arc::new(base_cfg(format!("http://{up}")))).unwrap();
+    let draining = state.draining.clone();
+    let app = build_router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let r = send(proxy, "GET", "/__edgeguard/ready", None, Bytes::new()).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    draining.store(true, std::sync::atomic::Ordering::Release);
+    let r = send(proxy, "GET", "/__edgeguard/ready", None, Bytes::new()).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    let r = send(proxy, "GET", "/__edgeguard/health", None, Bytes::new()).await;
+    assert_eq!(r.status, StatusCode::OK);
 }
 
 /// Baseline for the WAF tests: no auth (so an attack-shaped request reaches the WAF step),
@@ -1603,10 +1632,12 @@ async fn path_based_upstream_routing() {
         UpstreamRoute {
             path: "/api/".into(),
             target: format!("http://{api_up}"),
+            ..Default::default()
         },
         UpstreamRoute {
             path: "/api/admin/".into(),
             target: format!("http://{admin_up}"),
+            ..Default::default()
         },
     ];
     let addr = spawn_proxy(cfg).await;
@@ -2020,6 +2051,7 @@ fn vault_cfg(upstream: String, allowed_models: Vec<String>) -> Config {
         provider_key: "sk-real-PROVIDER".into(),
         allowed_models,
         label: "team-a".into(),
+        ..Default::default()
     }];
     cfg
 }
@@ -2049,6 +2081,132 @@ async fn vault_swaps_virtual_key_for_provider_key_upstream() {
         "{}",
         m.body
     );
+}
+
+/// A CI run's identity as the credential (gateway L2, dagron-ci plan 14.4): the proxy verifies
+/// the run's OIDC token (`auth.mode = "jwt"`), and the vault entry its claims match has its
+/// provider key injected — the job holds no key, and the token never reaches the provider.
+fn workload_cfg(upstream: String) -> Config {
+    let mut cfg = llm_cfg(upstream, false);
+    cfg.auth = AuthCfg {
+        mode: "jwt".into(),
+        jwt: JwtCfg {
+            algorithm: "HS256".into(),
+            secret: "dagron-test-issuer".into(),
+            issuer: "https://dagron.example.com".into(),
+            audience: "eggrd".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.llm.keys = vec![KeyEntryCfg {
+        claims: [
+            (
+                "trust".to_string(),
+                vec!["agent".to_string(), "trusted".to_string()],
+            ),
+            ("repository".to_string(), vec!["acme/*".to_string()]),
+        ]
+        .into_iter()
+        .collect(),
+        provider_key: "sk-real-AGENTS".into(),
+        allowed_models: vec!["gpt-4o".into()],
+        label: "dagron-runs".into(),
+        ..Default::default()
+    }];
+    cfg
+}
+
+fn run_token(trust: &str, repository: &str, run_id: &str) -> String {
+    sign_hs256(
+        "dagron-test-issuer",
+        json!({
+            "iss": "https://dagron.example.com", "aud": "eggrd", "exp": far_future(),
+            "sub": format!("repo:{repository}:ref:refs/heads/main"),
+            "trust": trust, "repository": repository, "run_id": run_id,
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_run_s_oidc_token_chooses_the_provider_key_by_its_claims() {
+    let up = spawn_llm_echo_auth_upstream().await;
+    let proxy = spawn_proxy(workload_cfg(format!("http://{up}"))).await;
+    let ask = |token: String, model: &'static str| async move {
+        send(
+            proxy,
+            "POST",
+            "/v1/chat/completions",
+            Some(&format!("Bearer {token}")),
+            Bytes::from(format!(r#"{{"model":"{model}","messages":[]}}"#)),
+        )
+        .await
+    };
+
+    let token = run_token("agent", "acme/widgets", "run-1");
+    let r = ask(token.clone(), "gpt-4o").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains("Bearer sk-real-AGENTS"), "{}", r.body);
+    assert!(
+        !r.body.contains(&token),
+        "the token never reaches the provider: {}",
+        r.body
+    );
+
+    // Claims that match no entry are given no key; the entry's egress list still holds; a token
+    // that does not verify is refused at the gate.
+    assert_eq!(
+        ask(run_token("untrusted", "acme/widgets", "run-1"), "gpt-4o")
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        ask(run_token("agent", "other/x", "run-1"), "gpt-4o")
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(ask(token, "o1-preview").await.status, StatusCode::FORBIDDEN);
+    let forged = sign_hs256(
+        "someone-else",
+        json!({ "iss": "https://dagron.example.com", "aud": "eggrd", "exp": far_future(), "trust": "agent", "repository": "acme/widgets" }),
+    );
+    assert_eq!(ask(forged, "gpt-4o").await.status, StatusCode::UNAUTHORIZED);
+}
+
+/// `claim:run_id` holds each run to its own budget: the run that spent its own is refused, and
+/// another run of the same repository is not.
+#[tokio::test]
+async fn each_run_is_held_to_its_own_budget() {
+    let up = spawn_llm_upstream().await;
+    let mut cfg = workload_cfg(format!("http://{up}"));
+    cfg.llm.budgets = vec![BudgetCfg {
+        name: "per-run".into(),
+        scope: "claim:run_id".into(),
+        unit: "tokens".into(),
+        limit: 50.0,
+        window: "24h".into(),
+    }];
+    let proxy = spawn_proxy(cfg).await;
+    let ask = |run_id: &'static str| async move {
+        send(
+            proxy,
+            "POST",
+            "/v1/chat/completions",
+            Some(&format!(
+                "Bearer {}",
+                run_token("agent", "acme/widgets", run_id)
+            )),
+            Bytes::from_static(br#"{"model":"gpt-4o","max_tokens":10,"messages":[]}"#),
+        )
+        .await
+        .status
+    };
+    // Each request is reconciled to the 33 tokens the upstream says it used.
+    assert_eq!(ask("run-1").await, StatusCode::OK);
+    assert_eq!(ask("run-1").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(ask("run-2").await, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -2700,7 +2858,8 @@ async fn budget_alert_posts_a_slack_message_once_per_crossing() {
         webhook_url: format!("http://{webhook}/v1/traces"),
         budget_consumed_threshold: 0.9,
         ..Default::default()
-    });
+    })
+    .unwrap();
 
     // First crossing into the alert zone fires; staying over does not re-fire (no spam).
     alerts.fire_budget_alert("monthly", 0.95);

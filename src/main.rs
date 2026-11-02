@@ -29,7 +29,8 @@ use edgeguard::otlp_metrics;
 use edgeguard::telemetry;
 use edgeguard::{
     acme, build_admin_router, build_public_router, build_router, build_runtime, build_state,
-    certstore, cp, doctor, hash_password, reload, scaffold, selfsigned, supervisor, tls,
+    certstore, client_auth, cp, doctor, hash_password, reload, scaffold, selfsigned, serve,
+    supervisor, tls,
 };
 
 /// The selected mode of operation. `serve` is the default; `hash` and `generate` are standalone
@@ -445,34 +446,121 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Arc::new(Config::load(config.as_deref())?);
+    // Listener settings are read once, here, so a bad duration or PROXY protocol trust list fails
+    // before anything starts.
+    let serve_opts = serve::ServeOpts::from_cfg(&cfg.server)?;
+    if serve_opts.proxy_protocol.is_some() {
+        info!(trusted = ?cfg.server.proxy_protocol_trusted, "reading PROXY protocol headers on the public and redirect listeners");
+    }
+    // Likewise the client-certificate verifier: a CA bundle or CRL that does not load, or client
+    // authentication asked for without TLS, fails here.
+    let client_auth = client_auth::ClientAuth::from_cfg(&cfg.tls)?;
 
+    // Shutdown runs in two phases. `shutdown` flips on the signal: the public listeners stop
+    // taking new work and drain, and the background loops stop (flushing what they hold). `stop`
+    // flips once the public listener has drained: only then are the wrapped app and the admin
+    // listener stopped, so a request still in flight can reach the app, and `/ready` keeps
+    // answering `503` for the whole drain.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     // Start the wrapped app (co-process mode) if requested.
-    if let Some(cmd) = wrap.clone() {
+    let supervisor_task = wrap.clone().map(|cmd| {
         let app_port = cfg.server.app_port;
-        let rx = shutdown_rx.clone();
+        let rx = stop_rx.clone();
         tokio::spawn(async move {
             supervisor::run(cmd, app_port, rx).await;
-        });
-    }
+        })
+    });
 
     // Best-effort readiness wait, but only when the upstream is local (a wrapped child or one
-    // derived from APP_PORT). For an external UPSTREAM there's no local port to wait on.
-    if wrap.is_some() || cfg.server.upstream.is_empty() {
+    // derived from APP_PORT). For an external UPSTREAM there's no local port to wait on, and with
+    // a `/` route (a pool, say) the default upstream takes no requests at all.
+    let root_route = cfg.upstreams.iter().any(|u| u.path == "/");
+    if wrap.is_some() || (cfg.server.upstream.is_empty() && !root_route) {
         wait_for_upstream(cfg.server.app_port, Duration::from_secs(30)).await;
     }
 
+    // Every client certificate this edge presents — to upstreams, the control plane, collectors,
+    // the JWKS endpoint — is watched and re-read like the listener's own, and warned about as it
+    // nears expiry: each file pair once, from the moment the first client loads it, including
+    // clients a reload builds later.
+    {
+        let tls = cfg.tls.clone();
+        let rx = shutdown_rx.clone();
+        let runtime = tokio::runtime::Handle::current();
+        edgeguard::outbound::watch_identities(move |store| {
+            watch_client_identity(store, &tls, &rx, &runtime)
+        });
+    }
+
+    if !cfg.outbound.is_empty() {
+        let o = &cfg.outbound;
+        let used_by: Vec<String> = edgeguard::outbound::inheritors(&cfg)
+            .into_iter()
+            .map(|(section, keys)| format!("{section} ({})", keys.join(", ")))
+            .collect();
+        info!(
+            extra_ca_path = %o.extra_ca_path,
+            client_cert_path = %o.client_cert_path,
+            proxy = %edgeguard::outbound::redact_proxy(&o.proxy),
+            used_by = ?used_by,
+            "[outbound] defaults for the edge's own clients"
+        );
+    }
     let state = build_state(cfg.clone())?;
-    // Keep a handle to the hot-swappable runtime for the reload watcher.
-    let runtime = state.runtime.clone();
+    // This is the registry `/__edgeguard/metrics` and `/__edgeguard/tls` serve: it reports the
+    // process's client certificates.
+    state.metrics.report_client_certs();
+    // `[trusted_client_cert_header]` with `ca_path`: its CA bundle and CRLs reload like the
+    // listener's, so a revocation applies without a restart.
+    if let Some(verifier) = state.client_cert_header.as_ref().and_then(|h| h.verifier()) {
+        tokio::spawn(client_auth::watch(
+            Arc::clone(verifier),
+            shutdown_rx.clone(),
+        ));
+    }
+    if let Some(header) = &state.client_cert_header {
+        info!(header = %header.name(), trusted_proxies = ?header.trusted_proxies(), trusted_proxy_names = ?header.trusted_proxy_names(), verify = header.verifier().is_some(), "reading client certificates from a load balancer header");
+    }
+    // The one place the runtime is rebuilt from: the config file and, in managed mode, the
+    // control-plane policy on top. The reload watcher and the policy poller both go through it.
+    let policy = edgeguard::policy::Policy::new(
+        cfg.clone(),
+        state.runtime.clone(),
+        state.policy_pending.clone(),
+    )?;
+    // Managed mode: start on the last policy the control plane gave this edge, if one was kept,
+    // so a restart while the control plane is unreachable does not fall back to the file alone.
+    // Done before the listener binds, so no request is served under the file's policy first.
+    let cached_policy = policy.restore_cached();
+    if let (Some(client), Some(cached)) = (&state.cp, &cached_policy) {
+        client.set_policy_etag(&cached.etag);
+    }
+    if policy.pending() {
+        warn!("control_plane.boot_without_policy = \"refuse\" and no cached policy: answering 503 until the control plane provides one");
+    }
+    // Upstream pools: their active health checks, for whichever runtime is current.
+    for pool in state.runtime.load().pools().filter(|p| p.is_pool()) {
+        let tier = |backup: bool| -> Vec<String> {
+            pool.targets
+                .iter()
+                .filter(|t| t.backup == backup)
+                .map(|t| match t.weight {
+                    1 => t.label.clone(),
+                    w => format!("{} (weight {w})", t.label),
+                })
+                .collect()
+        };
+        info!(route = %pool.route, targets = ?tier(false), backup = ?tier(true), balance = ?pool.balance, hash_on = ?pool.hash_on.as_ref().map(|h| h.label()), sticky_cookie = ?pool.sticky_cookie_name(), health_check = ?pool.health_check.as_ref().map(|h| h.label()), "upstream pool");
+    }
+    edgeguard::pool::spawn_health_checks(&state, shutdown_rx.clone());
     // Clones for the managed-mode background loops (grabbed before `state` is moved into the router).
     let cp_client = state.cp.clone();
     // The ACME order below runs before the managed-mode loops take ownership of `cp_client`, and it
     // needs the same client: in managed mode the CA's SHARED rate limits are held by the control
     // plane, not by this box's local ledger. See `acme::check_budget`.
     let acme_cp = state.cp.clone();
-    let cp_runtime = state.runtime.clone();
     let cp_metrics = state.metrics.clone();
     // Also grabbed here, before `state` moves into the router below: the access-log shipper is
     // installed on the same registry the response path already holds.
@@ -481,6 +569,9 @@ async fn main() -> Result<()> {
     // series render with the rest and `/__edgeguard/tls` can reach it.
     let tls_metrics = state.metrics.clone();
     let cp_quota = state.quota.clone();
+    // Flipped by the signal handler below, so `/ready` fails from the first moment of shutdown.
+    let draining = state.draining.clone();
+    let listener_metrics = state.metrics.clone();
 
     // Hard quota needs the managed-mode client to poll verdicts; without it the gate would stay
     // permissive forever. Fail fast rather than silently not enforcing a configured cap.
@@ -503,12 +594,22 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("binding admin listener on {admin_addr}"))?;
         let admin_app = build_admin_router(state.clone());
-        let admin_rx = shutdown_rx.clone();
+        // Stopped after the public drain (on `stop`, not `shutdown`), so probes and scrapes see
+        // the drain. No connection cap and no drain delay: it must answer while the public port is
+        // full, and it has nothing to hand off. No PROXY protocol: probes and scrapes reach it
+        // directly, not through the balancer.
+        let admin_opts = serve::ServeOpts {
+            max_connections: 0,
+            drain_delay: Duration::ZERO,
+            proxy_protocol: None,
+            ..serve_opts.clone()
+        }
+        .with_stats(state.metrics.listener_stats("admin"));
+        let admin_rx = stop_rx.clone();
         info!(listen = %admin_addr, "EdgeGuard admin endpoints listening (health/ready/metrics)");
         tokio::spawn(async move {
-            if let Err(e) = axum::serve(admin_listener, admin_app)
-                .with_graceful_shutdown(shutdown_on(admin_rx))
-                .await
+            if let Err(e) =
+                serve::serve(admin_listener, None, admin_app, admin_opts, admin_rx).await
             {
                 warn!(error = %e, "admin listener stopped");
             }
@@ -520,8 +621,9 @@ async fn main() -> Result<()> {
 
     // Config hot-reload: watch the config file (if one was given) and swap policy in place.
     if let Some(path) = config.clone() {
+        let policy = Arc::clone(&policy);
         tokio::spawn(async move {
-            if let Err(e) = reload::watch(PathBuf::from(path), runtime).await {
+            if let Err(e) = reload::watch(PathBuf::from(path), policy).await {
                 warn!(error = format!("{e:#}"), "config watcher stopped");
             }
         });
@@ -545,7 +647,7 @@ async fn main() -> Result<()> {
         } else {
             cfg.control_plane.edge_id.trim().to_string()
         };
-        match logship::spawn(&cfg.log.ship, edge_id, shutdown_rx.clone()) {
+        match logship::spawn(&cfg.log.ship, edge_id, shutdown_rx.clone()).context("[log.ship]")? {
             Some(shipper) => {
                 log_metrics.set_log_shipper(shipper);
             }
@@ -559,7 +661,9 @@ async fn main() -> Result<()> {
     // install — the majority — emitted no traces at all, because the only span this proxy produced
     // was the LLM client span.
     if cfg.tracing.enabled {
-        match telemetry::spawn_span_shipper(&cfg.tracing, shutdown_rx.clone()) {
+        match telemetry::spawn_span_shipper(&cfg.tracing, shutdown_rx.clone())
+            .context("[tracing]")?
+        {
             Some(shipper) => {
                 log_metrics.set_span_shipper(shipper);
             }
@@ -570,6 +674,7 @@ async fn main() -> Result<()> {
     // OTLP metrics: the Prometheus registry, pushed to a collector on an interval.
     if cfg.metrics.otlp.enabled
         && otlp_metrics::spawn_exporter(&cfg.metrics.otlp, log_metrics.clone(), shutdown_rx.clone())
+            .context("[metrics.otlp]")?
             .is_none()
     {
         warn!("[metrics.otlp] is enabled but no exporter started; check metrics.otlp.endpoint");
@@ -585,10 +690,11 @@ async fn main() -> Result<()> {
             warn!(error = %e, interval = %cfg.control_plane.report_interval, "invalid report_interval; using 60s");
             Duration::from_secs(60)
         });
-        let base = cfg.clone();
         let poll_rx = shutdown_rx.clone();
         let poller = cp_client.clone();
-        tokio::spawn(async move { cp::poll_loop(poller, base, cp_runtime, poll, poll_rx).await });
+        let policy = Arc::clone(&policy);
+        let etag = cached_policy.map(|c| c.etag);
+        tokio::spawn(async move { cp::poll_loop(poller, policy, poll, etag, poll_rx).await });
         // Quota enforcement poller (opt-in): publishes the edge's quota verdict to the shared
         // QuotaState the proxy hard-stops on.
         if cfg.control_plane.enforce_quota {
@@ -609,11 +715,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    // A single task flips the shutdown watch on Ctrl-C/SIGTERM; both the supervisor and the
-    // listener react to it for a graceful, connection-draining stop.
+    // A single task starts the shutdown on Ctrl-C/SIGTERM: readiness fails first, then the public
+    // listeners drain and the background loops stop. See `stop` above for the second phase.
     tokio::spawn(async move {
         wait_for_signal().await;
-        info!("shutdown signal received");
+        info!("shutdown signal received; draining");
+        draining.store(true, std::sync::atomic::Ordering::Release);
         let _ = shutdown_tx.send(true);
     });
 
@@ -637,6 +744,21 @@ async fn main() -> Result<()> {
         // nothing, and a failed order propagates below rather than falling back to an untrusted
         // certificate on a public name.
         if cfg.tls.acme.enabled {
+            // Build the ACME client once now, so a CA bundle, certificate or proxy that will not
+            // load fails startup — not the renewal two months from now, with a certificate on disk
+            // that skipped issuance today.
+            acme::http_client(&cfg.tls.acme)?;
+            let settings = edgeguard::outbound::Settings::of(
+                &cfg.tls.acme.outbound,
+                &cfg.tls.acme.directory_url,
+            );
+            info!(
+                directory = %cfg.tls.acme.directory_url,
+                trust = settings.trust.label_for(edgeguard::outbound::PublicRoots::System),
+                client_cert = settings.identity.is_some(),
+                proxy = %edgeguard::outbound::redact_proxy(settings.proxy.0),
+                "ACME client"
+            );
             // Only order a certificate when one isn't already on disk; re-ordering on every
             // boot would burn ACME issuance rate limits. Renewal before expiry is the job of
             // `certstore::maintain`, started once the listener's certificate is loaded.
@@ -743,15 +865,21 @@ async fn main() -> Result<()> {
                 store,
             });
         }
-        let server_config = if sni_certs.is_empty() {
-            tls::server_config(Arc::clone(&cert_store))?
+        let resolver: Arc<dyn rustls::server::ResolvesServerCert> = if sni_certs.is_empty() {
+            Arc::clone(&cert_store) as _
         } else {
             let resolver = certstore::SniResolver::new(Arc::clone(&cert_store), sni_certs.clone())
                 .context("[[tls.certs]]")?;
             info!(certs = ?resolver, "serving certificates by hostname (SNI)");
             tls_metrics.set_sni_certs(sni_certs.clone());
-            tls::server_config_with(Arc::new(resolver))?
+            Arc::new(resolver)
         };
+        let server_config = tls::server_config_with_client_auth(resolver, client_auth.clone())?;
+        if let Some(auth) = &client_auth {
+            info!(mode = ?auth.mode(), "verifying client certificates (mutual TLS)");
+            tokio::spawn(client_auth::watch(Arc::clone(auth), shutdown_rx.clone()));
+            tls_metrics.set_client_auth(Arc::clone(auth));
+        }
         for c in &sni_certs {
             if cfg.tls.watch {
                 let store = Arc::clone(&c.store);
@@ -810,6 +938,9 @@ async fn main() -> Result<()> {
             let tls_port = cfg.server.port;
             let status = cfg.tls.redirect_status;
             let hosts = cfg.tls.redirect_hosts.clone();
+            let redirect_opts = serve_opts
+                .clone()
+                .with_stats(listener_metrics.listener_stats("redirect"));
             let redirect_rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 if let Err(e) = tls::serve_redirect(
@@ -818,6 +949,7 @@ async fn main() -> Result<()> {
                     status,
                     hosts,
                     challenges,
+                    redirect_opts,
                     redirect_rx,
                 )
                 .await
@@ -832,7 +964,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("binding public TLS listener on {addr}"))?;
         info!(
             listen = %addr,
-            upstream = %cfg.upstream_base(),
+            upstream = %default_upstream(&cfg),
             auth = %cfg.auth.mode,
             rate_limit = cfg.ratelimit.enabled,
             store = %cfg.ratelimit.store,
@@ -841,33 +973,92 @@ async fn main() -> Result<()> {
             redirect_port = cfg.tls.redirect_port,
             "EdgeGuard listening (HTTPS)"
         );
-        tls::serve(listener, server_config, app, shutdown_rx.clone())
-            .await
-            .context("TLS server error")?;
+        let public_opts = serve_opts.with_stats(listener_metrics.listener_stats("public"));
+        serve::serve(
+            listener,
+            Some(server_config),
+            app,
+            public_opts,
+            shutdown_rx.clone(),
+        )
+        .await
+        .context("TLS server error")?;
     } else {
         let listener = TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding public listener on {addr}"))?;
         info!(
             listen = %addr,
-            upstream = %cfg.upstream_base(),
+            upstream = %default_upstream(&cfg),
             auth = %cfg.auth.mode,
             rate_limit = cfg.ratelimit.enabled,
             store = %cfg.ratelimit.store,
             waf = %cfg.waf.mode,
             "EdgeGuard listening"
         );
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_on(shutdown_rx.clone()))
-        .await
-        .context("server error")?;
+        let public_opts = serve_opts.with_stats(listener_metrics.listener_stats("public"));
+        serve::serve(listener, None, app, public_opts, shutdown_rx.clone())
+            .await
+            .context("server error")?;
+    }
+
+    // The public listener has drained: stop the wrapped app and the admin listener. Wait for the
+    // app to exit (the supervisor sends SIGTERM, then SIGKILL after 10s), since returning from
+    // here drops it, and dropping it kills it outright.
+    let _ = stop_tx.send(true);
+    if let Some(task) = supervisor_task {
+        if tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .is_err()
+        {
+            warn!("wrapped app still stopping after 15s; exiting anyway");
+        }
     }
 
     info!("EdgeGuard stopped");
     Ok(())
+}
+
+/// Keep a client certificate this edge presents current: watched and re-read on change, so a
+/// rotated certificate reaches the next handshake with no restart, and warned about as it nears
+/// expiry. Nothing here renews it. Spawned on `runtime`, since a reload may load a new one from
+/// any thread.
+fn watch_client_identity(
+    store: &Arc<certstore::CertStore>,
+    tls: &edgeguard::config::TlsCfg,
+    shutdown_rx: &watch::Receiver<bool>,
+    runtime: &tokio::runtime::Handle,
+) {
+    let watched = Arc::clone(store);
+    let rx = shutdown_rx.clone();
+    runtime.spawn(async move {
+        if let Err(e) = certstore::watch(watched, rx).await {
+            warn!(error = format!("{e:#}"), "client certificate watcher stopped; changes on disk are picked up by the hourly check");
+        }
+    });
+    let renewer = certstore::Renewer {
+        store: Arc::clone(store),
+        plan: certstore::RenewPlan::None,
+        tls: tls.clone(),
+        cp: None,
+        challenges: None,
+    };
+    runtime.spawn(certstore::maintain(renewer, shutdown_rx.clone()));
+}
+
+/// Where requests no other prefix claims go, for the startup log: a `/` route's target or
+/// targets, else `server.upstream`.
+fn default_upstream(cfg: &Config) -> String {
+    match cfg.upstreams.iter().find(|u| u.path == "/") {
+        Some(root) if !root.targets.is_empty() => root
+            .targets
+            .iter()
+            .map(|t| t.url.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(root) => root.target.clone(),
+        None => cfg.upstream_base(),
+    }
 }
 
 /// Poll the upstream port until it accepts a connection or the timeout elapses.
@@ -892,15 +1083,6 @@ async fn wait_for_upstream(port: u16, timeout: Duration) {
     }
 }
 
-/// Resolve once the shutdown watch flips to `true` (for axum's graceful shutdown).
-async fn shutdown_on(mut rx: watch::Receiver<bool>) {
-    while !*rx.borrow_and_update() {
-        if rx.changed().await.is_err() {
-            break;
-        }
-    }
-}
-
 /// Resolve on Ctrl-C or SIGTERM.
 async fn wait_for_signal() {
     let ctrl_c = async {
@@ -920,5 +1102,30 @@ async fn wait_for_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = term => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edgeguard::config::UpstreamRoute;
+
+    #[test]
+    fn the_startup_log_names_where_a_root_route_sends_requests() {
+        let mut cfg = Config::default();
+        cfg.server.app_port = 3000;
+        let route = |path: &str, target: &str, targets: &[&str]| UpstreamRoute {
+            path: path.into(),
+            target: target.into(),
+            targets: targets.iter().map(|t| (*t).into()).collect(),
+            ..Default::default()
+        };
+        cfg.upstreams = vec![route("/api", "", &["http://api-1", "http://api-2"])];
+        assert_eq!(default_upstream(&cfg), "http://127.0.0.1:3000");
+        cfg.upstreams
+            .push(route("/", "", &["http://a", "http://b"]));
+        assert_eq!(default_upstream(&cfg), "http://a, http://b");
+        cfg.upstreams[1] = route("/", "http://single", &[]);
+        assert_eq!(default_upstream(&cfg), "http://single");
     }
 }

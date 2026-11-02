@@ -22,6 +22,9 @@ pub struct Config {
     /// a static frontend. Longest matching prefix wins; no match falls back to the default
     /// upstream. This is a static prefix map, not a service mesh — see [`UpstreamRoute`].
     pub upstreams: Vec<UpstreamRoute>,
+    /// TLS from EdgeGuard to `https://` upstreams: which CAs to trust, the client certificate to
+    /// present (mutual TLS), and the name to verify. See [`UpstreamTlsCfg`].
+    pub upstream_tls: UpstreamTlsCfg,
     /// IP allow/deny lists (CIDR). Empty by default (allow all); when set, requests are gated by
     /// client IP before auth/rate-limit. See [`AccessCfg`].
     pub access: AccessCfg,
@@ -45,14 +48,150 @@ pub struct Config {
     pub tracing: TracingCfg,
     /// Metrics beyond the Prometheus endpoint. See [`MetricsCfg`].
     pub metrics: MetricsCfg,
+    /// A client certificate a load balancer verified and forwarded in a header, trusted only from
+    /// the load balancer's addresses. Off by default. See [`TrustedClientCertHeaderCfg`].
+    pub trusted_client_cert_header: TrustedClientCertHeaderCfg,
+    /// Defaults for every client the edge opens itself, where its section sets nothing: an egress
+    /// proxy, the edge's client certificate, CAs to trust beside the public ones. See
+    /// [`OutboundDefaultsCfg`].
+    pub outbound: OutboundDefaultsCfg,
+}
+
+/// `[outbound]` — how the edge reaches what it calls itself, once for every section.
+///
+/// Each section with a URL of its own (`[control_plane]`, `[log.ship]`, `[tracing]`,
+/// `[metrics.otlp]`, `[auth.jwt]`, `[alerts]`, `[llm.telemetry]`, `[tls.acme]` (the ACME
+/// directory), `[tls.acme.dns]`) takes these
+/// where it leaves its own [`OutboundCfg`] keys empty, so a corporate egress proxy or the edge's
+/// identity is written once. A section's own value always wins. Proxied traffic to upstreams is
+/// not covered: it has `[upstream_tls]`.
+///
+/// There is no `ca_path` here. In a section it replaces the public roots, which is right for an
+/// endpoint behind a private CA and wrong for every public one: inherited by an alert webhook on a
+/// chat service or a JWKS at a SaaS identity provider, it would break them. `extra_ca_path` adds
+/// CAs to the public roots instead, so private endpoints and public ones both verify. Edge-local:
+/// a control-plane policy cannot change it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct OutboundDefaultsCfg {
+    /// CA certificates (PEM) trusted in addition to the public web PKI, by every section that sets
+    /// no `ca_path` of its own: a corporate CA, or the one a TLS-inspecting egress proxy signs
+    /// with. Used for `https://` URLs only. Empty (default) adds none.
+    pub extra_ca_path: String,
+    /// The client certificate (PEM, leaf first) every section without one of its own presents to
+    /// an `https://` endpoint that asks for one. Set with `client_key_path`. Watched and re-read on
+    /// change, like a section's. Empty (default) presents none.
+    pub client_cert_path: String,
+    /// The private key (PEM) for `client_cert_path`.
+    pub client_key_path: String,
+    /// The proxy for every section whose `proxy` is empty: an `http://[user:password@]host:port`
+    /// CONNECT proxy, or `"none"`. Empty (default) honours `HTTPS_PROXY`/`NO_PROXY` from the
+    /// environment, as before. A section opts out with its own `proxy = "none"`.
+    pub proxy: String,
+    /// Not a setting: read only so that `[outbound] ca_path` is refused rather than ignored. See
+    /// the type's documentation.
+    #[doc(hidden)]
+    pub ca_path: String,
+}
+
+/// One section's outbound client, as [`Config::outbound_clients`] lists it.
+#[derive(Debug, Clone, Copy)]
+pub struct OutboundClient<'a> {
+    /// The section, as errors name it: `log.ship`, `auth.jwt`.
+    pub section: &'static str,
+    /// Whether this config opens the client: the section is on, or has its URL.
+    pub enabled: bool,
+    pub url: &'a str,
+    pub outbound: &'a OutboundCfg,
+}
+
+impl OutboundDefaultsCfg {
+    /// Whether anything is set.
+    pub fn is_empty(&self) -> bool {
+        self.extra_ca_path.is_empty()
+            && self.client_cert_path.is_empty()
+            && self.client_key_path.is_empty()
+            && self.proxy.trim().is_empty()
+            && self.ca_path.is_empty()
+    }
+}
+
+/// `[trusted_client_cert_header]` — client certificates when a load balancer, not EdgeGuard,
+/// terminates the client's mutual TLS.
+///
+/// Behind an L7 load balancer the client's TLS ends at the balancer, so `[tls.client_auth]` never
+/// sees a client certificate. Balancers that do the mTLS themselves (an ALB in verify mode,
+/// Cloudflare, Envoy or Istio, nginx) forward the certificate in a header instead. With `name` set,
+/// EdgeGuard reads that header, but only on a connection from `trusted_proxies`: anyone else could
+/// write any certificate into it. From a trusted peer it becomes the request's client certificate,
+/// exactly as if the TLS listener had verified it — `auth.mode = "mtls"`, `[auth.mtls] allowed`,
+/// `forward_client_cert`, the access log and the per-consumer series all use it. The header itself
+/// is always removed before the request is forwarded. Edge-local: a control-plane policy cannot
+/// change it, because whoever sets it decides who may claim which identity. Read at startup.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TrustedClientCertHeaderCfg {
+    /// The header the load balancer puts the client certificate in, e.g. `X-Amzn-Mtls-Clientcert`.
+    /// Empty (default) turns this off.
+    pub name: String,
+    /// How the header carries it: `"pem"` (default; PEM, URL-encoded or not, leaf first: ALB,
+    /// nginx `$ssl_client_escaped_cert`), `"der"` (base64 DER, URL-encoded or not: Cloudflare,
+    /// HAProxy `ssl_c_der,base64`, Traefik), or `"xfcc"` (Envoy's `X-Forwarded-Client-Cert`: the
+    /// last element's `Cert`/`Chain`, or without them its `URI`, `DNS`, `Subject` and `Hash`).
+    pub format: String,
+    /// The addresses the header is trusted from: the load balancer's, as CIDRs or bare IPs. Matched
+    /// against the connection's own peer address, never `X-Forwarded-For` or a PROXY protocol
+    /// header (which name the client, not the hop that wrote this one). This or
+    /// `trusted_proxy_names` is required with `name`; a `/0` (everyone) is refused.
+    pub trusted_proxies: Vec<String>,
+    /// The load balancer's names: the header is trusted only from a connection whose TLS client
+    /// certificate, verified by `[tls.client_auth]`, has one of them. Exact names or prefixes
+    /// ending in `*`, as `[auth.mtls] allowed` (`spiffe://prod.example/ns/ingress/*`). For a
+    /// balancer on a shared edge network, whose addresses other tenants share. With
+    /// `trusted_proxies` too, both must match. A bare `*` (any certificate) is refused.
+    pub trusted_proxy_names: Vec<String>,
+    /// Also verify the forwarded certificate against these CAs (PEM), for a balancer that forwards
+    /// it without verifying (an ALB in passthrough mode). Empty (default) trusts the balancer's
+    /// verification. Reloaded when it changes.
+    pub ca_path: String,
+    /// CRLs (PEM) for that verification, as `tls.client_auth.crl_paths`. Needs `ca_path`.
+    pub crl_paths: Vec<String>,
+}
+
+impl Default for TrustedClientCertHeaderCfg {
+    fn default() -> Self {
+        TrustedClientCertHeaderCfg {
+            name: String::new(),
+            format: "pem".into(),
+            trusted_proxies: Vec::new(),
+            trusted_proxy_names: Vec::new(),
+            ca_path: String::new(),
+            crl_paths: Vec::new(),
+        }
+    }
 }
 
 /// `[metrics]` — where metrics go besides `/__edgeguard/metrics`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct MetricsCfg {
     /// Push the same metrics to an OpenTelemetry collector. See [`OtlpMetricsCfg`].
     pub otlp: OtlpMetricsCfg,
+    /// Most consumers (authenticated principals: an API-key id, a Basic user, a JWT `sub`, a
+    /// client certificate's name) given their own `edgeguard_consumer_*` series. Past it, new ones
+    /// share one `_over_cap` series, so a large or growing user base cannot grow the scrape without
+    /// bound. `0` turns per-consumer series off — for a deployment where principals are personal
+    /// data (an email in `sub`) that should not leave the edge as metric labels. Read at startup.
+    pub consumer_series_max: usize,
+}
+
+impl Default for MetricsCfg {
+    fn default() -> Self {
+        MetricsCfg {
+            otlp: OtlpMetricsCfg::default(),
+            consumer_series_max: crate::metrics::DEFAULT_CONSUMER_SERIES,
+        }
+    }
 }
 
 /// `[metrics.otlp]` — push every metric `/__edgeguard/metrics` serves to an OTLP/HTTP collector, as
@@ -73,6 +212,9 @@ pub struct OtlpMetricsCfg {
     pub service_name: String,
     /// Per-push timeout in milliseconds.
     pub timeout_ms: u64,
+    /// How the edge reaches `endpoint`. See [`OutboundCfg`].
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
 }
 
 impl Default for OtlpMetricsCfg {
@@ -83,6 +225,7 @@ impl Default for OtlpMetricsCfg {
             interval_secs: 60,
             service_name: "edgeguard".into(),
             timeout_ms: 5_000,
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -104,6 +247,9 @@ pub struct AlertsCfg {
     pub budget_consumed_threshold: f64,
     /// Per-emit timeout for the background POST, in milliseconds. Default 2000.
     pub timeout_ms: u64,
+    /// How the edge reaches `webhook_url`. See [`OutboundCfg`].
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
 }
 
 impl Default for AlertsCfg {
@@ -113,6 +259,7 @@ impl Default for AlertsCfg {
             webhook_url: String::new(),
             budget_consumed_threshold: 0.9,
             timeout_ms: 2000,
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -198,6 +345,9 @@ pub struct TelemetryCfg {
     pub max_content_bytes: usize,
     /// Per-emit timeout for the background POST, in milliseconds. Default 2000.
     pub timeout_ms: u64,
+    /// How the edge reaches `endpoint`. See [`OutboundCfg`].
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
 }
 
 impl Default for TelemetryCfg {
@@ -210,6 +360,7 @@ impl Default for TelemetryCfg {
             capture_content: false,
             max_content_bytes: 8192,
             timeout_ms: 2000,
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -364,11 +515,21 @@ impl Default for LlmCfg {
 /// One vault entry (`[[llm.keys]]`): a client-facing virtual key mapped to a real provider key and
 /// an optional model egress allowlist. The provider key is injected into the upstream `Authorization`
 /// and is **never** sent back to the client; the client only ever holds the virtual key.
+///
+/// Or, in place of a virtual key, the **claims** of the verified JWT the request was authenticated
+/// with (`auth.mode = "jwt"`): a workload's own identity — a CI job's OIDC token, say — chooses the
+/// entry, so the workload holds no key of any kind, and the token it presents lasts minutes.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct KeyEntryCfg {
-    /// The secret the client presents (`Authorization: Bearer <virtual_key>`). Required.
+    /// The secret the client presents (`Authorization: Bearer <virtual_key>`). Required, unless
+    /// `claims` is set instead.
     pub virtual_key: String,
+    /// The verified JWT claims this entry is chosen by, in place of a virtual key: each claim named
+    /// must be one of the values listed (a value ending in `*` matches any rest), e.g.
+    /// `claims = { iss = ["https://dagron.example.com"], trust = ["agent"], repository = ["acme/*"] }`.
+    /// Entries are asked in order, and the first whose every claim matches is used.
+    pub claims: std::collections::BTreeMap<String, Vec<String>>,
     /// The real upstream provider secret injected on the way out. Required. Prefer sourcing this
     /// from a pushed control-plane policy / secret store rather than committing it.
     pub provider_key: String,
@@ -386,7 +547,8 @@ pub struct KeyEntryCfg {
 pub struct BudgetCfg {
     /// Identifier (also the metric/log label and part of the store key). Required, non-empty.
     pub name: String,
-    /// Keying dimension: `"global"`, `"key"` (per authenticated principal), or `"model"`.
+    /// Keying dimension: `"global"`, `"key"` (per authenticated principal), `"model"`, `"team"`,
+    /// or `"claim:<name>"` (per value of a claim of the verified JWT, e.g. `claim:run_id`).
     pub scope: String,
     /// `"tokens"` (prompt + completion) or `"usd"` (cost via the price book).
     pub unit: String,
@@ -467,6 +629,52 @@ pub struct ControlPlaneCfg {
     /// of edges with the previous set ageing out. A value that survives the roll (the workload's
     /// name plus an ordinal) makes the fleet view track the edge rather than the process.
     pub edge_id: String,
+    /// File to keep the last policy pulled from the control plane in, so a restart while the
+    /// control plane is unreachable starts on that policy instead of the local config file alone
+    /// (which may be looser: no auth, WAF in report mode). Written `0600` after each policy is
+    /// applied, read once at startup. It holds whatever the policy holds — API keys, provider keys
+    /// — so put it where the edge's own secrets live. Empty (default) keeps nothing.
+    pub cache_path: String,
+    /// What to serve while no control-plane policy has been applied, at startup, before the first
+    /// pull answers and with nothing in `cache_path`: `"local"` (default) runs on the local config
+    /// file; `"refuse"` answers proxied requests with `503` (and `/__edgeguard/ready` with `503`)
+    /// until a policy arrives. Health and metrics stay up either way.
+    pub boot_without_policy: String,
+    /// How the edge reaches the control plane: a private CA, the client certificate it presents
+    /// (in addition to `edge_token`), a proxy. See [`OutboundCfg`].
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
+}
+
+/// How the edge reaches an HTTP endpoint it calls itself: the control plane, a log or OTLP
+/// collector, a JWKS endpoint, an alert webhook, the ACME directory, a DNS provider's API. The
+/// same four keys, with the same meaning, sit directly in each section that has such a URL
+/// (`[control_plane]`, `[log.ship]`, `[tracing]`, `[metrics.otlp]`, `[auth.jwt]`, `[alerts]`,
+/// `[llm.telemetry]`, `[tls.acme]`, `[tls.acme.dns]`). A key left empty takes the `[outbound]` default ([`OutboundDefaultsCfg`]).
+/// Proxied traffic to upstreams has its own, `[upstream_tls]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct OutboundCfg {
+    /// CA certificates (PEM) that sign the endpoint's server certificate, for one behind a private
+    /// CA. Set, it replaces the public web PKI for this client: only these CAs are trusted. Empty
+    /// (default) trusts the public roots built into the binary. Needs an `https://` URL.
+    pub ca_path: String,
+    /// Client certificate (PEM, leaf first) presented to an endpoint that asks for one. Set with
+    /// `client_key_path`. Watched and re-read on change, so a rotated certificate is presented on
+    /// the next handshake with no restart. Empty (default) presents none. Needs an `https://` URL.
+    pub client_cert_path: String,
+    /// The private key (PEM) for `client_cert_path`.
+    pub client_key_path: String,
+    /// How to reach the endpoint: empty (default) takes `[outbound] proxy`, and with that empty
+    /// too honours `HTTPS_PROXY`/`NO_PROXY` from the environment; an
+    /// `http://[user:password@]host:port` URL sends this client — and only this one — through that
+    /// proxy, as a `CONNECT` tunnel, so TLS stays end to end; `"none"` connects directly, whatever
+    /// `[outbound]` or the environment says.
+    pub proxy: String,
+    /// `[outbound]`, as [`Config::load`] copies it into every section, for the keys above that are
+    /// left empty. Not read from the section.
+    #[serde(skip)]
+    pub defaults: OutboundDefaultsCfg,
 }
 
 impl Default for ControlPlaneCfg {
@@ -482,6 +690,9 @@ impl Default for ControlPlaneCfg {
             enforce_quota: false,
             quota_poll_interval: "30s".into(),
             edge_id: String::new(),
+            cache_path: String::new(),
+            boot_without_policy: "local".into(),
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -511,6 +722,40 @@ pub struct ServerCfg {
     /// `127.0.0.1` (same-host only — e.g. a sidecar scraper); set to `0.0.0.0` to expose it on
     /// a private network interface (rely on your network policy to keep it off the internet).
     pub admin_addr: String,
+    /// Close a connection that has not sent a complete request head within this long: a new
+    /// connection that sends nothing, one that sends its headers a byte at a time, and a
+    /// keep-alive connection idle between requests. It runs before auth and rate limiting, so
+    /// without it a few clients can hold sockets open indefinitely. A request already being
+    /// answered is not affected, however long its response takes. `"0"` disables. Applies to every
+    /// listener; read at startup, not on reload.
+    pub header_read_timeout: String,
+    /// Most connections the public listener holds open at once. One more is closed as soon as it
+    /// is accepted and counted in `edgeguard_connections_rejected_total`. `0` (default) is
+    /// unlimited. The redirect listener gets its own cap of the same size; the admin listener has
+    /// none, so health checks and scrapes still get through when the public port is full.
+    pub max_connections: usize,
+    /// After SIGTERM or Ctrl-C, keep accepting new connections for this long — with
+    /// `/__edgeguard/ready` already answering `503` — before draining. A load balancer, or
+    /// Kubernetes removing the pod from its endpoints, only stops routing here some time after the
+    /// signal; connections that arrive in between are refused if the listener has already closed.
+    /// `"0"` (default) stops accepting at once.
+    pub drain_delay: String,
+    /// Once the listener stops accepting, how long to wait for in-flight requests to finish before
+    /// closing what is left. Idle keep-alive connections close at once. Keep `drain_delay` plus
+    /// this under the platform's kill deadline (Kubernetes' `terminationGracePeriodSeconds`, 30 s
+    /// by default). `"0"` closes everything at once.
+    pub drain_timeout: String,
+    /// Read a PROXY protocol header (v1 or v2) at the start of each connection on the public and
+    /// redirect listeners, and use the client address it carries. For an L4 load balancer (AWS NLB,
+    /// a GCP TCP proxy, HAProxy, F5), which passes TCP through and so adds no `X-Forwarded-For`:
+    /// without it, rate limits, IP access rules and the access log see the balancer's address.
+    /// The header is believed only from `proxy_protocol_trusted`; from any other peer a connection
+    /// that starts with one is closed, and one that does not is served as it is. Off by default.
+    pub proxy_protocol: bool,
+    /// The addresses a PROXY header is believed from: the load balancer's, as CIDRs or bare IPs.
+    /// Required with `proxy_protocol`; a `/0` is refused, since it would let any client choose its
+    /// own address.
+    pub proxy_protocol_trusted: Vec<String>,
 }
 
 /// `[tracing]` — one OpenTelemetry **SERVER** span per proxied request.
@@ -548,6 +793,9 @@ pub struct TracingCfg {
     pub queue_size: usize,
     /// Per-POST timeout in milliseconds.
     pub timeout_ms: u64,
+    /// How the edge reaches `endpoint`. See [`OutboundCfg`].
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
 }
 
 impl Default for TracingCfg {
@@ -561,6 +809,7 @@ impl Default for TracingCfg {
             interval_secs: 5,
             queue_size: 10_000,
             timeout_ms: 2_000,
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -581,6 +830,11 @@ pub struct LogCfg {
     pub redact_params: Vec<String>,
     /// Ship the access log to a collector. Off by default. See [`LogShipCfg`].
     pub ship: LogShipCfg,
+    /// How the authenticated principal and the client certificate's name are recorded: `"full"`
+    /// (default), `"hash"` or `"off"` — see
+    /// [`PrincipalLogMode`](crate::accesslog::PrincipalLogMode). The per-consumer metrics are set
+    /// separately, by `metrics.consumer_series_max`.
+    pub principal: crate::accesslog::PrincipalLogMode,
 }
 
 /// `[log.ship]` — stream the access log off the box to a collector.
@@ -619,6 +873,9 @@ pub struct LogShipCfg {
     /// restart and not a collector outage. Raising it trades memory for a longer outage tolerated;
     /// it does not make delivery guaranteed, and nothing here should be read as if it did.
     pub queue_size: usize,
+    /// How the edge reaches `url`. See [`OutboundCfg`].
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
 }
 
 impl Default for LogShipCfg {
@@ -630,6 +887,7 @@ impl Default for LogShipCfg {
             batch: 500,
             interval_secs: 5,
             queue_size: 10_000,
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -640,6 +898,7 @@ impl Default for LogCfg {
             query: crate::accesslog::QueryLogMode::Redact,
             redact_params: Vec::new(),
             ship: LogShipCfg::default(),
+            principal: crate::accesslog::PrincipalLogMode::Full,
         }
     }
 }
@@ -647,8 +906,10 @@ impl Default for LogCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AuthCfg {
-    /// "none" | "basic" | "apikey" | "jwt". Selects the gate applied to every proxied
-    /// request; the internal `/__edgeguard/*` endpoints are always exempt.
+    /// "none" | "basic" | "apikey" | "jwt" | "mtls". Selects the gate applied to every proxied
+    /// request; the internal `/__edgeguard/*` endpoints are always exempt. `mtls` authenticates
+    /// by the client certificate verified on the TLS listener (`[tls.client_auth]`, which it
+    /// requires) and takes the principal from it.
     pub mode: String,
     /// Realm shown in the `WWW-Authenticate` challenge on a 401, i.e. the name the browser's
     /// password prompt displays. Only used when `mode = "basic"`.
@@ -666,6 +927,24 @@ pub struct AuthCfg {
     pub api_key_header: String,
     /// JWT verification policy. Used when `mode = "jwt"`.
     pub jwt: JwtCfg,
+    /// Client-certificate policy. Used when `mode = "mtls"`.
+    pub mtls: MtlsAuthCfg,
+}
+
+/// `[auth.mtls]` — which client certificates `auth.mode = "mtls"` lets through.
+///
+/// The TLS listener has already verified the certificate against `[tls.client_auth] ca_path` by
+/// the time this runs; this narrows *which* of the certificates that CA vouches for may call the
+/// app. A certificate's names are its URI alternative names (a SPIFFE ID is one), DNS names, email
+/// names and subject common name; the principal is the first of them, in that order, that is
+/// allowed.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct MtlsAuthCfg {
+    /// Allowed names: an exact name, or a prefix ending in `*` (`spiffe://prod.example/ns/web/*`).
+    /// DNS and email names are compared in lower case. Empty (default) allows any certificate the
+    /// CA issued.
+    pub allowed: Vec<String>,
 }
 
 /// JWT bearer-token verification. Either a symmetric `secret` (HS*) or an asymmetric key
@@ -694,6 +973,10 @@ pub struct JwtCfg {
     pub audience: String,
     /// Clock-skew leeway (seconds) applied to `exp`/`nbf` validation. Default 60.
     pub leeway_secs: u64,
+    /// How the edge reaches `jwks_url`. See [`OutboundCfg`]. Edge-local: kept from this file
+    /// when a control-plane policy replaces the rest of `[auth]`.
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -740,8 +1023,14 @@ pub struct RateLimitCfg {
 pub struct RouteRateLimit {
     /// Path prefix this limit applies to, e.g. "/api/".
     pub path: String,
+    /// The route's rate, `N/sec`, `N/min` or `N/hour`, still keyed per client IP. Replaces the
+    /// global `rate` for requests under `path`.
     pub rate: String,
+    /// The route's burst: bucket depth on top of the steady rate.
     pub burst: u32,
+    /// The `route` label this prefix's requests carry in the per-route metrics. Empty (default)
+    /// uses `path`.
+    pub name: String,
 }
 
 impl Default for RouteRateLimit {
@@ -750,6 +1039,7 @@ impl Default for RouteRateLimit {
             path: String::new(),
             rate: "60/min".into(),
             burst: 20,
+            name: String::new(),
         }
     }
 }
@@ -791,6 +1081,11 @@ pub struct ValidationCfg {
     /// "500ms", "2m". "0" disables the timeout. Bounds a stalled upstream so it can't pin a
     /// handler task indefinitely; on elapse the proxy returns 504.
     pub upstream_timeout: String,
+    /// Max time to open the TCP connection to an upstream, e.g. "5s". "0" leaves it to
+    /// `upstream_timeout`. An upstream whose packets are dropped (a partitioned network, a
+    /// firewall) never refuses the connection, so without this the request waits out the whole
+    /// `upstream_timeout`, and a pool cannot move on to its next target in time. Read at startup.
+    pub upstream_connect_timeout: String,
     /// Cap on the total size of incoming request headers (sum of name + value bytes), e.g.
     /// "32KiB". "0" disables the cap (default). Requests over the limit get `431`. This is a
     /// policy limit enforced by EdgeGuard on top of hyper's own transport-level header cap.
@@ -903,6 +1198,12 @@ impl Default for ServerCfg {
             trust_forwarded_for: false,
             admin_port: 0,
             admin_addr: "127.0.0.1".into(),
+            header_read_timeout: "30s".into(),
+            max_connections: 0,
+            drain_delay: "0s".into(),
+            drain_timeout: "25s".into(),
+            proxy_protocol: false,
+            proxy_protocol_trusted: Vec::new(),
         }
     }
 }
@@ -916,6 +1217,7 @@ impl Default for AuthCfg {
             api_keys: vec![],
             api_key_header: "X-API-Key".into(),
             jwt: JwtCfg::default(),
+            mtls: MtlsAuthCfg::default(),
         }
     }
 }
@@ -931,6 +1233,7 @@ impl Default for JwtCfg {
             issuer: String::new(),
             audience: String::new(),
             leeway_secs: 60,
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -988,6 +1291,7 @@ impl Default for ValidationCfg {
             max_body: "2MiB".into(),
             max_response_body: "0".into(),
             upstream_timeout: "30s".into(),
+            upstream_connect_timeout: "5s".into(),
             max_header_bytes: "0".into(),
             allow_methods: vec![],
             stream_passthrough: false,
@@ -1086,6 +1390,50 @@ pub struct TlsCfg {
     /// certbot, Vault Agent): they are reloaded when they change on disk, like the default pair, and
     /// warned about as they near expiry, but nothing here renews them.
     pub certs: Vec<SniCertCfg>,
+    /// Verify client certificates on this listener (mutual TLS). See `[tls.client_auth]`.
+    pub client_auth: ClientAuthCfg,
+}
+
+/// `[tls.client_auth]` — client certificates on the TLS listener (mutual TLS).
+///
+/// With `mode = "required"` a client must present a certificate signed by a CA in `ca_path` to
+/// complete the handshake; with `"optional"` one is verified if presented. A verified
+/// certificate's names identify the client: `auth.mode = "mtls"` authenticates by them, and
+/// `forward_client_cert` passes them to the app. The CA bundle and CRLs are reloaded when they
+/// change on disk; existing connections keep the verification they were opened with.
+///
+/// TLS session resumption is off while this is on: a resumed session skips certificate
+/// verification, so a certificate revoked after the first connection would keep working.
+///
+/// Edge-local like the rest of `[tls]`. Needs `[tls] enabled`: a certificate only reaches the
+/// process that terminates TLS.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClientAuthCfg {
+    /// `"off"` (default), `"optional"` or `"required"`.
+    pub mode: String,
+    /// PEM bundle of the CAs allowed to sign a client certificate. Required unless `mode = "off"`.
+    pub ca_path: String,
+    /// PEM certificate revocation lists. A certificate one of them revokes is refused at the
+    /// handshake. Checked for the client's own certificate, which must then be covered by one of
+    /// them: a certificate whose issuer has no CRL here is refused rather than assumed good.
+    pub crl_paths: Vec<String>,
+    /// Pass the verified certificate to the app: `"off"` (default) or `"xfcc"`, an
+    /// `X-Forwarded-Client-Cert` header (`Hash=<sha256>;URI="…";DNS="…"`). Whatever this is set to,
+    /// an `X-Forwarded-Client-Cert` header from the client is removed while client
+    /// authentication is on, so the app never sees one the client wrote.
+    pub forward_client_cert: String,
+}
+
+impl Default for ClientAuthCfg {
+    fn default() -> Self {
+        ClientAuthCfg {
+            mode: "off".into(),
+            ca_path: String::new(),
+            crl_paths: Vec::new(),
+            forward_client_cert: "off".into(),
+        }
+    }
 }
 
 /// One extra certificate, served to the hostnames in `hosts`. See [`TlsCfg::certs`].
@@ -1140,6 +1488,7 @@ impl Default for TlsCfg {
             redirect_hosts: Vec::new(),
             acme: AcmeCfg::default(),
             certs: Vec::new(),
+            client_auth: ClientAuthCfg::default(),
         }
     }
 }
@@ -1201,6 +1550,13 @@ pub struct AcmeCfg {
     pub challenge: String,
     /// The DNS provider for `challenge = "dns-01"`. See `[tls.acme.dns]`.
     pub dns: AcmeDnsCfg,
+    /// How the edge reaches the ACME directory (`directory_url`): its CA, a client certificate, a
+    /// proxy. See [`OutboundCfg`]. One difference from the other sections: with no `ca_path` (or
+    /// `[outbound] extra_ca_path`), the directory is verified against the operating system's
+    /// trust store, as it always was, not the roots built into the binary, so a private ACME CA
+    /// whose root is installed on the host keeps working.
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
 }
 
 /// Where DNS-01 publishes its `_acme-challenge` TXT records.
@@ -1222,6 +1578,9 @@ pub struct AcmeDnsCfg {
     /// Seconds to wait after publishing a record before asking the CA to check it, so it has reached
     /// the authoritative servers. Default 30; raise it if validation fails with "no TXT record".
     pub propagation_secs: u64,
+    /// How the edge reaches the provider's API. See [`OutboundCfg`].
+    #[serde(flatten)]
+    pub outbound: OutboundCfg,
 }
 
 impl Default for AcmeDnsCfg {
@@ -1233,6 +1592,7 @@ impl Default for AcmeDnsCfg {
             api_base: "https://api.cloudflare.com/client/v4".into(),
             url: String::new(),
             propagation_secs: 30,
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -1252,6 +1612,7 @@ impl Default for AcmeCfg {
             ari: true,
             challenge: "http-01".into(),
             dns: AcmeDnsCfg::default(),
+            outbound: OutboundCfg::default(),
         }
     }
 }
@@ -1325,17 +1686,281 @@ impl Default for WafRule {
 
 /// A per-path-prefix upstream override (a `[[upstreams]]` entry). Requests whose path starts with
 /// `path` are forwarded to `target` instead of the default `server.upstream`; the longest matching
-/// prefix wins. This is deliberately a *static prefix map* for the common "static frontend + `/api`
-/// backend" shape — not a gateway: no service discovery, load balancing, health-based routing, or
-/// request rewriting (the path is forwarded unchanged). For those, put EdgeGuard behind a real
-/// gateway/mesh.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// prefix wins (`path = "/"` replaces the default). The path is forwarded unchanged.
+///
+/// With `targets` instead of `target`, the prefix has a pool: several upstreams, for failover (an
+/// on-prem primary and a cloud standby, say) or to spread load (`balance = "round_robin"`). A
+/// target leaves rotation when its `health_check` fails, or when requests fail to connect to it
+/// (`eject_after`), and a request that could not connect is sent to the next one. `backup` targets
+/// take requests only when none of `targets` will. There is no service discovery.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct UpstreamRoute {
     /// Path prefix this upstream applies to, e.g. `/api/`.
     pub path: String,
     /// Upstream base URL for this prefix, e.g. `http://api.internal:4000`.
     pub target: String,
+    /// A pool instead of `target`: upstream base URLs, e.g.
+    /// `["http://10.0.1.5:8080", "https://standby.example.com"]`, or with round-robin weights,
+    /// `[{ url = "http://10.0.1.5:8080", weight = 3 }, "http://10.0.1.6:8080"]`. Each `https://`
+    /// one takes its own `[[upstream_tls.targets]]` entry, as a `target` would.
+    pub targets: Vec<TargetCfg>,
+    /// How a pool picks among its targets in rotation: `"priority"` (default) sends every request
+    /// to the first in the order listed, the rest standing by; `"round_robin"` takes them in turn,
+    /// as many turns each as its `weight`; `"least_conn"` the one with the fewest requests in
+    /// flight for its weight; `"hash"` the one `hash_on` points to. Whichever, a request that
+    /// cannot connect moves on to the next.
+    pub balance: String,
+    /// With `balance = "hash"`, the key that picks a request's target: `"client_ip"` (default),
+    /// `"path"`, `"header:<name>"`, `"cookie:<name>"` or `"query:<name>"` (a query parameter's
+    /// value as sent, not percent-decoded). The same key goes to the same target, on every edge,
+    /// while that target is in rotation; when it leaves, only its keys move. A request without the
+    /// key is balanced in turn.
+    pub hash_on: String,
+    /// Keep each client on the target that first answered it: the edge sets a cookie of this name
+    /// naming that target, and a request carrying it goes there while the target is in rotation.
+    /// Empty (default) is off.
+    pub sticky_cookie: String,
+    /// How long the sticky cookie lasts, e.g. `"8h"`: its `Max-Age`, counted from when it was set
+    /// (it is not refreshed while the client stays). After it, the client's next request is
+    /// balanced and stuck again to whichever target answers. Empty (default): a session cookie,
+    /// gone when the browser closes.
+    pub sticky_cookie_max_age: String,
+    /// Remove the sticky cookie from requests before they reach the upstream, which then never
+    /// sees the edge's cookie (HAProxy's `indirect`). The client's other cookies are kept.
+    /// Default `false`.
+    pub sticky_cookie_strip: bool,
+    /// A pool's standby targets: they take requests only when no target in `targets` is in
+    /// rotation, or when every one of them refused the request. Balanced among themselves as
+    /// `balance` says. Empty by default.
+    pub backup: Vec<TargetCfg>,
+    /// The `route` label this prefix's requests carry in the per-route metrics. Empty (default)
+    /// uses `path`.
+    pub name: String,
+    /// Active checks for a pool's targets. Off unless `health_check.path` is set.
+    pub health_check: HealthCheckCfg,
+    /// Take a pool's target out of rotation after this many requests in a row fail to connect to
+    /// it: refused, unreachable, past `validation.upstream_connect_timeout`, or a failed TLS
+    /// handshake. `0` turns it off. Default `1`: the request that failed is retried on the next
+    /// target, so the first failure costs nothing but that attempt.
+    pub eject_after: u32,
+    /// How long such a target stays out before requests try it again: this, times the number of
+    /// ejections in a row, up to `eject_for_max`. Default `"30s"`.
+    pub eject_for: String,
+    /// The longest an ejection grows to: a target ejected again soon after coming back is out
+    /// `eject_for` × 2, then × 3, up to this. One not ejected again for this long after its last
+    /// ejection ends starts over.
+    /// Empty (default) is 5 minutes, or `eject_for` if longer; set it to `eject_for` for every
+    /// ejection to last the same.
+    pub eject_for_max: String,
+    /// Take a pool's target out of rotation, for `eject_for`, after this many answers in a row
+    /// with a `5xx` status: a server that is up but broken. Any other answer resets the count.
+    /// Never the last target in rotation: when every one answers `5xx`, rotation cannot help.
+    /// `0` (default) turns it off, since a `500` may be one endpoint's bug rather than the server's.
+    pub eject_after_5xx: u32,
+}
+
+impl Default for UpstreamRoute {
+    fn default() -> Self {
+        UpstreamRoute {
+            path: String::new(),
+            target: String::new(),
+            targets: Vec::new(),
+            balance: "priority".into(),
+            hash_on: String::new(),
+            sticky_cookie: String::new(),
+            sticky_cookie_max_age: String::new(),
+            sticky_cookie_strip: false,
+            backup: Vec::new(),
+            name: String::new(),
+            health_check: HealthCheckCfg::default(),
+            eject_after: 1,
+            eject_for: "30s".into(),
+            eject_after_5xx: 0,
+            eject_for_max: String::new(),
+        }
+    }
+}
+
+/// One entry of a pool's `targets` or `backup`: a URL, or `{ url = "…", weight = 3 }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCfg {
+    pub url: String,
+    /// Its turns, with `balance = "round_robin"`, for each one the others with weight 1 get: a
+    /// target with weight 3 takes three requests for every one theirs take. `None` for a bare
+    /// URL, which counts as 1.
+    pub weight: Option<u32>,
+}
+
+impl From<&str> for TargetCfg {
+    fn from(url: &str) -> Self {
+        TargetCfg {
+            url: url.to_string(),
+            weight: None,
+        }
+    }
+}
+
+impl From<String> for TargetCfg {
+    fn from(url: String) -> Self {
+        TargetCfg { url, weight: None }
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetCfg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        /// The table form. Unknown keys are refused, so a misspelled `weight` is an error rather
+        /// than a silent weight of 1.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            url: String,
+            weight: Option<u32>,
+        }
+        struct Entry;
+        impl<'de> serde::de::Visitor<'de> for Entry {
+            type Value = TargetCfg;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a URL, or a table with url and weight")
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                url: &str,
+            ) -> std::result::Result<TargetCfg, E> {
+                Ok(url.into())
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<TargetCfg, A::Error> {
+                let t = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(TargetCfg {
+                    url: t.url,
+                    weight: t.weight,
+                })
+            }
+        }
+        d.deserialize_any(Entry)
+    }
+}
+
+/// `[upstreams.health_check]` — active checks of a pool's targets: a `GET` (or `method`) of `path`
+/// on each target every `interval`. A target answering `2xx` or `3xx` within `timeout` passes. It leaves
+/// rotation after `unhealthy_after` failures in a row and returns after `healthy_after` passes. A
+/// new target starts in rotation, and is checked at once.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HealthCheckCfg {
+    /// `"http"` (default): `GET path`, judged by `expect_status` and `expect_body`. `"tcp"`: a
+    /// connection to the target's host and port, and nothing more, for a target that speaks no
+    /// HTTP worth asking or has no health endpoint.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The path to check, relative to each target as a request's is, e.g. `/healthz`. Empty
+    /// (default) leaves only the passive check, `eject_after`, unless `type = "tcp"`.
+    pub path: String,
+    /// Default `"5s"`.
+    pub interval: String,
+    /// Default `"2s"`.
+    pub timeout: String,
+    /// Default `2`.
+    pub healthy_after: u32,
+    /// Default `2`.
+    pub unhealthy_after: u32,
+    /// The statuses that pass: codes, ranges and classes, comma-separated, e.g. `"200"`,
+    /// `"2xx"`, or `"200-299,304"`. Default `"200-399"`. Redirects are not followed.
+    pub expect_status: String,
+    /// Text the first 64 KiB of the answer's body must contain, e.g. `"\"status\":\"ok\""`, for
+    /// an endpoint that answers `200` while saying it is down. Empty (default): the status alone.
+    pub expect_body: String,
+    /// A regular expression the body must match instead, e.g.
+    /// `"\"status\":\\s*\"(ok|degraded)\""`: Rust `regex` syntax, which runs in linear time. It is
+    /// searched for in the body as read to its end, or to its first 64 KiB: `^` and `$` are the
+    /// start and end of that unless `(?m)` makes them lines. Set this or `expect_body`, not both.
+    pub expect_body_regex: String,
+    /// The check's method. Default `"GET"`. `"HEAD"` asks for the status alone, so it takes no
+    /// `expect_body`. Any method but `CONNECT`; no body is sent.
+    pub method: String,
+    /// Headers each check sends, as `[name, value]` pairs, e.g. `[["Host", "app.internal"]]` for a
+    /// target that routes by name, or a token its health endpoint wants. One that names
+    /// `User-Agent` replaces the edge's. The status endpoint shows their names, not their values.
+    pub headers: Vec<(String, String)>,
+    /// Check each target on this port instead of the one requests go to, for an app that serves
+    /// its health on a separate management port. The target's host, scheme (an `https://` target
+    /// is checked over TLS on this port too, with the TLS settings its requests use) and path
+    /// prefix are kept. `0` (default): the target's own port.
+    pub port: u16,
+}
+
+impl Default for HealthCheckCfg {
+    fn default() -> Self {
+        HealthCheckCfg {
+            kind: "http".into(),
+            path: String::new(),
+            interval: "5s".into(),
+            timeout: "2s".into(),
+            healthy_after: 2,
+            unhealthy_after: 2,
+            expect_status: "200-399".into(),
+            expect_body: String::new(),
+            expect_body_regex: String::new(),
+            method: "GET".into(),
+            headers: Vec::new(),
+            port: 0,
+        }
+    }
+}
+
+/// `[upstream_tls]` — TLS from EdgeGuard to `https://` upstreams.
+///
+/// An `https://` upstream (`server.upstream` or a `[[upstreams]]` target) is reached over TLS 1.2+
+/// and its certificate verified, with no configuration: by default against the public web PKI
+/// (the Mozilla root set built into the binary). The settings here change who is trusted, add a
+/// client certificate for upstreams that require one (mutual TLS), and set the name to verify.
+/// `[[upstream_tls.targets]]` entries give one upstream its own settings; any field left empty
+/// there is taken from here.
+///
+/// Edge-local, like `[server]` and `[tls]`: a control-plane policy never changes it. Read at
+/// startup; the client certificate and key are reloaded when they change on disk.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UpstreamTlsCfg {
+    /// PEM bundle of the CAs allowed to sign an upstream's certificate. Empty (default) trusts the
+    /// public web PKI. When set, **only** these CAs are trusted: a certificate from a public CA for
+    /// the same name is refused, which is the point of a private CA. A self-signed upstream
+    /// certificate goes here too; there is no option to skip verification.
+    pub ca_path: String,
+    /// PEM certificate chain EdgeGuard presents to an upstream that asks for a client certificate
+    /// (mutual TLS). Set together with `key_path`. Reloaded when the file changes, like the
+    /// listener's certificate; new connections use the new one.
+    pub cert_path: String,
+    /// PEM private key for `cert_path`.
+    pub key_path: String,
+    /// Name to verify the upstream's certificate against and to send as SNI, instead of the host
+    /// in the upstream URL. For an upstream addressed by IP, or through a name its certificate
+    /// does not carry. Empty (default) uses the URL's host.
+    pub server_name: String,
+    /// Settings for one upstream at a time. See [`UpstreamTlsTarget`].
+    pub targets: Vec<UpstreamTlsTarget>,
+}
+
+/// One `[[upstream_tls.targets]]` entry: TLS settings for a single upstream, overriding the ones
+/// in `[upstream_tls]` field by field.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct UpstreamTlsTarget {
+    /// The upstream these settings apply to, as an `https://host[:port]` URL: the same host and
+    /// port as in `server.upstream` or a `[[upstreams]] target` (any path is ignored, and the port
+    /// defaults to 443). Each upstream may be listed once.
+    pub target: String,
+    /// See [`UpstreamTlsCfg::ca_path`]. Empty inherits it.
+    pub ca_path: String,
+    /// See [`UpstreamTlsCfg::cert_path`]. Set together with `key_path`; empty inherits both.
+    pub cert_path: String,
+    /// See [`UpstreamTlsCfg::key_path`].
+    pub key_path: String,
+    /// See [`UpstreamTlsCfg::server_name`]. Empty inherits it.
+    pub server_name: String,
 }
 
 /// IP allow/deny lists, matched against the resolved client IP (the same IP rate limiting keys
@@ -1477,7 +2102,104 @@ impl Config {
                 ),
             }
         }
+        cfg.inherit_outbound();
         Ok(cfg)
+    }
+
+    /// Every section that opens a client of its own, whether this config opens it, and where to.
+    pub fn outbound_clients(&self) -> [OutboundClient<'_>; 9] {
+        fn client<'a>(
+            section: &'static str,
+            enabled: bool,
+            url: &'a str,
+            outbound: &'a OutboundCfg,
+        ) -> OutboundClient<'a> {
+            OutboundClient {
+                section,
+                enabled,
+                url: url.trim(),
+                outbound,
+            }
+        }
+        let dns = &self.tls.acme.dns;
+        [
+            client(
+                "control_plane",
+                self.control_plane.enabled,
+                &self.control_plane.url,
+                &self.control_plane.outbound,
+            ),
+            client(
+                "log.ship",
+                self.log.ship.enabled,
+                &self.log.ship.url,
+                &self.log.ship.outbound,
+            ),
+            client(
+                "tracing",
+                self.tracing.enabled,
+                &self.tracing.endpoint,
+                &self.tracing.outbound,
+            ),
+            client(
+                "metrics.otlp",
+                self.metrics.otlp.enabled,
+                &self.metrics.otlp.endpoint,
+                &self.metrics.otlp.outbound,
+            ),
+            client(
+                "auth.jwt",
+                !self.auth.jwt.jwks_url.trim().is_empty(),
+                &self.auth.jwt.jwks_url,
+                &self.auth.jwt.outbound,
+            ),
+            client(
+                "alerts",
+                self.alerts.enabled,
+                &self.alerts.webhook_url,
+                &self.alerts.outbound,
+            ),
+            client(
+                "llm.telemetry",
+                self.llm.telemetry.enabled,
+                &self.llm.telemetry.endpoint,
+                &self.llm.telemetry.outbound,
+            ),
+            client(
+                "tls.acme",
+                self.tls.acme.enabled,
+                &self.tls.acme.directory_url,
+                &self.tls.acme.outbound,
+            ),
+            client(
+                "tls.acme.dns",
+                self.tls.acme.enabled && self.tls.acme.challenge == "dns-01",
+                if dns.provider == "challtestsrv" {
+                    &dns.url
+                } else {
+                    &dns.api_base
+                },
+                &dns.outbound,
+            ),
+        ]
+    }
+
+    /// Copy `[outbound]` into every section, for the keys each leaves empty. [`Config::load`] does
+    /// this; a config built another way calls it before building clients from it.
+    pub fn inherit_outbound(&mut self) {
+        for section in [
+            &mut self.control_plane.outbound,
+            &mut self.log.ship.outbound,
+            &mut self.tracing.outbound,
+            &mut self.metrics.otlp.outbound,
+            &mut self.auth.jwt.outbound,
+            &mut self.alerts.outbound,
+            &mut self.llm.telemetry.outbound,
+            &mut self.tls.acme.outbound,
+            &mut self.tls.acme.dns.outbound,
+        ] {
+            section.defaults = self.outbound.clone();
+        }
     }
 
     /// Produce an effective config by overlaying a control-plane-pushed *policy* document onto
@@ -1495,7 +2217,20 @@ impl Config {
             control_plane: self.control_plane.clone(),
             // Upstream topology is edge-local (like `server`), not pushed policy.
             upstreams: self.upstreams.clone(),
-            auth: p.auth,
+            // So is how this edge reaches its upstreams over TLS: the CA bundle and client
+            // certificate are files on this box, and the trust they express is this edge's own.
+            // A pushed policy that could swap the CA would let a control plane vouch for any
+            // certificate the upstream connection is offered.
+            upstream_tls: self.upstream_tls.clone(),
+            // The policy decides who may call; how this edge reaches the JWKS endpoint (its CA,
+            // its client certificate, its proxy) is edge-local, like `upstream_tls`.
+            auth: AuthCfg {
+                jwt: JwtCfg {
+                    outbound: self.auth.jwt.outbound.clone(),
+                    ..p.auth.jwt
+                },
+                ..p.auth
+            },
             ratelimit: p.ratelimit,
             validation: p.validation,
             headers: p.headers,
@@ -1526,6 +2261,15 @@ impl Config {
             // And the metrics endpoint: where this edge's numbers (hostnames, certificate names,
             // route labels) are pushed. Edge-local, never pushed.
             metrics: self.metrics.clone(),
+            // Which addresses may assert a client certificate in a header is network trust, not
+            // policy: a control plane that could widen it could mint any identity.
+            trusted_client_cert_header: self.trusted_client_cert_header.clone(),
+            // How this edge reaches the network — its proxy, its identity, the CAs it adds — is
+            // edge-local like each section's own settings, and for the same reason: a pushed
+            // proxy plus a pushed CA would let a control plane read every connection the edge
+            // opens, its own included. Every section that inherits it is carried from the edge
+            // too, defaults already copied in.
+            outbound: self.outbound.clone(),
         })
     }
 
@@ -1870,6 +2614,174 @@ mod tests {
         let merged = local.with_policy_from(policy).unwrap();
         assert_eq!(merged.metrics.otlp.endpoint, "http://local:4318/v1/metrics");
         assert_eq!(merged.tracing.endpoint, "http://local:4318/v1/traces");
+    }
+
+    /// A pushed policy cannot make the edge trust a client-certificate header from anyone new.
+    #[test]
+    fn with_policy_from_keeps_the_trusted_client_cert_header_edge_local() {
+        let mut local = Config::default();
+        local.trusted_client_cert_header.name = "X-Amzn-Mtls-Clientcert".into();
+        local.trusted_client_cert_header.trusted_proxies = vec!["10.0.0.0/16".into()];
+        let policy =
+            "[trusted_client_cert_header]\nname = \"X-Evil\"\ntrusted_proxies = [\"0.0.0.0/1\"]\n";
+        let merged = local.with_policy_from(policy).unwrap();
+        assert_eq!(
+            merged.trusted_client_cert_header.name,
+            "X-Amzn-Mtls-Clientcert"
+        );
+        assert_eq!(
+            merged.trusted_client_cert_header.trusted_proxies,
+            ["10.0.0.0/16"]
+        );
+    }
+
+    /// A pushed policy sets the JWKS URL but not the CA, certificate or proxy used to fetch it.
+    #[test]
+    fn with_policy_from_keeps_how_the_jwks_is_fetched_edge_local() {
+        let mut local = Config::default();
+        local.auth.jwt.outbound.ca_path = "/etc/eggrd/corp-ca.pem".into();
+        local.auth.jwt.outbound.proxy = "none".into();
+        let policy = "[auth]\nmode = \"jwt\"\n\n[auth.jwt]\nalgorithm = \"ES256\"\njwks_url = \"https://idp.example/jwks\"\nca_path = \"/tmp/evil-ca.pem\"\nproxy = \"http://evil:3128\"\n";
+        let merged = local.with_policy_from(policy).unwrap();
+        assert_eq!(merged.auth.mode, "jwt");
+        assert_eq!(merged.auth.jwt.jwks_url, "https://idp.example/jwks");
+        assert_eq!(merged.auth.jwt.outbound.ca_path, "/etc/eggrd/corp-ca.pem");
+        assert_eq!(merged.auth.jwt.outbound.proxy, "none");
+    }
+
+    /// The four keys sit directly in each section, and reach the field they name.
+    #[test]
+    fn outbound_settings_parse_in_every_section() {
+        let mut toml = String::new();
+        for section in [
+            "control_plane",
+            "log.ship",
+            "tracing",
+            "metrics.otlp",
+            "auth.jwt",
+            "alerts",
+            "llm.telemetry",
+            "tls.acme",
+            "tls.acme.dns",
+        ] {
+            toml.push_str(&format!(
+                "[{section}]\nca_path = \"{section}-ca\"\nclient_cert_path = \"{section}-cert\"\n\
+                 client_key_path = \"{section}-key\"\nproxy = \"none\"\n\n"
+            ));
+        }
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        for (section, o) in [
+            ("control_plane", &cfg.control_plane.outbound),
+            ("log.ship", &cfg.log.ship.outbound),
+            ("tracing", &cfg.tracing.outbound),
+            ("metrics.otlp", &cfg.metrics.otlp.outbound),
+            ("auth.jwt", &cfg.auth.jwt.outbound),
+            ("alerts", &cfg.alerts.outbound),
+            ("llm.telemetry", &cfg.llm.telemetry.outbound),
+            ("tls.acme", &cfg.tls.acme.outbound),
+            ("tls.acme.dns", &cfg.tls.acme.dns.outbound),
+        ] {
+            assert_eq!(o.ca_path, format!("{section}-ca"));
+            assert_eq!(o.client_cert_path, format!("{section}-cert"));
+            assert_eq!(o.client_key_path, format!("{section}-key"));
+            assert_eq!(o.proxy, "none");
+        }
+        // The section's own keys still parse beside them, defaults included.
+        let cfg: Config = toml::from_str(
+            "[log.ship]\nenabled = true\nurl = \"https://c\"\nbatch = 7\nheaders = [[\"a\", \"b\"]]\n\
+             ca_path = \"x\"\n\n[tracing]\nsample_rate = 0.25\ntimeout_ms = 900\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.log.ship.batch, 7);
+        assert_eq!(cfg.log.ship.headers, [("a".to_string(), "b".to_string())]);
+        assert_eq!(cfg.log.ship.outbound.ca_path, "x");
+        assert_eq!(cfg.tracing.sample_rate, 0.25);
+        assert_eq!(cfg.tracing.timeout_ms, 900);
+        assert_eq!(cfg.tracing.queue_size, 10_000, "defaults still apply");
+
+        // [tls.acme] reads its own keys, its [tls.acme.dns] table and the outbound ones together.
+        let cfg: Config = toml::from_str(
+            "[tls.acme]\nenabled = true\ndomains = [\"a.example\", \"b.example\"]\nrenew = false\n\
+             proxy = \"http://egress:3128\"\n\n[tls.acme.dns]\nprovider = \"cloudflare\"\n\
+             propagation_secs = 5\nproxy = \"none\"\n",
+        )
+        .unwrap();
+        let acme = &cfg.tls.acme;
+        assert!(acme.enabled && !acme.renew && acme.ari, "{acme:?}");
+        assert_eq!(acme.domains, ["a.example", "b.example"]);
+        assert_eq!(acme.outbound.proxy, "http://egress:3128");
+        assert_eq!(acme.dns.provider, "cloudflare");
+        assert_eq!(acme.dns.propagation_secs, 5);
+        assert_eq!(acme.dns.outbound.proxy, "none", "each table keeps its own");
+        assert_eq!(
+            acme.directory_url, "https://acme-staging-v02.api.letsencrypt.org/directory",
+            "defaults still apply"
+        );
+    }
+
+    #[test]
+    fn outbound_defaults_reach_every_section_from_load_and_stay_edge_local() {
+        let path = std::env::temp_dir().join(format!("eg-outbound-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            "[outbound]\nextra_ca_path = \"/etc/eggrd/corp-ca.pem\"\n\
+             client_cert_path = \"/etc/eggrd/edge.pem\"\nclient_key_path = \"/etc/eggrd/edge.key\"\n\
+             proxy = \"http://egress:3128\"\n\n[log.ship]\nproxy = \"none\"\n",
+        )
+        .unwrap();
+        let local = Config::load(path.to_str()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(local.outbound.proxy, "http://egress:3128");
+        let clients = local.outbound_clients();
+        let sections: Vec<&str> = clients.iter().map(|c| c.section).collect();
+        assert_eq!(
+            sections,
+            [
+                "control_plane",
+                "log.ship",
+                "tracing",
+                "metrics.otlp",
+                "auth.jwt",
+                "alerts",
+                "llm.telemetry",
+                "tls.acme",
+                "tls.acme.dns"
+            ]
+        );
+        for c in &clients {
+            assert_eq!(
+                c.outbound.defaults.client_cert_path, "/etc/eggrd/edge.pem",
+                "{}",
+                c.section
+            );
+            assert_eq!(c.outbound.defaults.extra_ca_path, "/etc/eggrd/corp-ca.pem");
+        }
+        // The section's own key is kept beside the inherited ones; resolving it is the client's.
+        assert_eq!(local.log.ship.outbound.proxy, "none");
+        assert_eq!(local.log.ship.outbound.defaults.proxy, "http://egress:3128");
+        assert!(
+            Config::default()
+                .outbound_clients()
+                .iter()
+                .all(|c| !c.enabled),
+            "nothing is on by default"
+        );
+
+        // A pushed policy cannot repoint it: not the defaults, not the sections that take them.
+        let policy =
+            "[outbound]\nproxy = \"http://cp-chosen:3128\"\nextra_ca_path = \"/tmp/cp-ca.pem\"\n\n\
+                      [auth.jwt]\njwks_url = \"https://idp.example/jwks\"\n";
+        let merged = local.with_policy_from(policy).unwrap();
+        assert_eq!(merged.outbound.proxy, "http://egress:3128");
+        assert_eq!(merged.outbound.extra_ca_path, "/etc/eggrd/corp-ca.pem");
+        assert_eq!(merged.auth.jwt.jwks_url, "https://idp.example/jwks");
+        for c in merged.outbound_clients() {
+            assert_eq!(
+                c.outbound.defaults.proxy, "http://egress:3128",
+                "{}",
+                c.section
+            );
+        }
     }
 
     #[test]

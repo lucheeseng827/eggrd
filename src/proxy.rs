@@ -25,7 +25,7 @@ use axum::{
 use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, RateLimiter};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::{Body as HttpBody, Frame, SizeHint};
-use hyper_util::client::legacy::{connect::HttpConnector, Client};
+use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -34,20 +34,28 @@ use crate::auth::{AuthEngine, Challenge, Decision};
 use crate::config::{Config, HeadersCfg};
 use crate::limiter::{Admit, DistributedLimiter};
 use crate::metrics::Metrics;
+use crate::upstream::UpstreamResult;
 use crate::waf::{WafEngine, WafMode};
 
 pub type KeyedLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 /// Rate limiter keyed by the authenticated principal (per-key limiting).
 pub type StrLimiter = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 /// The upstream client. Its body type is axum's boxed [`Body`], so one client carries both a
-/// buffered request (`Body::from(bytes)`) and a streamed one ([`StreamedRequestBody`]).
-pub type UpstreamClient = Client<HttpConnector, Body>;
+/// buffered request (`Body::from(bytes)`) and a streamed one ([`StreamedRequestBody`]). Its
+/// connector speaks TLS to `https://` upstreams ([`crate::upstream`]).
+pub type UpstreamClient = Client<crate::upstream::UpstreamConnector, Body>;
 
 /// Shared, cheaply-cloned handle the router hands to every request. Only the hot-swappable
 /// [`Runtime`] changes on reload; the client and metrics are stable.
 #[derive(Clone)]
 pub struct AppState {
     pub client: UpstreamClient,
+    /// The connector `client` was built on, for the health checks that need it with other TLS
+    /// settings (see [`crate::upstream::UpstreamConnector::with_tls_of`]).
+    pub connector: crate::upstream::UpstreamConnector,
+    /// The TLS settings the client's connector uses, held here too so the client certificates in
+    /// them can be watched for changes on disk.
+    pub upstream_tls: Arc<crate::upstream::UpstreamTls>,
     pub metrics: Arc<Metrics>,
     pub runtime: Arc<ArcSwap<Runtime>>,
     /// Managed-mode control-plane client (`Some` only when `[control_plane]` is enabled). Used to
@@ -57,6 +65,16 @@ pub struct AppState {
     /// hard-stop gate below. Lives here (not on the hot-swappable [`Runtime`]) so a policy reload
     /// never resets enforcement. Inert unless `control_plane.enforce_quota` is set.
     pub quota: Arc<crate::cp::QuotaState>,
+    /// Set when shutdown begins. `/__edgeguard/ready` answers `503` from then on, so a load
+    /// balancer stops sending new traffic while the listeners drain.
+    pub draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Set while `control_plane.boot_without_policy = "refuse"` and no control-plane policy has
+    /// been applied: proxied requests and readiness get `503`. Cleared by
+    /// [`crate::policy::Policy`] when one is.
+    pub policy_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// `[trusted_client_cert_header]`: client certificates a load balancer forwards. Read at
+    /// startup and fixed for the process, like `upstream_tls`.
+    pub client_cert_header: Option<Arc<crate::client_cert_header::TrustedHeader>>,
 }
 
 /// A per-route rate-limit override: requests whose path starts with `prefix` use `limiter`.
@@ -69,12 +87,17 @@ pub struct RouteLimiter {
 /// swapped in atomically.
 pub struct Runtime {
     pub cfg: Arc<Config>,
-    /// Default upstream base URL (the single `server.upstream`/`app_port`), used when no
+    /// The default upstream (the single `server.upstream`/`app_port`), used when no
     /// `[[upstreams]]` prefix matches.
-    pub upstream_base: Arc<String>,
-    /// Per-path-prefix upstream overrides as `(prefix, base)`; the longest matching prefix wins.
-    /// Empty unless `[[upstreams]]` is configured.
-    pub upstream_routes: Vec<(String, Arc<String>)>,
+    pub default_upstream: crate::pool::Pool,
+    /// Per-path-prefix upstreams as `(prefix, pool)`; the longest matching prefix wins. Empty
+    /// unless `[[upstreams]]` is configured.
+    pub upstream_routes: Vec<(String, crate::pool::Pool)>,
+    /// The `route` label of the per-route metrics, as `(prefix, label)`: every `[[upstreams]]` and
+    /// `[[ratelimit.routes]]` prefix, labelled by its `name` or the prefix itself. The longest
+    /// matching prefix wins; nothing matching is [`crate::metrics::DEFAULT_ROUTE`]. Labels come
+    /// only from config, so a request cannot add one.
+    pub route_labels: Vec<(String, String)>,
     pub auth: AuthEngine,
     /// WAF-lite input screener. Inert (`evaluate` returns `None`) when `waf.mode = "off"`.
     pub waf: Arc<WafEngine>,
@@ -113,6 +136,8 @@ pub struct Runtime {
     /// Tunnel WebSocket / `Upgrade` connections to the upstream. See
     /// [`crate::config::ValidationCfg::websocket_passthrough`].
     pub websocket_passthrough: bool,
+    /// What happens to `X-Forwarded-Client-Cert` on the way upstream (`[tls.client_auth]`).
+    pub client_cert_header: crate::client_auth::ForwardPolicy,
     /// Compiled LLM token-metering runtime (price book + on/off). Inert when `[llm]` is disabled.
     pub llm: Arc<crate::llm::LlmRuntime>,
     /// Compiled LLM hard-budget engine (gateway L1). `None` when no `[[llm.budgets]]` are configured.
@@ -131,15 +156,40 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// The upstream base URL to forward `path` to: the longest matching `[[upstreams]]` prefix,
-    /// or the default [`Runtime::upstream_base`] when none match.
-    pub fn pick_upstream(&self, path: &str) -> &str {
+    /// The per-route metrics label for `path` (see [`Runtime::route_labels`]).
+    pub fn route_label(&self, path: &str) -> &str {
+        self.route_labels
+            .iter()
+            .filter(|(prefix, _)| path_prefix_matches(path, prefix))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .map(|(_, label)| label.as_str())
+            .unwrap_or(crate::metrics::DEFAULT_ROUTE)
+    }
+
+    /// The upstreams to forward `path` to: the longest matching `[[upstreams]]` prefix, or the
+    /// default [`Runtime::default_upstream`] when none match.
+    pub fn pick_upstream(&self, path: &str) -> &crate::pool::Pool {
         self.upstream_routes
             .iter()
             .filter(|(prefix, _)| path_prefix_matches(path, prefix))
             .max_by_key(|(prefix, _)| prefix.len())
-            .map(|(_, base)| base.as_str())
-            .unwrap_or_else(|| self.upstream_base.as_str())
+            .map(|(_, pool)| pool)
+            .unwrap_or(&self.default_upstream)
+    }
+
+    /// Every route's upstreams, the default first.
+    pub fn pools(&self) -> impl Iterator<Item = &crate::pool::Pool> + Clone {
+        std::iter::once(&self.default_upstream).chain(self.upstream_routes.iter().map(|(_, p)| p))
+    }
+
+    /// Keep the health of the pool targets `old` already tracked: same route prefix, same URL.
+    /// Called on every rebuild, so a reload does not put a dead target back in rotation.
+    pub fn carry_health_from(&mut self, old: &Runtime) {
+        for (prefix, pool) in &mut self.upstream_routes {
+            if let Some((_, previous)) = old.upstream_routes.iter().find(|(p, _)| p == prefix) {
+                pool.carry_health_from(previous);
+            }
+        }
     }
 }
 
@@ -180,6 +230,13 @@ pub async fn handle(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request<Body>,
 ) -> Response<Body> {
+    // Read before the runtime, which is stored before this is cleared: a request that sees no
+    // policy pending is sure to load the policy's runtime, never the local-only one it replaced.
+    // Read after, a request could load the local runtime, then see the first policy arrive, and
+    // be served on the very config `boot_without_policy = "refuse"` says not to serve on.
+    let policy_pending = state
+        .policy_pending
+        .load(std::sync::atomic::Ordering::Acquire);
     // One atomic load pins a consistent policy snapshot for the whole request, even if a reload
     // swaps in a new Runtime mid-flight — routing, auth, *and* the final CORS decoration below all
     // see the same one (loading again here could decorate with a policy the request never used).
@@ -209,10 +266,109 @@ pub async fn handle(
         }
     }
 
-    let mut resp = handle_inner(&state, &rt, peer, req).await;
+    // Per-route and per-consumer metrics, and the access line. The route is decided from config
+    // before the pipeline runs; the rest is learned on the way through, into `ctx`.
+    let started = Instant::now();
+    let method = req.method().clone();
+    let route_label = rt.route_label(req.uri().path()).to_string();
+    let route = state.metrics.route_stats(&route_label);
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .map(|v| crate::accesslog::user_agent(v.as_bytes()));
+    let tls_version = req
+        .extensions()
+        .get::<crate::serve::TlsVersion>()
+        .map(|v| v.0);
+    // A certificate the load balancer forwards, from a trusted peer, becomes the request's client
+    // certificate before anything reads it; the balancer's own handshake certificate, if any, was
+    // the hop's. The header is gone from the request either way. Trust is the TCP peer's: the hop
+    // that wrote the header, not a client a PROXY protocol header named.
+    if let Some(header) = &state.client_cert_header {
+        let hop = req
+            .extensions()
+            .get::<crate::serve::TcpPeer>()
+            .map_or(peer, |p| p.0);
+        if let Some(result) = header.apply(hop.ip(), &mut req) {
+            state.metrics.record_client_cert_header(result);
+        }
+    }
+    let client_cert = req
+        .extensions()
+        .get::<Arc<crate::client_auth::ClientCert>>()
+        .cloned();
+    let ctx = Arc::new(RequestCtx::default());
+
+    let mut resp = handle_inner(&state, &rt, policy_pending, peer, req, &ctx).await;
     if let Some(origin) = &origin {
         if let Some(cors) = &rt.cors {
             cors.decorate_origin(origin, &mut resp);
+        }
+    }
+
+    // Every response counts, the edge's own `401`/`429`/`403` included: a request refused before
+    // authentication is the unauthenticated consumer's.
+    let status = resp.status().as_u16();
+    let elapsed = started.elapsed();
+    route.record(method.as_str(), status, elapsed);
+    if let Some(busy) = ctx.upstream_busy.get() {
+        state
+            .metrics
+            .observe_edge_overhead(elapsed.saturating_sub(*busy));
+    }
+    if let Some(stats) = ctx
+        .consumer
+        .get()
+        .cloned()
+        .or_else(|| state.metrics.consumer_stats(None))
+    {
+        stats.record(status);
+    }
+
+    // The access line. A streamed response's body writes it when it ends, so its bytes and
+    // duration are the real ones; every other response's is written now.
+    if let Some(info) = resp.extensions().get::<FinishInfo>() {
+        let names = rt.cfg.log.principal;
+        let (bytes_in, bytes_out) = match ctx.bytes.get() {
+            Some((i, o)) => (Some(*i), Some(*o)),
+            None => (None, None),
+        };
+        let line = AccessLine {
+            started,
+            record: crate::logship::AccessRecord {
+                schema: crate::logship::ACCESS_RECORD_SCHEMA,
+                ts: String::new(),
+                request_id: info.request_id.clone(),
+                method: method.to_string(),
+                target: info.target.clone(),
+                client_ip: info.client_ip.to_string(),
+                status,
+                outcome: info.outcome.clone(),
+                latency_ms: info.elapsed.as_millis() as u64,
+                duration_ms: 0,
+                edge_id: String::new(),
+                route: route_label,
+                principal: ctx.principal.get().and_then(|p| names.apply(p)),
+                user_agent,
+                upstream: ctx.upstream.get().cloned(),
+                upstream_ms: ctx.upstream_ms.get().copied(),
+                bytes_in,
+                bytes_out,
+                tls_version: tls_version.map(str::to_string),
+                client_cert: client_cert.and_then(|c| {
+                    let name = c
+                        .identities()
+                        .next()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("sha256:{}", c.sha256));
+                    names.apply(&name)
+                }),
+            },
+        };
+        if ctx.streamed.load(std::sync::atomic::Ordering::Acquire) {
+            *ctx.pending.lock().expect("request ctx mutex poisoned") = Some(line);
+        } else {
+            write_access_line(&state.metrics, line);
         }
     }
 
@@ -345,8 +501,10 @@ fn unix_nanos() -> u128 {
 async fn handle_inner(
     state: &AppState,
     rt: &Runtime,
+    policy_pending: bool,
     peer: SocketAddr,
     req: Request<Body>,
+    ctx: &Arc<RequestCtx>,
 ) -> Response<Body> {
     let started = Instant::now();
     let m = &state.metrics;
@@ -390,6 +548,16 @@ async fn handle_inner(
             "not_found",
             text(StatusCode::NOT_FOUND, "Not Found"),
         );
+    }
+
+    // Managed mode with `boot_without_policy = "refuse"`, before any policy has arrived: the
+    // runtime is the local config file alone, which this edge was told not to serve on. Before
+    // every other step, since every other step is policy. Read in `handle`, before `rt`.
+    if policy_pending {
+        let mut resp = text(StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable");
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return finish(m, &rid, &method, &path, ip, started, "no_policy", resp);
     }
 
     // 0) IP access control. A coarse network gate (CIDR allow/deny) evaluated before auth and
@@ -516,9 +684,20 @@ async fn handle_inner(
         }
     }
 
-    // 2) Authentication. On success we learn the principal for per-key limiting.
-    let principal = match rt.auth.authorize(&rt.cfg.auth, req.headers()).await {
-        Decision::Allow(principal) => principal,
+    // 2) Authentication. On success we learn the principal for per-key limiting, and, for a
+    //    verified JWT, its claims, which may choose a vault entry and key a budget. The client
+    //    certificate, when the TLS listener verified one, is what `auth.mode = "mtls"` reads.
+    let client_cert = req
+        .extensions()
+        .get::<Arc<crate::client_auth::ClientCert>>()
+        .cloned();
+    let (principal, claims) = match rt
+        .auth
+        .authorize_with_cert(&rt.cfg.auth, req.headers(), client_cert.as_deref())
+        .await
+    {
+        Decision::Allow(principal) => (principal, None),
+        Decision::AllowJwt(principal, claims) => (principal, Some(claims)),
         Decision::Deny(challenge) => {
             let mut resp = text(StatusCode::UNAUTHORIZED, "Unauthorized");
             let challenge_value = match challenge {
@@ -534,6 +713,13 @@ async fn handle_inner(
             return finish(m, &rid, &method, &path, ip, started, "unauthorized", resp);
         }
     };
+    // From here on the request is this principal's (or the anonymous consumer's, with no auth).
+    if let Some(stats) = m.consumer_stats(principal.as_deref()) {
+        let _ = ctx.consumer.set(stats);
+    }
+    if let Some(p) = &principal {
+        let _ = ctx.principal.set(p.clone());
+    }
 
     // 3) Per-key rate limit (only for authenticated principals). Routed to the distributed
     //    limiter when configured, else the in-process per-key limiter.
@@ -617,7 +803,11 @@ async fn handle_inner(
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer "))
                 .map(str::trim);
-            match presented.and_then(|k| vault.lookup(k)) {
+            // A virtual key, or else the verified claims of the request's JWT.
+            match presented
+                .and_then(|k| vault.lookup(k))
+                .or_else(|| claims.as_deref().and_then(|c| vault.lookup_claims(c)))
+            {
                 Some(entry) => {
                     if !entry.model_allowed(None) {
                         m.record_keyvault("denied_model");
@@ -668,7 +858,10 @@ async fn handle_inner(
                 }
             }
         }
-        return proxy_upgrade(state, rt, req, &rid, &method, &raw_path, &path, ip, started).await;
+        return proxy_upgrade(
+            state, rt, req, &rid, &method, &raw_path, &path, ip, started, ctx,
+        )
+        .await;
     }
 
     // 5) Buffer the body up to the configured limit.
@@ -951,7 +1144,11 @@ async fn handle_inner(
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
             .map(str::trim);
-        match presented.and_then(|k| vault.lookup(k)) {
+        // A virtual key, or else the verified claims of the request's JWT.
+        match presented
+            .and_then(|k| vault.lookup(k))
+            .or_else(|| claims.as_deref().and_then(|c| vault.lookup_claims(c)))
+        {
             Some(entry) => {
                 // Fail closed: a request whose model is absent or unparseable is denied when the
                 // key has a non-empty allowlist — same as an explicitly off-list model.
@@ -1065,6 +1262,7 @@ async fn handle_inner(
             .filter(|s| !s.is_empty());
         let dims = crate::budget::Dims {
             principal: principal.as_deref(),
+            claims: claims.as_deref(),
             // Normalize a provider-prefixed model ("openai/gpt-4o") to the bare name for budget
             // attribution, so a prefixed request can't silently escape a bare-named per-model budget.
             model: crate::llm::canonical_model(model),
@@ -1129,15 +1327,17 @@ async fn handle_inner(
         }
     }
 
-    // 7) Build the upstream request (the per-path upstream override, or the default).
+    // 7) Build the upstream request (the per-path upstream override, or the default), for the
+    // first of the route's targets to try.
     // Two forms again, and for the same reason as `raw_path`/`path` above: `uri` is forwarded and
-    // must carry the client's query verbatim, `log_uri` is what a timeout or a connection error
-    // writes to the log. Redacting the access log and then printing the same `?api_key=` in a
+    // must carry the client's query verbatim, `log_uri` (below) is what a timeout or a connection
+    // error writes to the log. Redacting the access log and then printing the same `?api_key=` in a
     // `warn!` on the failure path would leak exactly the credentials this is meant to keep out — and
     // on the path an operator is most likely to be reading.
-    let upstream_base = rt.pick_upstream(&raw_path);
-    let uri = format!("{upstream_base}{raw_path}");
-    let log_uri = format!("{upstream_base}{path}");
+    let pool = rt.pick_upstream(&raw_path);
+    let affinity = pool.affinity(&parts.headers, &parts.uri, ip);
+    let tries = pool.order_for(&affinity);
+    let uri = format!("{}{raw_path}", tries[0].base);
     let mut up = Request::builder().method(parts.method.clone()).uri(&uri);
     {
         let headers = up.headers_mut().expect("builder headers");
@@ -1145,16 +1345,13 @@ async fn handle_inner(
         // forwarding, so they don't leak across the proxy boundary.
         let mut forwarded = parts.headers.clone();
         strip_hop_by_hop(&mut forwarded);
+        pool.strip_sticky_cookie(&mut forwarded);
         // The body is re-sent from a sized `Full`, so the client's Content-Length may be stale (it
         // is once DLP redaction rewrote the body). Drop it and let the upstream client recompute the
         // correct length from the body, rather than forwarding a mismatched header.
         forwarded.remove(header::CONTENT_LENGTH);
-        for (name, value) in forwarded.iter() {
-            if name == header::HOST {
-                continue; // let the client set Host for the upstream
-            }
-            headers.insert(name.clone(), value.clone());
-        }
+        forward_headers(&forwarded, headers);
+        set_client_cert_header(headers, rt.client_cert_header, client_cert.as_deref());
         // Standard forwarding headers.
         if let Ok(v) = HeaderValue::from_str(&ip.to_string()) {
             headers.insert(HeaderName::from_static("x-forwarded-for"), v);
@@ -1207,6 +1404,9 @@ async fn handle_inner(
     let request_blocked = streamed_body
         .as_ref()
         .map(StreamedRequestBody::blocked_flag);
+    // The body again, for the next target should the first refuse the connection. Only a buffered
+    // one: a streamed body is read as it is sent, once.
+    let replay = (tries.len() > 1 && streamed_body.is_none()).then(|| body_bytes.clone());
     let upstream_body = match streamed_body {
         Some(b) => Body::new(b),
         None => Body::from(body_bytes),
@@ -1229,15 +1429,51 @@ async fn handle_inner(
     };
 
     // 8) Forward and collect the response under a single deadline, so a stalled upstream
-    //    can't pin this task. `None` => no timeout (validation.upstream_timeout = "0").
+    //    can't pin this task. `None` => no timeout (validation.upstream_timeout = "0"). The
+    //    deadline covers every target tried.
     let deadline = rt.upstream_timeout.map(|d| tokio::time::Instant::now() + d);
+    let template = (tries.len() > 1).then(|| {
+        (
+            upstream_req.method().clone(),
+            upstream_req.headers().clone(),
+        )
+    });
+    let again = |target: &crate::pool::Target| {
+        let (method, headers) = template.as_ref()?;
+        let mut req = Request::builder()
+            .method(method.clone())
+            .uri(format!("{}{raw_path}", target.base))
+            .body(Body::from(replay.clone()?))
+            .ok()?;
+        *req.headers_mut() = headers.clone();
+        Some(req)
+    };
+
+    // The wait, from the first send to the answer, for the access log's `upstream_ms`; the target
+    // that answered gets its own attempt's in its histogram. An exchange the edge itself cut short
+    // (the request body over its cap, or blocked by inspection) says nothing about the upstream
+    // and is not counted against it.
+    let sent = Instant::now();
+    let attempt = send_to_pool(state, pool, &tries, upstream_req, again, deadline, &path).await;
+    let waited = sent.elapsed();
+    let target = attempt.target;
+    // In flight until `ctx` goes: when this returns, or a streamed body (which holds it) ends.
+    if let Some(in_flight) = attempt.in_flight {
+        let _ = ctx.in_flight.set(in_flight);
+    }
+    let up_stats = m.upstream_stats(&target.label);
+    let _ = ctx.upstream.set(target.label.clone());
+    let log_uri = format!("{}{path}", target.base);
     let timed_out = || {
         warn!(upstream = %log_uri, "upstream timed out");
         text(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout")
     };
-
-    let upstream_resp = match within(deadline, state.client.request(upstream_req)).await {
-        Ok(Ok(r)) => r,
+    let _ = ctx.upstream_ms.set(waited.as_millis() as u64);
+    let upstream_resp = match attempt.result {
+        Ok(Ok(r)) => {
+            up_stats.observe_headers(attempt.waited);
+            r
+        }
         Ok(Err(_))
             if request_cut
                 .as_ref()
@@ -1266,7 +1502,12 @@ async fn handle_inner(
             );
         }
         Ok(Err(e)) => {
-            warn!(error = %e, upstream = %log_uri, "upstream unreachable");
+            up_stats.record(UpstreamResult::classify(&e));
+            warn!(
+                error = crate::upstream::error_chain(&e),
+                upstream = %log_uri,
+                "upstream unreachable"
+            );
             return finish(
                 m,
                 &rid,
@@ -1279,6 +1520,7 @@ async fn handle_inner(
             );
         }
         Err(_) => {
+            up_stats.record(UpstreamResult::Timeout);
             return finish(
                 m,
                 &rid,
@@ -1288,11 +1530,18 @@ async fn handle_inner(
                 started,
                 "upstream_timeout",
                 timed_out(),
-            )
+            );
         }
     };
 
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
+    // Before hardening, which treats it as it does the upstream's own cookies.
+    if let Some(cookie) = pool.sticky_cookie(&affinity, target) {
+        resp_parts.headers.append(header::SET_COOKIE, cookie);
+    }
+    // How the exchange ended once the upstream has answered: by its status, unless reading a
+    // buffered body fails below.
+    let answered = UpstreamResult::from_status(resp_parts.status.as_u16());
 
     // 8a) SSE passthrough: forward a `text/event-stream` response frame-by-frame instead of
     //     buffering the whole body, so the client sees events as they arrive (time-to-first-byte
@@ -1326,6 +1575,9 @@ async fn handle_inner(
             rt.dlp.as_ref().is_some_and(|d| d.scan_response()),
         );
     if sse_stream || whole_stream {
+        // A streamed body is not waited for: the exchange is counted on its headers.
+        up_stats.record(answered);
+        let _ = ctx.upstream_busy.set(waited);
         strip_hop_by_hop(&mut resp_parts.headers);
         if sse_stream {
             resp_parts.headers.remove(header::CONTENT_LENGTH);
@@ -1394,25 +1646,31 @@ async fn handle_inner(
         let body = if whole_stream && rt.max_response_body > 0 {
             // Over the cap, `Limited` errors the stream and the connection is cut: the headers are
             // already out, so a short body is the only signal left to give.
-            Body::new(CountingBody::new(
-                Limited::new(resp_body, rt.max_response_body),
-                Arc::clone(m),
-                Arc::clone(&ingress),
-                header_egress,
-                llm_meter,
-                dlp_scanner,
-                unmasker,
-            ))
+            Body::new(
+                CountingBody::new(
+                    Limited::new(resp_body, rt.max_response_body),
+                    Arc::clone(m),
+                    Arc::clone(&ingress),
+                    header_egress,
+                    llm_meter,
+                    dlp_scanner,
+                    unmasker,
+                )
+                .with_ctx(Arc::clone(ctx)),
+            )
         } else {
-            Body::new(CountingBody::new(
-                resp_body,
-                Arc::clone(m),
-                Arc::clone(&ingress),
-                header_egress,
-                llm_meter,
-                dlp_scanner,
-                unmasker,
-            ))
+            Body::new(
+                CountingBody::new(
+                    resp_body,
+                    Arc::clone(m),
+                    Arc::clone(&ingress),
+                    header_egress,
+                    llm_meter,
+                    dlp_scanner,
+                    unmasker,
+                )
+                .with_ctx(Arc::clone(ctx)),
+            )
         };
         let mut response = Response::from_parts(resp_parts, body);
         harden_response(&rt.cfg, &mut response);
@@ -1428,8 +1686,17 @@ async fn handle_inner(
         )
         .await
         {
-            Ok(Ok(c)) => c.to_bytes(),
-            Ok(Err(_)) => {
+            Ok(Ok(c)) => {
+                up_stats.record(answered);
+                c.to_bytes()
+            }
+            Ok(Err(e)) => {
+                // Over the cap is the edge's limit, not an upstream failure; a broken body is.
+                up_stats.record(if e.is::<http_body_util::LengthLimitError>() {
+                    answered
+                } else {
+                    UpstreamResult::classify(&*e)
+                });
                 warn!(
                     limit = rt.max_response_body,
                     "upstream response exceeded max_response_body"
@@ -1446,6 +1713,7 @@ async fn handle_inner(
                 );
             }
             Err(_) => {
+                up_stats.record(UpstreamResult::Timeout);
                 return finish(
                     m,
                     &rid,
@@ -1455,13 +1723,17 @@ async fn handle_inner(
                     started,
                     "upstream_timeout",
                     timed_out(),
-                )
+                );
             }
         }
     } else {
         match within(deadline, resp_body.collect()).await {
-            Ok(Ok(c)) => c.to_bytes(),
+            Ok(Ok(c)) => {
+                up_stats.record(answered);
+                c.to_bytes()
+            }
             Ok(Err(e)) => {
+                up_stats.record(UpstreamResult::classify(&e));
                 warn!(error = %e, "failed reading upstream body");
                 return finish(
                     m,
@@ -1475,6 +1747,7 @@ async fn handle_inner(
                 );
             }
             Err(_) => {
+                up_stats.record(UpstreamResult::Timeout);
                 return finish(
                     m,
                     &rid,
@@ -1484,10 +1757,13 @@ async fn handle_inner(
                     started,
                     "upstream_timeout",
                     timed_out(),
-                )
+                );
             }
         }
     };
+
+    // Waiting on the upstream ends here; what follows (inspection, rewriting) is the edge's.
+    let _ = ctx.upstream_busy.set(sent.elapsed());
 
     // The body was rebuffered, so let the server recompute framing; strip hop-by-hop headers
     // (incl. any named by `Connection`) so they don't leak downstream.
@@ -1496,10 +1772,15 @@ async fn handle_inner(
 
     // Managed-mode usage: this is the proxied path, where both bodies are buffered, so the byte
     // counts are exact. (`add_usage_request` is recorded for every request in `finish`.)
-    m.add_usage_bytes(
+    let (bytes_in, bytes_out) = (
         ingress.load(std::sync::atomic::Ordering::Relaxed),
         header_bytes(&resp_parts.headers).saturating_add(resp_bytes.len()),
     );
+    m.add_usage_bytes(bytes_in, bytes_out);
+    if let Some(stats) = ctx.consumer.get() {
+        stats.add_bytes(bytes_in, bytes_out);
+    }
+    let _ = ctx.bytes.set((bytes_in as u64, bytes_out as u64));
 
     // LLM token metering on the buffered (non-streaming) path: read the upstream's own `usage`
     // object. Priced model -> tokens + cost; unmapped model -> tokens only; no usage -> just count
@@ -1787,12 +2068,51 @@ pub(crate) fn streams_any_response(
     enabled && !llm_route && !reversible_dlp && !dlp_scans_response
 }
 
+/// `X-Forwarded-Client-Cert` on the way upstream. While client authentication is on the client's
+/// own is always dropped — EdgeGuard terminated the client's TLS, so no one in front of it could
+/// have written one the app should believe — and with `forward_client_cert = "xfcc"` it is
+/// replaced by one describing the certificate the listener verified.
+fn set_client_cert_header(
+    headers: &mut HeaderMap,
+    policy: crate::client_auth::ForwardPolicy,
+    cert: Option<&crate::client_auth::ClientCert>,
+) {
+    if policy.strip_inbound {
+        headers.remove(crate::client_auth::XFCC_HEADER);
+    }
+    if let (true, Some(cert)) = (policy.forward, cert) {
+        if let Ok(v) = HeaderValue::from_str(&cert.xfcc()) {
+            headers.insert(HeaderName::from_static(crate::client_auth::XFCC_HEADER), v);
+        }
+    }
+}
+
 /// Readiness probe. Returns `200` only if the upstream accepts a TCP connection, so a
 /// platform's readiness check reflects whether EdgeGuard can actually serve traffic — not
-/// merely that the process booted. `503` while the upstream is unreachable. (Liveness, i.e.
-/// "is EdgeGuard itself up", is the separate unconditional `/__edgeguard/health`.)
+/// merely that the process booted. `503` while the upstream is unreachable, while a `refuse` edge
+/// waits for its first control-plane policy, and from the moment shutdown begins, so traffic
+/// moves elsewhere before the listeners drain. (Liveness, i.e. "is
+/// EdgeGuard itself up", is the separate unconditional `/__edgeguard/health`, which stays `200`
+/// through the drain so the process is not killed early.)
 pub async fn ready(State(state): State<AppState>) -> StatusCode {
+    if state.draining.load(std::sync::atomic::Ordering::Acquire)
+        || state
+            .policy_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     let rt = state.runtime.load();
+    // A pool that serves everything is ready while any of its targets is in rotation: its checks
+    // already say what a connection here would.
+    let root = rt.pick_upstream("/");
+    if root.is_pool() {
+        return if root.any_in_rotation() {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+    }
     let Some((host, port)) = rt.cfg.upstream_probe_addr() else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
@@ -1820,15 +2140,52 @@ pub async fn metrics_handler(State(state): State<AppState>) -> Response<Body> {
     resp
 }
 
-/// The served TLS certificate (`GET /__edgeguard/tls`): source, serial, validity, days left,
-/// whether renewal is due, and the last renewal attempt. `404` when this listener does not
-/// terminate TLS. Lives with the other ops endpoints, so in split mode it is admin-port only.
+/// Every route's upstreams (`GET /__edgeguard/upstreams`), the default first: where each prefix
+/// goes and, for a pool, whether each target takes requests and why not (its health check, an
+/// ejection after failed connections), with each target's request counts. Reading it changes
+/// nothing, round-robin's turn included. An ops endpoint, so in split mode it is admin-port only.
+pub async fn upstreams_status(State(state): State<AppState>) -> Response<Body> {
+    let rt = state.runtime.load();
+    let requests = |label: &str| {
+        let counts = state.metrics.upstream_results(label);
+        serde_json::Value::Object(
+            UpstreamResult::ALL
+                .iter()
+                .zip(counts)
+                .map(|(r, n)| (r.label().to_string(), serde_json::json!(n)))
+                .collect(),
+        )
+    };
+    let routes: Vec<serde_json::Value> =
+        std::iter::once(rt.default_upstream.status_json(None, requests))
+            .chain(
+                rt.upstream_routes
+                    .iter()
+                    .map(|(prefix, pool)| pool.status_json(Some(prefix), requests)),
+            )
+            .collect();
+    let mut resp = Response::new(Body::from(
+        serde_json::json!({ "routes": routes }).to_string(),
+    ));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp
+}
+
+/// The edge's certificates (`GET /__edgeguard/tls`). For the served certificate, at the top level
+/// as in 0.5.0: source, serial, validity, days left, whether renewal is due, and the last renewal
+/// attempt. Then `sni` (the `[[tls.certs]]` pairs), `client_certs` (each client certificate the
+/// edge presents, and what presents it) and `client_auth` (the CAs and CRLs client certificates are
+/// checked against), each present only when there is one. `404` when there is no certificate at
+/// all. Lives with the other ops endpoints, so in split mode it is admin-port only.
 pub async fn tls_status(State(state): State<AppState>) -> Response<Body> {
-    match state.metrics.cert_store() {
+    let mut status = match state.metrics.cert_store() {
         Some(store) => {
             let mut status = store.status_json();
-            // Extra `[[tls.certs]]` pairs, each with the hosts it is served for. Absent (not an
-            // empty list) when there are none, so a single-certificate edge reads as it did in 0.5.0.
+            // Absent (not an empty list) when there are none, so a single-certificate edge reads as
+            // it did in 0.5.0.
             let sni = state.metrics.sni_certs();
             if !sni.is_empty() {
                 status["sni"] = serde_json::Value::Array(
@@ -1841,19 +2198,69 @@ pub async fn tls_status(State(state): State<AppState>) -> Response<Body> {
                         .collect(),
                 );
             }
-            let mut resp = Response::new(Body::from(status.to_string()));
-            resp.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            resp
+            status
         }
-        None => {
-            let mut resp = Response::new(Body::from("TLS is not enabled on this listener\n"));
-            *resp.status_mut() = StatusCode::NOT_FOUND;
-            resp
-        }
+        None => serde_json::json!({}),
+    };
+    let clients = state.metrics.client_certs();
+    if !clients.is_empty() {
+        status["client_certs"] = serde_json::Value::Array(
+            clients
+                .iter()
+                .map(|c| {
+                    let mut j = c.store.validity_json();
+                    j["used_by"] = serde_json::json!(c.used_by);
+                    j
+                })
+                .collect(),
+        );
     }
+    if let Some(auth) = state.metrics.client_auth() {
+        let mut j = trust_json(auth);
+        j["mode"] = serde_json::json!(auth.mode().label());
+        status["client_auth"] = j;
+    }
+    if let Some(header) = state.metrics.trusted_header() {
+        let mut j = header.verifier().map(trust_json).unwrap_or_default();
+        j["name"] = serde_json::json!(header.name().as_str());
+        j["format"] = serde_json::json!(format!("{:?}", header.format()).to_ascii_lowercase());
+        j["trusted_proxies"] = serde_json::json!(header.trusted_proxies());
+        j["trusted_proxy_names"] = serde_json::json!(header.trusted_proxy_names());
+        status["trusted_client_cert_header"] = j;
+    }
+    if status.as_object().is_some_and(|o| o.is_empty()) {
+        let mut resp = Response::new(Body::from("TLS is not enabled on this listener\n"));
+        *resp.status_mut() = StatusCode::NOT_FOUND;
+        return resp;
+    }
+    let mut resp = Response::new(Body::from(status.to_string()));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp
+}
+
+/// A client-certificate verifier's CA bundle and CRLs, for `GET /__edgeguard/tls`.
+fn trust_json(auth: &Arc<crate::client_auth::ClientAuth>) -> serde_json::Value {
+    let now = crate::certstore::now_unix();
+    let trust = auth.trust();
+    serde_json::json!({
+        "ca_path": auth.ca_path(),
+        "cas": trust.cas.iter().map(|ca| serde_json::json!({
+            "name": ca.name,
+            "serial": ca.info.serial,
+            "not_before": ca.info.not_before,
+            "not_after": ca.info.not_after,
+            "days_left": ca.info.days_left(now),
+        })).collect::<Vec<_>>(),
+        "crls": trust.crls.iter().map(|crl| serde_json::json!({
+            "name": crl.name,
+            "this_update": crl.info.this_update,
+            "next_update": crl.info.next_update,
+            "stale": crl.info.stale(now),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// CSP violation report sink (`POST /__edgeguard/csp-report`). Browsers POST a JSON report
@@ -1988,6 +2395,7 @@ async fn proxy_upgrade(
     path: &str,
     ip: IpAddr,
     started: Instant,
+    ctx: &Arc<RequestCtx>,
 ) -> Response<Body> {
     let m = &state.metrics;
 
@@ -1997,10 +2405,12 @@ async fn proxy_upgrade(
 
     // Build the upstream request: copy end-to-end headers AND the upgrade/connection headers
     // (the handshake needs them), add the forwarding headers, send an empty body.
-    let upstream_base = rt.pick_upstream(raw_path);
-    let uri = format!("{upstream_base}{raw_path}");
-    // The redacted form, for the failure logs below. See the note in `handle_inner`.
-    let log_uri = format!("{upstream_base}{path}");
+    // A sticky cookie is followed here but not set: a `101` is not hardened like other answers,
+    // and the page that opened the socket has set it already.
+    let pool = rt.pick_upstream(raw_path);
+    let affinity = pool.affinity(req.headers(), req.uri(), ip);
+    let tries = pool.order_for(&affinity);
+    let uri = format!("{}{raw_path}", tries[0].base);
     let mut up = Request::builder().method(req.method().clone()).uri(&uri);
     {
         let headers = up.headers_mut().expect("builder headers");
@@ -2010,12 +2420,13 @@ async fn proxy_upgrade(
         let upgrade = req.headers().get(header::UPGRADE).cloned();
         let mut forwarded = req.headers().clone();
         strip_hop_by_hop(&mut forwarded);
-        for (name, value) in forwarded.iter() {
-            if name == header::HOST {
-                continue;
-            }
-            headers.insert(name.clone(), value.clone());
-        }
+        pool.strip_sticky_cookie(&mut forwarded);
+        forward_headers(&forwarded, headers);
+        let client_cert = req
+            .extensions()
+            .get::<Arc<crate::client_auth::ClientCert>>()
+            .cloned();
+        set_client_cert_header(headers, rt.client_cert_header, client_cert.as_deref());
         headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
         if let Some(v) = upgrade {
             headers.insert(header::UPGRADE, v);
@@ -2051,6 +2462,35 @@ async fn proxy_upgrade(
     // Bound the handshake by the same `upstream_timeout` as the buffered path, so a stalled
     // upstream can't pin this task (a `None` deadline means no timeout).
     let deadline = rt.upstream_timeout.map(|d| tokio::time::Instant::now() + d);
+    // The handshake has no body, so any target refusing the connection can be followed by the next.
+    let template = (tries.len() > 1).then(|| {
+        (
+            upstream_req.method().clone(),
+            upstream_req.headers().clone(),
+        )
+    });
+    let again = |target: &crate::pool::Target| {
+        let (method, headers) = template.as_ref()?;
+        let mut req = Request::builder()
+            .method(method.clone())
+            .uri(format!("{}{raw_path}", target.base))
+            .body(Body::empty())
+            .ok()?;
+        *req.headers_mut() = headers.clone();
+        Some(req)
+    };
+
+    // Counted on the handshake's answer: what follows a `101` is a tunnel, not an exchange.
+    let sent = Instant::now();
+    let attempt = send_to_pool(state, pool, &tries, upstream_req, again, deadline, path).await;
+    let waited = sent.elapsed();
+    let target = attempt.target;
+    // A tunnel holds a connection to the target for its whole life: in flight until it closes.
+    let in_flight = attempt.in_flight;
+    let up_stats = m.upstream_stats(&target.label);
+    let _ = ctx.upstream.set(target.label.clone());
+    // The redacted form, for the failure logs below. See the note in `handle_inner`.
+    let log_uri = format!("{}{path}", target.base);
     let timed_out = || {
         warn!(upstream = %log_uri, "upstream timed out (upgrade)");
         finish(
@@ -2065,10 +2505,21 @@ async fn proxy_upgrade(
         )
     };
 
-    let mut up_resp = match within(deadline, state.client.request(upstream_req)).await {
-        Ok(Ok(r)) => r,
+    let _ = ctx.upstream_ms.set(waited.as_millis() as u64);
+    let mut up_resp = match attempt.result {
+        Ok(Ok(r)) => {
+            up_stats.observe_headers(attempt.waited);
+            up_stats.record(UpstreamResult::from_status(r.status().as_u16()));
+            let _ = ctx.upstream_busy.set(waited);
+            r
+        }
         Ok(Err(e)) => {
-            warn!(error = %e, upstream = %log_uri, "upstream unreachable (upgrade)");
+            up_stats.record(UpstreamResult::classify(&e));
+            warn!(
+                error = crate::upstream::error_chain(&e),
+                upstream = %log_uri,
+                "upstream unreachable (upgrade)"
+            );
             return finish(
                 m,
                 request_id,
@@ -2080,7 +2531,10 @@ async fn proxy_upgrade(
                 text(StatusCode::BAD_GATEWAY, "Bad Gateway"),
             );
         }
-        Err(_) => return timed_out(),
+        Err(_) => {
+            up_stats.record(UpstreamResult::Timeout);
+            return timed_out();
+        }
     };
 
     // Upstream declined to upgrade: forward its response as-is (the client sees the rejection),
@@ -2128,6 +2582,7 @@ async fn proxy_upgrade(
     // `101`: wire up the upstream-side upgrade and splice the two connections once both complete.
     let upstream_upgrade = hyper::upgrade::on(&mut up_resp);
     tokio::spawn(async move {
+        let _in_flight = in_flight;
         match tokio::join!(client_upgrade, upstream_upgrade) {
             (Ok(client_io), Ok(up_io)) => {
                 let mut client_io = TokioIo::new(client_io);
@@ -2197,6 +2652,9 @@ struct CountingBody<B> {
     /// A non-data (trailers) frame held back so the redaction flush is emitted *before* it, then
     /// returned on the next poll. Keeps trailers last even when a buffered redaction tail remains.
     pending: Option<Frame<Bytes>>,
+    /// The request this body answers: its consumer, whose bytes these are, and the access line
+    /// this body writes when it ends.
+    ctx: Option<Arc<RequestCtx>>,
 }
 
 /// Streaming reversible-unmask state: the per-request mask map + the held-back boundary tail.
@@ -2377,7 +2835,17 @@ impl<B> CountingBody<B> {
             dlp,
             unmask,
             pending: None,
+            ctx: None,
         }
+    }
+
+    /// Count this body's bytes to the request's consumer, and write its access line when the body
+    /// ends.
+    fn with_ctx(mut self, ctx: Arc<RequestCtx>) -> Self {
+        ctx.streamed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.ctx = Some(ctx);
+        self
     }
 
     /// Append the bytes the client will actually receive to the bounded LLM tail buffer (keeping only
@@ -2530,10 +2998,23 @@ where
 
 impl<B> Drop for CountingBody<B> {
     fn drop(&mut self) {
-        self.metrics.add_usage_bytes(
-            self.ingress.load(std::sync::atomic::Ordering::Relaxed),
-            self.egress,
-        );
+        let ingress = self.ingress.load(std::sync::atomic::Ordering::Relaxed);
+        self.metrics.add_usage_bytes(ingress, self.egress);
+        if let Some(ctx) = &self.ctx {
+            if let Some(consumer) = ctx.consumer.get() {
+                consumer.add_bytes(ingress, self.egress);
+            }
+            let line = ctx
+                .pending
+                .lock()
+                .expect("request ctx mutex poisoned")
+                .take();
+            if let Some(mut line) = line {
+                line.record.bytes_in = Some(ingress as u64);
+                line.record.bytes_out = Some(self.egress as u64);
+                write_access_line(&self.metrics, line);
+            }
+        }
         // LLM metering for the streamed body: parse the terminal `usage` frame from the tail. The
         // client gets usage only if it sent `stream_options.include_usage`; otherwise `no_usage`.
         if let Some(meter) = self.llm.as_mut() {
@@ -2657,6 +3138,35 @@ fn wall_clock_span(started: Instant) -> (u64, u64) {
 /// Remove hop-by-hop headers so they don't leak across the proxy boundary (RFC 7230 §6.1):
 /// the fixed [`HOP_BY_HOP`] set plus any header *named* in a `Connection` header. Applied in
 /// both directions (request to upstream, response to client).
+/// Copy the client's end-to-end headers (the hop-by-hop ones already gone) onto the upstream
+/// request: every value of every header, in order, but `Host`, which the upstream client sets.
+/// A header sent twice is forwarded twice, as the client sent it. Several `Cookie` headers, which
+/// is how an HTTP/2 client sends its cookies, become one joined with `"; "`, as RFC 9113 §8.2.3
+/// asks of a hop to HTTP/1.1, where a client sends one.
+///
+/// Headers the edge sets itself afterwards (`X-Forwarded-For`, the request id, `traceparent`, an
+/// `Authorization` from the key vault) are inserted over these, replacing every client value.
+fn forward_headers(from: &HeaderMap, to: &mut HeaderMap) {
+    for (name, value) in from.iter() {
+        if name != header::HOST && name != header::COOKIE {
+            to.append(name.clone(), value.clone());
+        }
+    }
+    let cookies: Vec<&[u8]> = from
+        .get_all(header::COOKIE)
+        .iter()
+        .map(HeaderValue::as_bytes)
+        .collect();
+    let joined = match cookies.as_slice() {
+        [] => None,
+        [one] => HeaderValue::from_bytes(one).ok(),
+        many => HeaderValue::from_bytes(&many.join(&b"; "[..])).ok(),
+    };
+    if let Some(cookie) = joined {
+        to.insert(header::COOKIE, cookie);
+    }
+}
+
 fn strip_hop_by_hop(headers: &mut HeaderMap) {
     // Header names listed in any `Connection` header are connection-specific; collect them
     // before mutating (the borrow of `headers` must end before we remove).
@@ -2848,6 +3358,82 @@ fn harden_cookie(cookie: &str, add_httponly: bool) -> String {
 
 /// Run `fut` bounded by an optional deadline. `None` means no timeout. On success returns
 /// the future's own output; `Err(Elapsed)` if the deadline passed first.
+/// What sending a request to a route's targets came to.
+struct Sent<'p> {
+    /// The target that gave `result`: the last one tried.
+    target: &'p crate::pool::Target,
+    result: Result<
+        Result<hyper::Response<hyper::body::Incoming>, hyper_util::client::legacy::Error>,
+        tokio::time::error::Elapsed,
+    >,
+    /// That target's attempt, from sending to `result`.
+    waited: Duration,
+    /// The request counted in flight to that target, for a `least_conn` pool: to be held until
+    /// the exchange (or the tunnel) is over.
+    in_flight: Option<crate::pool::InFlight>,
+}
+
+/// Send `first` to `tries[0]`. When it cannot connect (refused, unreachable, a failed handshake),
+/// nothing reached the upstream: count that against the target and send `again(next)` to the next
+/// one, while there is one and `again` can build the request. Each attempt's passive health is
+/// recorded here, and the per-upstream series of each abandoned one; the caller records the last,
+/// with what it learns from the response. `path` is the redacted target, for the log.
+async fn send_to_pool<'p>(
+    state: &AppState,
+    pool: &crate::pool::Pool,
+    tries: &[&'p crate::pool::Target],
+    first: Request<Body>,
+    mut again: impl FnMut(&crate::pool::Target) -> Option<Request<Body>>,
+    deadline: Option<tokio::time::Instant>,
+    path: &str,
+) -> Sent<'p> {
+    let mut req = first;
+    let mut i = 0;
+    loop {
+        let target = tries[i];
+        // Dropped, and so no longer counted, if this attempt is abandoned for the next.
+        let in_flight = pool.start(target);
+        let sent = Instant::now();
+        let result = within(deadline, state.client.request(req)).await;
+        let waited = sent.elapsed();
+        if let Ok(outcome) = &result {
+            match outcome {
+                Ok(resp) => pool.answered(target, resp.status().as_u16()),
+                Err(e) => {
+                    let class = UpstreamResult::classify(e);
+                    if matches!(
+                        class,
+                        UpstreamResult::ConnectError | UpstreamResult::TlsError
+                    ) {
+                        let error = crate::upstream::error_chain(e);
+                        pool.connect_failed(target, &error);
+                        if let Some(next) = tries.get(i + 1) {
+                            if let Some(r) = again(next) {
+                                state.metrics.upstream_stats(&target.label).record(class);
+                                warn!(
+                                    error,
+                                    upstream = %format!("{}{path}", target.base),
+                                    next = %next.label,
+                                    "upstream unreachable; trying the next target"
+                                );
+                                req = r;
+                                i += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Sent {
+            target,
+            result,
+            waited,
+            in_flight,
+        };
+    }
+}
+
 async fn within<F: Future>(
     deadline: Option<tokio::time::Instant>,
     fut: F,
@@ -2881,6 +3467,86 @@ struct FinishInfo {
     status: u16,
     elapsed: Duration,
     request_id: String,
+    /// The sanitised request target, as logged.
+    target: String,
+    client_ip: IpAddr,
+}
+
+/// What the pipeline learns about a request on its way through, for the access line and the
+/// per-consumer series `handle` writes once the response is known. Shared with a streamed
+/// response's body, which writes the line when it ends.
+#[derive(Default)]
+pub(crate) struct RequestCtx {
+    consumer: std::sync::OnceLock<Arc<crate::metrics::ConsumerStats>>,
+    principal: std::sync::OnceLock<String>,
+    /// The upstream it was forwarded to, as logged ([`upstream_for_log`]).
+    upstream: std::sync::OnceLock<String>,
+    upstream_ms: std::sync::OnceLock<u64>,
+    /// How long the response waited on the upstream: its headers and, buffered, its body. Set
+    /// only when the upstream answered; the rest of the time to headers is the edge's own.
+    upstream_busy: std::sync::OnceLock<Duration>,
+    /// Request and response bytes of a buffered proxied exchange.
+    bytes: std::sync::OnceLock<(u64, u64)>,
+    /// Set when the response body streams: that body writes the access line.
+    streamed: std::sync::atomic::AtomicBool,
+    /// The request counted in flight to its `least_conn` target, released with this context.
+    in_flight: std::sync::OnceLock<crate::pool::InFlight>,
+    pending: std::sync::Mutex<Option<AccessLine>>,
+}
+
+/// An access line waiting to be written, and when its request started.
+pub(crate) struct AccessLine {
+    started: Instant,
+    record: crate::logship::AccessRecord,
+}
+
+/// Write one access line: to stdout, and to `[log.ship]` when configured. Shipping is a single
+/// non-blocking `try_send` onto a bounded queue — it never awaits and never touches the network,
+/// so a slow or absent collector costs dropped telemetry rather than request latency.
+fn write_access_line(metrics: &Metrics, line: AccessLine) {
+    let mut r = line.record;
+    r.duration_ms = line.started.elapsed().as_millis() as u64;
+    info!(
+        request_id = %r.request_id,
+        method = %r.method,
+        path = %r.target,
+        client_ip = %r.client_ip,
+        status = r.status,
+        outcome = %r.outcome,
+        latency_ms = r.latency_ms,
+        duration_ms = r.duration_ms,
+        route = %r.route,
+        principal = r.principal.as_deref(),
+        user_agent = r.user_agent.as_deref(),
+        upstream = r.upstream.as_deref(),
+        upstream_ms = r.upstream_ms,
+        bytes_in = r.bytes_in,
+        bytes_out = r.bytes_out,
+        tls_version = r.tls_version.as_deref(),
+        client_cert = r.client_cert.as_deref(),
+        "request"
+    );
+    if let Some(shipper) = metrics.log_shipper() {
+        r.ts = rfc3339_now();
+        r.edge_id = shipper.edge_id().to_string();
+        shipper.record(r);
+    }
+}
+
+/// An upstream base URL as the access log records it: `scheme://host:port`, without any userinfo
+/// a configured URL might carry.
+pub(crate) fn upstream_for_log(base: &str) -> String {
+    match base.parse::<axum::http::Uri>() {
+        Ok(uri) => {
+            let scheme = uri.scheme_str().unwrap_or("http");
+            let host = uri.host().unwrap_or_default();
+            let port = uri
+                .port_u16()
+                .unwrap_or(if scheme == "https" { 443 } else { 80 });
+            format!("{scheme}://{host}:{port}")
+        }
+        Err(_) => String::new(),
+    }
 }
 
 /// RFC3339 UTC, to the second, without pulling in a date-time crate.
@@ -2900,7 +3566,7 @@ fn rfc3339_now() -> String {
 /// The conversion itself, split out from [`rfc3339_now`] so it is testable against known
 /// timestamps. A hand-rolled date conversion that is only ever called with "now" is a conversion
 /// nobody has checked.
-fn rfc3339(secs: i64) -> String {
+pub(crate) fn rfc3339(secs: i64) -> String {
     // Civil-time conversion from a Unix timestamp (days since epoch -> y/m/d), the standard
     // algorithm. Cheaper than a dependency for one format, and it has no local-timezone concept to
     // get wrong: this is UTC by construction.
@@ -2941,46 +3607,24 @@ fn finish(
     if let Ok(v) = HeaderValue::from_str(request_id) {
         resp.headers_mut().insert(REQUEST_ID_HEADER, v);
     }
+    // `method` is part of the tuple every call site passes; the access line `handle` writes takes
+    // it from the request instead.
+    let _ = method;
     let elapsed = started.elapsed();
-    info!(
-        request_id,
-        %method,
-        path = %path,
-        client_ip = %ip,
-        status = resp.status().as_u16(),
-        outcome,
-        latency_ms = elapsed.as_millis() as u64,
-        "request"
-    );
     metrics.record_request(outcome);
     metrics.observe_latency(elapsed);
-    // For `handle()` to build the server span. `outcome` is a &'static str from a fixed set, so this
-    // clone is one String (the request id) per request and nothing else.
+    // For `handle()`, which writes the access line and builds the server span from it. `path` is
+    // already sanitised by `accesslog::sanitize_target` at the call sites, so credentials in the
+    // query string never reach the line or the collector.
     let status = resp.status().as_u16();
     resp.extensions_mut().insert(FinishInfo {
         outcome: outcome.to_string(),
         status,
         elapsed,
         request_id: request_id.to_string(),
+        target: path.to_string(),
+        client_ip: ip,
     });
-    // Ship the same line off-box, when `[log.ship]` is configured. `record` is a single non-blocking
-    // `try_send` onto a bounded queue — it never awaits and never touches the network, so a slow or
-    // absent collector costs dropped telemetry rather than request latency. `path` is already
-    // sanitised by `accesslog::sanitize_target` at the call sites, so credentials in the query
-    // string do not travel to the collector either.
-    if let Some(shipper) = metrics.log_shipper() {
-        shipper.record(crate::logship::AccessRecord {
-            ts: rfc3339_now(),
-            request_id: request_id.to_string(),
-            method: method.to_string(),
-            target: path.to_string(),
-            client_ip: ip.to_string(),
-            status: resp.status().as_u16(),
-            outcome: outcome.to_string(),
-            latency_ms: elapsed.as_millis() as u64,
-            edge_id: shipper.edge_id().to_string(),
-        });
-    }
     // Managed mode: count every finished request (proxied or rejected) toward the usage delta, and
     // — when the edge denied it — the drainable `blocked` figure. Cheap (relaxed atomic adds) and
     // inert unless a control plane drains it for reporting.
@@ -2995,6 +3639,19 @@ mod tests {
     /// Every feature that reads the whole response forces buffering on its own; with none of
     /// them, the switch decides.
     /// Every reader of the request body forces buffering on its own.
+    #[test]
+    fn the_logged_upstream_drops_userinfo_and_names_the_port() {
+        assert_eq!(
+            upstream_for_log("http://user:secret@api.internal:4000/base"),
+            "http://api.internal:4000"
+        );
+        assert_eq!(
+            upstream_for_log("https://api.example.com"),
+            "https://api.example.com:443"
+        );
+        assert_eq!(upstream_for_log("http://[::1]"), "http://[::1]:80");
+    }
+
     #[test]
     fn a_request_streams_only_when_nothing_reads_its_body() {
         assert!(streams_request(true, false, false, false));
@@ -3187,6 +3844,43 @@ mod tests {
         h.insert("a", HeaderValue::from_static("bb")); // 1 + 2
         h.insert("ccc", HeaderValue::from_static("dddd")); // 3 + 4
         assert_eq!(header_bytes(&h), 1 + 2 + 3 + 4);
+    }
+
+    #[test]
+    fn every_value_of_a_repeated_header_is_forwarded_and_cookies_become_one() {
+        let mut from = HeaderMap::new();
+        from.insert(header::HOST, HeaderValue::from_static("edge.example"));
+        from.append("x-multi", HeaderValue::from_static("1"));
+        from.append("x-multi", HeaderValue::from_static("2"));
+        from.append(header::ACCEPT, HeaderValue::from_static("text/html"));
+        from.append(header::COOKIE, HeaderValue::from_static("a=1"));
+        from.append(header::COOKIE, HeaderValue::from_static("b=2; c=3"));
+        from.append(header::COOKIE, HeaderValue::from_bytes(b"d=\xe9").unwrap());
+        let mut to = HeaderMap::new();
+        forward_headers(&from, &mut to);
+        let all = |name: &str| -> Vec<&[u8]> {
+            to.get_all(name).iter().map(HeaderValue::as_bytes).collect()
+        };
+        assert_eq!(all("x-multi"), [b"1", b"2"], "both, in order");
+        assert_eq!(all("accept"), [b"text/html"]);
+        assert_eq!(
+            all("cookie"),
+            [&b"a=1; b=2; c=3; d=\xe9"[..]],
+            "one, bytes kept"
+        );
+        assert!(
+            to.get(header::HOST).is_none(),
+            "the upstream client sets Host"
+        );
+        // One Cookie header goes as it came.
+        let mut one = HeaderMap::new();
+        one.insert(header::COOKIE, HeaderValue::from_static("a=1;b=2"));
+        let mut to = HeaderMap::new();
+        forward_headers(&one, &mut to);
+        assert_eq!(to[header::COOKIE], "a=1;b=2");
+        let mut to = HeaderMap::new();
+        forward_headers(&HeaderMap::new(), &mut to);
+        assert!(to.is_empty());
     }
 
     #[test]

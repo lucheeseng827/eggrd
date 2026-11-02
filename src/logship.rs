@@ -40,6 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -47,14 +48,21 @@ use tracing::{info, warn};
 
 use crate::config::LogShipCfg;
 
+/// The [`AccessRecord`] layout version, sent as `schema` on every record. Bumped when a field is
+/// renamed, removed or changes meaning; adding one is not a bump.
+pub const ACCESS_RECORD_SCHEMA: u32 = 2;
+
 /// One access-log record on the wire.
 ///
-/// The fields are exactly what `finish()` already logs to stdout — deliberately, so the shipped
-/// stream and the local one cannot disagree about what happened. `target` arrives already
-/// sanitised by [`crate::accesslog::sanitize_target`]: a proxy that advertises DLP must not be the
-/// component that writes credentials into a SIEM.
+/// The fields are exactly what the proxy logs to stdout — deliberately, so the shipped stream and
+/// the local one cannot disagree about what happened. `target` arrives already sanitised by
+/// [`crate::accesslog::sanitize_target`]: a proxy that advertises DLP must not be the component
+/// that writes credentials into a SIEM. Every key is always present; one that does not apply to a
+/// request (no upstream for a request refused at the edge, no TLS on a plain listener) is `null`.
 #[derive(Debug, Clone, Serialize)]
 pub struct AccessRecord {
+    /// [`ACCESS_RECORD_SCHEMA`].
+    pub schema: u32,
     /// RFC3339 UTC, so a collector can order records across boxes without trusting arrival order.
     pub ts: String,
     pub request_id: String,
@@ -64,9 +72,31 @@ pub struct AccessRecord {
     pub client_ip: String,
     pub status: u16,
     pub outcome: String,
+    /// Time to the response headers.
     pub latency_ms: u64,
+    /// Time until the record was written: the last byte of a streamed response, or `latency_ms`
+    /// for one that was not streamed.
+    pub duration_ms: u64,
     /// The edge that served it, so a fleet-wide stream stays attributable.
     pub edge_id: String,
+    /// The configured route it matched (`edgeguard_route_*`'s label).
+    pub route: String,
+    /// The authenticated principal, as `log.principal` records it; `null` without one.
+    pub principal: Option<String>,
+    /// Truncated to 256 bytes.
+    pub user_agent: Option<String>,
+    /// `scheme://host:port` of the upstream it was forwarded to; `null` when it was answered at
+    /// the edge.
+    pub upstream: Option<String>,
+    /// Time from sending the upstream request to its response headers (or its failure).
+    pub upstream_ms: Option<u64>,
+    /// Request and response bytes, headers included, for a proxied request.
+    pub bytes_in: Option<u64>,
+    pub bytes_out: Option<u64>,
+    /// `TLSv1.3` or `TLSv1.2` when the listener terminated TLS.
+    pub tls_version: Option<String>,
+    /// The verified client certificate's name (`[tls.client_auth]`), as `log.principal` records it.
+    pub client_cert: Option<String>,
 }
 
 /// Counters for the shipper itself.
@@ -134,15 +164,17 @@ impl LogShipper {
     }
 }
 
-/// Build the shipper and spawn its background task. `None` when shipping is disabled.
+/// Build the shipper and spawn its background task. `None` when shipping is disabled; an error
+/// when its TLS or proxy settings do not load.
 pub fn spawn(
     cfg: &LogShipCfg,
     edge_id: String,
     shutdown: watch::Receiver<bool>,
-) -> Option<LogShipper> {
+) -> Result<Option<LogShipper>> {
     if !cfg.enabled || cfg.url.is_empty() {
-        return None;
+        return Ok(None);
     }
+    let (http, _) = crate::outbound::builder(&cfg.outbound, "log.ship", &cfg.url)?;
     let stats = Arc::new(ShipStats::default());
     let (tx, rx) = mpsc::channel(cfg.queue_size.max(1));
     let shipper = LogShipper {
@@ -159,14 +191,14 @@ pub fn spawn(
         // A short timeout on purpose: this task is the only consumer of the queue, so a request
         // that hangs for the client's default (no timeout at all) stops draining and every record
         // behind it is dropped for queue-full. Failing fast and retrying loses less.
-        http: reqwest::Client::builder()
+        http: http
             .timeout(Duration::from_secs(10))
             .build()
-            .ok()?,
+            .context("building the log shipper's HTTP client")?,
     };
     info!(url = %cfg.url, batch = task.batch, ?task.interval, "access-log shipping enabled");
     tokio::spawn(task.run(rx, shutdown));
-    Some(shipper)
+    Ok(Some(shipper))
 }
 
 struct ShipTask {
@@ -276,7 +308,11 @@ impl ShipTask {
                 }
                 Err(e) => {
                     if attempt == 1 {
-                        warn!(error = %e, records = n, "shipping a log batch failed");
+                        warn!(
+                            error = %crate::upstream::error_chain(&e),
+                            records = n,
+                            "shipping a log batch failed"
+                        );
                     }
                 }
             }
@@ -293,8 +329,48 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// The record's keys are a contract with every collector that parses it: pin them, so a
+    /// change is a decision (and a schema bump if it renames or removes one), not an accident.
+    #[test]
+    fn the_record_carries_every_key_null_or_not() {
+        let json = serde_json::to_value(rec("r1")).unwrap();
+        let keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        let mut expected = vec![
+            "schema",
+            "ts",
+            "request_id",
+            "method",
+            "target",
+            "client_ip",
+            "status",
+            "outcome",
+            "latency_ms",
+            "duration_ms",
+            "edge_id",
+            "route",
+            "principal",
+            "user_agent",
+            "upstream",
+            "upstream_ms",
+            "bytes_in",
+            "bytes_out",
+            "tls_version",
+            "client_cert",
+        ];
+        expected.sort_unstable();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(keys, expected);
+        assert_eq!(json["schema"], 2);
+        assert!(
+            json["upstream"].is_null(),
+            "absent values are null, not missing"
+        );
+    }
+
     fn rec(id: &str) -> AccessRecord {
         AccessRecord {
+            schema: ACCESS_RECORD_SCHEMA,
             ts: "2026-09-06T12:00:00Z".into(),
             request_id: id.into(),
             method: "GET".into(),
@@ -303,7 +379,17 @@ mod tests {
             status: 200,
             outcome: "proxied".into(),
             latency_ms: 3,
+            duration_ms: 3,
             edge_id: "edge-1".into(),
+            route: "default".into(),
+            principal: None,
+            user_agent: None,
+            upstream: None,
+            upstream_ms: None,
+            bytes_in: None,
+            bytes_out: None,
+            tls_version: None,
+            client_cert: None,
         }
     }
 
@@ -315,6 +401,7 @@ mod tests {
             batch: 2,
             interval_secs: 1,
             queue_size: 8,
+            ..Default::default()
         }
     }
 
@@ -371,12 +458,12 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let mut c = cfg("http://example");
         c.enabled = false;
-        assert!(spawn(&c, "e".into(), rx.clone()).is_none());
+        assert!(spawn(&c, "e".into(), rx.clone()).unwrap().is_none());
 
         let mut c = cfg("");
         c.enabled = true;
         assert!(
-            spawn(&c, "e".into(), rx).is_none(),
+            spawn(&c, "e".into(), rx).unwrap().is_none(),
             "enabled with no URL must not spawn a task that can never deliver"
         );
     }
@@ -385,7 +472,7 @@ mod tests {
     async fn a_full_batch_is_posted_as_ndjson() {
         let (url, hits, bodies) = spawn_collector(200).await;
         let (_tx, rx) = watch::channel(false);
-        let s = spawn(&cfg(&url), "edge-1".into(), rx).unwrap();
+        let s = spawn(&cfg(&url), "edge-1".into(), rx).unwrap().unwrap();
 
         s.record(rec("a"));
         s.record(rec("b")); // batch = 2, so this triggers a flush
@@ -417,7 +504,7 @@ mod tests {
         // a gap that looks exactly like an outage.
         let (url, hits, _) = spawn_collector(200).await;
         let (_tx, rx) = watch::channel(false);
-        let s = spawn(&cfg(&url), "edge-1".into(), rx).unwrap();
+        let s = spawn(&cfg(&url), "edge-1".into(), rx).unwrap().unwrap();
 
         s.record(rec("only-one")); // below the batch size of 2
         for _ in 0..100 {
@@ -444,7 +531,7 @@ mod tests {
         // Large enough that the task never flushes on size, so the queue genuinely fills.
         c.batch = 10_000;
         c.interval_secs = 3_600;
-        let s = spawn(&c, "edge-1".into(), rx).unwrap();
+        let s = spawn(&c, "edge-1".into(), rx).unwrap().unwrap();
 
         // Far more than the queue can hold. Every one of these must return immediately.
         let started = std::time::Instant::now();
@@ -465,7 +552,7 @@ mod tests {
     async fn a_rejecting_collector_is_retried_once_then_the_batch_is_dropped() {
         let (url, hits, _) = spawn_collector(503).await;
         let (_tx, rx) = watch::channel(false);
-        let s = spawn(&cfg(&url), "edge-1".into(), rx).unwrap();
+        let s = spawn(&cfg(&url), "edge-1".into(), rx).unwrap().unwrap();
 
         s.record(rec("a"));
         s.record(rec("b"));
@@ -492,7 +579,7 @@ mod tests {
         let mut c = cfg(&url);
         c.batch = 100; // never flushes on size
         c.interval_secs = 3_600; // never flushes on the timer
-        let s = spawn(&c, "edge-1".into(), rx).unwrap();
+        let s = spawn(&c, "edge-1".into(), rx).unwrap().unwrap();
 
         s.record(rec("a"));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -546,7 +633,7 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
         let mut c = cfg(&format!("http://{addr}/ingest"));
         c.headers = vec![("x-api-key".into(), "secret-token".into())];
-        let s = spawn(&c, "edge-1".into(), rx).unwrap();
+        let s = spawn(&c, "edge-1".into(), rx).unwrap().unwrap();
         s.record(rec("a"));
         s.record(rec("b"));
 

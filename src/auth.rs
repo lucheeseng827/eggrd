@@ -28,6 +28,11 @@ pub enum Decision {
     /// Authenticated. Carries the principal used for per-key rate limiting (`None` when the
     /// scheme has no stable identity, e.g. `mode = "none"`).
     Allow(Option<String>),
+    /// Authenticated by a verified JWT: its `sub`, as [`Decision::Allow`] carries a principal, and
+    /// its claims, which the key vault and the budgets may read (`[[llm.keys]].claims`,
+    /// `scope = "claim:<name>"`). They are the issuer's word: the token's signature, issuer,
+    /// audience and expiry were checked first.
+    AllowJwt(Option<String>, Arc<Value>),
     /// Rejected. Carries the challenge to advertise in `WWW-Authenticate` (if any).
     Deny(Challenge),
 }
@@ -51,6 +56,11 @@ pub enum AuthEngine {
         header: HeaderName,
     },
     Jwt(Box<JwtValidator>),
+    /// The client certificate the TLS listener verified (`auth.mode = "mtls"`), narrowed by
+    /// `[auth.mtls] allowed`.
+    Mtls {
+        allowed: Vec<crate::client_auth::NamePattern>,
+    },
 }
 
 impl AuthEngine {
@@ -70,12 +80,75 @@ impl AuthEngine {
                 })
             }
             "jwt" => Ok(AuthEngine::Jwt(Box::new(JwtValidator::build(&cfg.jwt)?))),
-            other => anyhow::bail!("unknown auth.mode: {other:?} (expected none|basic|apikey|jwt)"),
+            "mtls" => Ok(AuthEngine::Mtls {
+                allowed: cfg
+                    .mtls
+                    .allowed
+                    .iter()
+                    .map(|p| crate::client_auth::NamePattern::parse("auth.mtls.allowed", p))
+                    .collect::<Result<_>>()?,
+            }),
+            other => {
+                anyhow::bail!("unknown auth.mode: {other:?} (expected none|basic|apikey|jwt|mtls)")
+            }
+        }
+    }
+
+    /// A header this mode reads the request's credentials from that `headers` carries more than
+    /// once, if any. `Authorization` for Basic and JWT. With an API key, its own header, always;
+    /// and `Authorization` too when [`verify_api_key`] falls back to it: the key's header absent,
+    /// or not readable as text. `None` for a mode that reads no header.
+    fn repeated_credential<'a>(&'a self, headers: &HeaderMap) -> Option<&'a HeaderName> {
+        static AUTHORIZATION: HeaderName = header::AUTHORIZATION;
+        let repeated = |name: &HeaderName| headers.get_all(name).iter().nth(1).is_some();
+        let auth = || repeated(&AUTHORIZATION).then_some(&AUTHORIZATION);
+        match self {
+            AuthEngine::Basic | AuthEngine::Jwt(_) => auth(),
+            AuthEngine::ApiKey { header, .. } if repeated(header) => Some(header),
+            // As `verify_api_key` decides which one holds the key.
+            AuthEngine::ApiKey { header, .. }
+                if headers.get(header).is_some_and(|v| v.to_str().is_ok()) =>
+            {
+                None
+            }
+            AuthEngine::ApiKey { .. } => auth(),
+            AuthEngine::Open | AuthEngine::Mtls { .. } => None,
+        }
+    }
+
+    /// The challenge a denied request gets, as for missing or wrong credentials.
+    fn challenge(&self, cfg: &AuthCfg) -> Challenge {
+        match self {
+            AuthEngine::Basic => Challenge::Basic(format!("Basic realm=\"{}\"", cfg.realm)),
+            AuthEngine::Jwt(_) => Challenge::Bearer,
+            AuthEngine::Open | AuthEngine::ApiKey { .. } | AuthEngine::Mtls { .. } => {
+                Challenge::None
+            }
         }
     }
 
     /// Apply the gate to a request's headers. Async because the JWT path may fetch a JWKS.
+    /// A request with no client certificate; see [`Self::authorize_with_cert`].
     pub async fn authorize(&self, cfg: &AuthCfg, headers: &HeaderMap) -> Decision {
+        self.authorize_with_cert(cfg, headers, None).await
+    }
+
+    /// [`Self::authorize`], for a request that arrived on a connection whose client certificate
+    /// the TLS listener verified. Only `mode = "mtls"` reads it.
+    pub async fn authorize_with_cert(
+        &self,
+        cfg: &AuthCfg,
+        headers: &HeaderMap,
+        client_cert: Option<&crate::client_auth::ClientCert>,
+    ) -> Decision {
+        // The edge checks the first value of the header it reads; the app behind it may read
+        // another, or all of them joined. A valid key first and a forged token second would pass
+        // here and be believed there. A client has no reason to send two, so a request that does
+        // is refused rather than guessed at.
+        if let Some(name) = self.repeated_credential(headers) {
+            tracing::debug!(header = %name, "refused: the credential header is sent more than once");
+            return Decision::Deny(self.challenge(cfg));
+        }
         match self {
             AuthEngine::Open => Decision::Allow(None),
             AuthEngine::Basic => {
@@ -83,7 +156,7 @@ impl AuthEngine {
                     // The principal is the username (for per-key limiting).
                     Decision::Allow(basic_username(headers))
                 } else {
-                    Decision::Deny(Challenge::Basic(format!("Basic realm=\"{}\"", cfg.realm)))
+                    Decision::Deny(self.challenge(cfg))
                 }
             }
             AuthEngine::ApiKey { keys, header } => match verify_api_key(keys, header, headers) {
@@ -91,12 +164,20 @@ impl AuthEngine {
                 None => Decision::Deny(Challenge::None),
             },
             AuthEngine::Jwt(v) => match bearer_token(headers) {
-                Some(token) => match v.verify(token).await {
-                    Ok(principal) => Decision::Allow(principal),
+                Some(token) => match v.verify_claims(token).await {
+                    Ok(claims) => Decision::AllowJwt(subject(&claims), Arc::new(claims)),
                     Err(_) => Decision::Deny(Challenge::Bearer),
                 },
                 None => Decision::Deny(Challenge::Bearer),
             },
+            // No certificate, or none of its names allowed. No challenge header: there is no HTTP
+            // scheme to ask for a certificate with, as there is none for an API key.
+            AuthEngine::Mtls { allowed } => {
+                match client_cert.and_then(|c| crate::client_auth::principal(c, allowed)) {
+                    Some(principal) => Decision::Allow(Some(principal)),
+                    None => Decision::Deny(Challenge::None),
+                }
+            }
         }
     }
 }
@@ -253,6 +334,7 @@ impl JwtValidator {
             KeySource::Jwks(JwksCache::new(
                 cfg.jwks_url.clone(),
                 Duration::from_secs(cfg.jwks_cache_secs),
+                &cfg.outbound,
             )?)
         } else {
             KeySource::Static(Arc::new(static_key(cfg, alg)?))
@@ -267,6 +349,13 @@ impl JwtValidator {
 
     /// Verify a raw token string, returning its principal on success.
     pub async fn verify(&self, token: &str) -> Result<Principal> {
+        self.verify_claims(token)
+            .await
+            .map(|claims| subject(&claims))
+    }
+
+    /// Verify a raw token string, returning all of its claims on success.
+    pub async fn verify_claims(&self, token: &str) -> Result<Value> {
         let header = decode_header(token).context("malformed JWT header")?;
         // Guard before key selection: the header alg must be the one we're configured for.
         anyhow::ensure!(
@@ -282,13 +371,16 @@ impl JwtValidator {
         };
 
         let data = decode::<Value>(token, &key, &self.validation).context("JWT rejected")?;
-        let principal = data
-            .claims
-            .get("sub")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        Ok(principal)
+        Ok(data.claims)
     }
+}
+
+/// A verified token's principal: its `sub` claim, where it has one.
+fn subject(claims: &Value) -> Principal {
+    claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Resolve a single static [`DecodingKey`] for HS* (shared secret) or asymmetric (PEM) algs.
@@ -363,8 +455,9 @@ struct CachedKeys {
 }
 
 impl JwksCache {
-    fn new(url: String, ttl: Duration) -> Result<JwksCache> {
-        let http = reqwest::Client::builder()
+    fn new(url: String, ttl: Duration, outbound: &crate::config::OutboundCfg) -> Result<JwksCache> {
+        let (http, _) = crate::outbound::builder(outbound, "auth.jwt", &url)?;
+        let http = http
             .timeout(Duration::from_secs(5))
             .build()
             .context("building JWKS HTTP client")?;
@@ -479,6 +572,7 @@ fn parse_jwks(json: &str) -> Result<HashMap<String, Arc<DecodingKey>>> {
 mod tests {
     use super::*;
     use crate::config::AuthCfg;
+    use axum::http::HeaderValue;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -627,6 +721,115 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600
+    }
+
+    /// The edge reads the first value of a credential header; the app behind it may read another.
+    /// So a request carrying two is refused in every mode that reads one, whatever they hold.
+    #[tokio::test]
+    async fn a_credential_header_sent_twice_is_refused() {
+        let twice = |name: &'static str, first: &str, second: &str| {
+            let mut h = HeaderMap::new();
+            h.append(name, first.parse().unwrap());
+            h.append(name, second.parse().unwrap());
+            h
+        };
+        let allowed = |d: &Decision| matches!(d, Decision::Allow(_) | Decision::AllowJwt(..));
+
+        // Basic: two Authorization headers, the first one valid.
+        let cfg = AuthCfg {
+            mode: "basic".into(),
+            ..cfg_with_user("admin", "s3cret")
+        };
+        let basic = AuthEngine::build(&cfg).unwrap();
+        let good = basic_value("admin", "s3cret");
+        assert!(allowed(
+            &basic
+                .authorize(&cfg, &headers_with("authorization", &good))
+                .await
+        ));
+        let d = basic
+            .authorize(&cfg, &twice("authorization", &good, &good))
+            .await;
+        assert!(
+            matches!(&d, Decision::Deny(Challenge::Basic(c)) if c.contains("realm=")),
+            "even the same value twice"
+        );
+
+        // API key: the configured header twice; or, without it, Authorization twice.
+        let cfg = AuthCfg {
+            mode: "apikey".into(),
+            api_keys: vec!["sk_live_abc".into()],
+            ..Default::default()
+        };
+        let apikey = AuthEngine::build(&cfg).unwrap();
+        let d = apikey
+            .authorize(&cfg, &twice("x-api-key", "sk_live_abc", "sk_other"))
+            .await;
+        assert!(matches!(d, Decision::Deny(Challenge::None)));
+        let d = apikey
+            .authorize(
+                &cfg,
+                &twice("authorization", "Bearer sk_live_abc", "Bearer forged"),
+            )
+            .await;
+        assert!(matches!(d, Decision::Deny(Challenge::None)));
+        // An unreadable key header is no key: the key is read from Authorization, so two of
+        // those are refused, as without the header. Two key headers are refused whatever they hold.
+        let mut h = twice("authorization", "Bearer sk_live_abc", "Bearer forged");
+        h.insert("x-api-key", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert!(matches!(
+            apikey.authorize(&cfg, &h).await,
+            Decision::Deny(Challenge::None)
+        ));
+        let mut h = HeaderMap::new();
+        h.append("x-api-key", HeaderValue::from_bytes(b"\xff").unwrap());
+        h.append("x-api-key", HeaderValue::from_static("sk_live_abc"));
+        assert!(matches!(
+            apikey.authorize(&cfg, &h).await,
+            Decision::Deny(Challenge::None)
+        ));
+        // With the key in its own header, Authorization is the app's: two of it are not the
+        // edge's to judge.
+        let mut h = twice("authorization", "Bearer app-1", "Bearer app-2");
+        h.insert("x-api-key", "sk_live_abc".parse().unwrap());
+        assert!(allowed(&apikey.authorize(&cfg, &h).await));
+
+        // JWT: a valid token first, a forged one second.
+        let cfg = AuthCfg {
+            mode: "jwt".into(),
+            jwt: JwtCfg {
+                algorithm: "HS256".into(),
+                secret: "topsecret".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let jwt = AuthEngine::build(&cfg).unwrap();
+        let token = hs_token(
+            "topsecret",
+            json!({ "sub": "user-42", "exp": far_future() }),
+        );
+        let bearer = format!("Bearer {token}");
+        assert!(allowed(
+            &jwt.authorize(&cfg, &headers_with("authorization", &bearer))
+                .await
+        ));
+        let d = jwt
+            .authorize(
+                &cfg,
+                &twice("authorization", &bearer, "Bearer forged.jwt.here"),
+            )
+            .await;
+        assert!(matches!(d, Decision::Deny(Challenge::Bearer)));
+
+        // A mode that reads no header lets them through, for the app to judge.
+        let cfg = AuthCfg::default();
+        let open = AuthEngine::build(&cfg).unwrap();
+        assert!(allowed(
+            &open
+                .authorize(&cfg, &twice("authorization", "Bearer a", "Bearer b"))
+                .await
+        ));
     }
 
     #[tokio::test]

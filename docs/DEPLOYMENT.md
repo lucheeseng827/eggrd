@@ -168,12 +168,232 @@ interstitial. Use ACME there.
    — there is no CA root to validate against.
 
 **Notes & limits.**
-- A file-provided certificate is loaded at **startup** — rotating it needs a restart. (Only
-  `[tls.acme]` certificates renew live in the background.)
-- EdgeGuard is built **without client-certificate auth** (no mutual-TLS / client-CA verification);
-  gate callers with Basic / API-key / JWT instead.
+- A file-provided certificate is reloaded when its files change (and checked hourly), so
+  replacing it needs no restart.
+- Client certificates (mutual TLS) are verified with `[tls.client_auth]`, or read from a load
+  balancer's header; see [Client certificates](#client-certificates--where-they-can-be-verified).
 - Prefer **automatic certificates** instead? Set `[tls.acme]` (Let's Encrypt, HTTP-01) — it obtains
   and renews the cert for you (staging directory by default).
+
+## The client's address behind a load balancer
+
+Rate limits, `[access]` rules, the access log and `X-Forwarded-For` to the app all key on the
+client's address. Behind a balancer, the connection comes from the balancer, so what sits in front
+decides where the client's real address is:
+
+| In front of EdgeGuard | Where the client's address is | Configure |
+|---|---|---|
+| Nothing | The connection's own peer | Nothing |
+| An L7 balancer (AWS ALB, a GCP HTTPS LB, nginx `http`, Envoy, Cloudflare) | `X-Forwarded-For` | `server.trust_forwarded_for = true` |
+| An L4 balancer that keeps the client's address (an NLB with client IP preservation, a passthrough GCP network LB, `externalTrafficPolicy: Local`) | The connection's own peer | Nothing |
+| An L4 balancer that does not (an NLB with IP targets, HAProxy `mode tcp`, nginx `stream`, a GCP TCP proxy) | A PROXY protocol header at the start of the connection | `server.proxy_protocol = true` |
+
+**Behind an L4 balancer** (`server.proxy_protocol`). The balancer writes one line (v1) or a binary
+block (v2) naming the client before anything else on the connection, and before the TLS handshake
+on a TLS listener. EdgeGuard reads either, but believes it only from the balancer's own addresses:
+
+```toml
+[server]
+proxy_protocol = true
+proxy_protocol_trusted = ["10.0.0.0/20"]   # the balancer's subnets
+```
+
+| Balancer | Its setting |
+|---|---|
+| AWS NLB | Target group attribute `proxy_protocol_v2.enabled = true`. On EKS, the Service annotation `service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"`. Trust the NLB's subnets. |
+| HAProxy | `send-proxy-v2` (or `send-proxy`) on the `server` line. Add `check-send-proxy` too, or its health checks arrive without a header and count as `missing`. |
+| nginx `stream` | `proxy_protocol on;` in the `server` block. |
+| GCP external proxy network LB (TCP proxy) | `--proxy-header=PROXY_V1` on the target TCP proxy. |
+
+How each connection is treated:
+- **From `proxy_protocol_trusted`, with a header:** the header's client is the connection's
+  address for every request on it.
+- **A header that names no client** (v2 `LOCAL`, v1 `UNKNOWN`): this is the balancer's own health
+  check, so it is served as the balancer.
+- **From `proxy_protocol_trusted`, without a header:** also served as the balancer, and counted as
+  `missing`.
+- **From any other peer, with a header:** closed (`untrusted`). Otherwise any client could choose
+  its own address.
+- **From any other peer, without a header:** served as itself (`direct`). Pods calling each other
+  and probes keep working.
+- **A header that does not parse, or nothing within `header_read_timeout`:** closed (`invalid`,
+  `timeout`).
+
+`edgeguard_proxy_protocol_total{listener,result}` counts each case.
+
+**Notes.**
+- A refused header closes the connection instead of serving it as the balancer. An `[access]`
+  rule that allows the balancer's subnet would otherwise let every client through when the
+  balancer's addresses change.
+- An NLB with **client IP preservation** on still sends the header, but from the client's address,
+  so every connection is refused. Turn preservation off, or leave `proxy_protocol` off, since the
+  peer already is the client.
+- Don't combine it with `trust_forwarded_for`: an L4 balancer passes the client's own
+  `X-Forwarded-For` through (`doctor` warns).
+- Applies to the public and redirect listeners. The admin listener never reads a header: probes and
+  scrapes reach it directly.
+- `[trusted_client_cert_header]` is still trusted by the connection's own peer, the hop that wrote
+  it, not by the client a PROXY header names. Behind an L4 balancer that peer is the balancer,
+  and the client writes the header, so leave the balancer out of `trusted_proxies` (`doctor`
+  warns). An L7 balancer that also sends PROXY headers (HAProxy `mode http` with `send-proxy`)
+  writes both itself, and belongs in both lists.
+- Listener settings: read at startup, not on reload.
+
+## Client certificates — where they can be verified
+
+A client certificate exists only in the TLS handshake, so it can be checked only by whatever
+terminates the client's TLS. What sits in front of EdgeGuard decides how:
+
+| In front of EdgeGuard | Does the certificate reach EdgeGuard? | Configure |
+|---|---|---|
+| Nothing (EdgeGuard terminates TLS), or a TCP-passthrough L4 balancer (AWS NLB, a passthrough GCP network LB, HAProxy `mode tcp`) | Yes, in the handshake | `[tls.client_auth]` |
+| An L7 balancer that does the client mTLS and forwards the certificate (ALB in verify mode, Envoy or Istio, nginx, HAProxy, Traefik) | In a header | `[trusted_client_cert_header]` |
+| An L7 balancer that terminates TLS without client certificates | No | Not possible: authenticate with API keys or JWT, or move to passthrough |
+
+**Behind an L7 balancer** (`[trusted_client_cert_header]`). The balancer verifies the certificate
+and writes it into a header, and EdgeGuard believes that header only on connections from the
+balancer's own addresses:
+
+```toml
+[trusted_client_cert_header]
+name = "X-Amzn-Mtls-Clientcert"          # the balancer's header
+format = "pem"                           # pem | der | xfcc
+trusted_proxies = ["10.0.0.0/20"]        # the balancer's subnets: the TCP peer, not X-Forwarded-For
+
+[auth]
+mode = "mtls"                            # the forwarded certificate is the principal
+```
+
+| Balancer | Its setting | `name` | `format` |
+|---|---|---|---|
+| AWS ALB, mTLS verify mode | trust store on the listener | `X-Amzn-Mtls-Clientcert` | `pem` |
+| AWS ALB, mTLS passthrough mode | (forwards without verifying) | `X-Amzn-Mtls-Clientcert` | `pem`, **and set `ca_path`** |
+| nginx | `ssl_verify_client on;` `proxy_set_header X-Client-Cert $ssl_client_escaped_cert;` | `X-Client-Cert` | `pem` |
+| HAProxy | `verify required` on the `bind`; `http-request set-header X-Client-Cert %[ssl_c_der,base64]` | `X-Client-Cert` | `der` |
+| Envoy / Istio | `forward_client_cert_details: SANITIZE_SET`, `set_current_client_cert_details: { cert: true, uri: true }` | `X-Forwarded-Client-Cert` | `xfcc` |
+| Traefik | `passTLSClientCert` middleware with `pem: true` | `X-Forwarded-Tls-Client-Cert` | `der` |
+
+Any other balancer that writes the certificate as PEM or base64 DER works the same way.
+- With `format = "xfcc"` and no `Cert` in the header (Istio's default), the names and hash it
+  reports are used. `ca_path` then has nothing to verify and refuses the request.
+- The header is removed before forwarding. Set `tls.client_auth.forward_client_cert = "xfcc"` to
+  give the app the verified certificate as `X-Forwarded-Client-Cert`.
+
+**Trust the hop, not just its address.**
+- `trusted_proxies` must be addresses only *your* balancer uses. A shared edge network's ranges
+  carry everyone's traffic, so anyone can send through them with any header.
+- A certificate is public, so `ca_path` alone does not prove the client holds its key.
+- Where the balancer's addresses are shared, trust it by its certificate instead: have it
+  present a TLS client certificate to EdgeGuard, and name that certificate in
+  `trusted_proxy_names`. The handshake then proves the hop, and the header names the client.
+  From a trusted hop, the header's certificate is the client's, and the hop's own never is.
+
+  ```toml
+  [tls.client_auth]
+  mode = "optional"                      # or "required" if nothing else connects directly
+  ca_path = "/etc/eggrd/ingress-ca.pem"  # the CA that issued the balancer's client certificate
+
+  [trusted_client_cert_header]
+  name = "X-Forwarded-Client-Cert"
+  format = "xfcc"
+  trusted_proxy_names = ["spiffe://prod.example/ns/ingress/*"]
+  ```
+
+  Name a certificate issued to *you*: an Envoy or Istio ingress with its own SPIFFE ID, or a
+  per-hostname origin certificate. A provider's default origin certificate, shared by all its
+  customers, proves no more than its shared ranges do. Listing addresses too
+  (`trusted_proxies`) makes both required.
+- `edgeguard_client_cert_header_total{result="untrusted_peer"}` counts headers dropped from
+  elsewhere. A rise means a forgery attempt, or balancer addresses that are no longer listed.
+
+## Behind a corporate egress proxy or CA
+
+An edge in a locked-down network often has no direct route out and sits on an internal PKI. Its
+own clients (the control plane, log and span shipping, OTLP metrics, the JWKS fetch, alerts, the
+ACME CA, the DNS provider's API) then need the egress proxy, the corporate CA and often a client
+certificate.
+`[outbound]` sets them once for all of those:
+
+```toml
+[outbound]
+proxy = "http://egress.corp:3128"            # CONNECT proxy: TLS stays end to end
+extra_ca_path = "/etc/eggrd/corp-ca.pem"     # trusted beside the public roots
+client_cert_path = "/etc/eggrd/edge.pem"     # the edge's identity, for endpoints that ask
+client_key_path = "/etc/eggrd/edge.key"
+
+[log.ship]
+enabled = true
+url = "http://127.0.0.1:9000/edge"           # a local collector: the proxy cannot reach it
+proxy = "none"
+```
+
+- Use `extra_ca_path` here, not a section's `ca_path`, for a CA that public endpoints are not
+  signed by. It is added to the public roots, so a chat webhook or a SaaS identity provider still
+  verifies. A TLS-inspecting proxy's CA belongs here too. A section's own `ca_path` replaces the
+  public roots, for the one endpoint that should trust only a private CA.
+- A section's own value wins over `[outbound]`, key by key. `proxy = "none"` sends a section
+  direct. A proxy set here does not read `NO_PROXY`, so a local or LAN collector needs that.
+- Run `edgeguard doctor`: it lists which sections take which `[outbound]` keys, and warns about a
+  section on plain `http://` to another machine, where the CA and certificate do not apply.
+- Proxied traffic to your upstreams is separate (`[upstream_tls]`).
+- The ACME client takes `[outbound]` too, so certificates are issued and renewed through the
+  proxy. It verifies the ACME CA against the host's trust store plus `extra_ca_path`, not the
+  binary's built-in roots, so an internal ACME CA installed on the host keeps working.
+
+## Failover between sites — an upstream pool
+
+An edge in front of on-prem servers with a cloud standby, or the reverse, can spread load and
+fail over without a load balancer in between:
+
+```toml
+[[upstreams]]
+path = "/"
+name = "app"
+targets = ["http://10.0.1.5:8080", "http://10.0.1.6:8080"]
+balance = "round_robin"                  # or "priority": the first takes everything
+backup = ["https://app.dr.example.com"]  # only when neither on-prem server will
+[upstreams.health_check]
+path = "/healthz"
+
+[[upstream_tls.targets]]                 # the standby's own TLS settings, by host and port
+target = "https://app.dr.example.com"
+ca_path = "/etc/eggrd/dr-ca.pem"
+```
+
+**Notes.**
+- **Routing:** the on-prem servers take requests in turn; the standby takes none while either is
+  in rotation. If one is bigger, give it a larger share:
+  `targets = [{ url = "http://10.0.1.5:8080", weight = 2 }, "http://10.0.1.6:8080"]`. If request
+  costs vary widely (reports beside reads, long-lived WebSockets), `balance = "least_conn"`
+  sends each request to the server with the fewest in flight instead. A health check takes a dead server out within `unhealthy_after` × `interval`
+  (10 s by default), and the other takes all its requests.
+- **Sessions in memory:** if the app keeps sessions in process memory, add
+  `sticky_cookie = "eg_upstream"`. Each browser then stays on the server that first answered it,
+  while that server is in rotation. When a server leaves rotation, its users move and log in again.
+  Shared sessions (a database, Redis) avoid that. `sticky_cookie_max_age = "8h"` keeps the
+  pairing across browser restarts, and `sticky_cookie_strip = true` keeps the edge's cookie out of
+  the app's request.
+- **Before the check notices:** a request that cannot connect is sent to the next target, the
+  standby last, and the dead one is ejected for `eject_for`.
+- **Up but broken:** a server whose process answers but whose database is gone passes a
+  shallow health check. `eject_after_5xx = 5` takes it out after five `5xx` answers in a row.
+  Those five still reach their clients. Better still, have `/healthz` check what the app
+  depends on. If it reports that in its body while answering `200`, set
+  `health_check.expect_body = '"status":"ok"'` so the check reads it.
+- **Losing the site:** with both on-prem servers out, every request goes to the standby until one
+  passes its checks again.
+- **Partitions:** `validation.upstream_connect_timeout` (5 s) is what makes a partition, where
+  packets are dropped rather than refused, fail over in seconds rather than at `upstream_timeout`.
+- **Failback:** a server takes traffic again after `healthy_after` passing checks. Expect a short
+  split while a standby request finishes.
+- **Health endpoint:** point `health_check.path` at an unauthenticated endpoint, or send what it
+  needs with `health_check.headers` (a token; a `Host` for an app that routes by name). A `401`,
+  or a `404` from a wrong path, takes every target out. Requests still go through then, since nothing
+  in rotation means every target is tried, but readiness fails and `EdgeGuardUpstreamPoolDown`
+  fires.
+- **No retries after an answer:** a request is never retried once a target answered it, even
+  with a `5xx`, nor when its body was streamed. Make long uploads idempotent, or keep
+  `stream_requests` off on the pool's routes.
 
 ## Catch plaintext traffic — HTTP → HTTPS redirect
 

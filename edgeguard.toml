@@ -28,6 +28,26 @@ trust_forwarded_for = false
 # health check at admin_port when enabled, and keep it on a trusted network (it has no auth).
 admin_port = 0            # 0 = keep internal endpoints on the public port (default)
 admin_addr = "127.0.0.1"  # loopback (same-host scraper); "0.0.0.0" for a private interface
+# Connection hygiene, on every listener. A connection must send a complete request head within
+# header_read_timeout — a new one that sends nothing, a slow one, or a keep-alive connection idle
+# between requests — or it is closed. "0" disables it (don't, on a public port).
+header_read_timeout = "30s"
+max_connections = 0       # open connections on the public listener; 0 = unlimited
+# Graceful shutdown. On SIGTERM, /__edgeguard/ready turns 503 at once; the listener keeps accepting
+# for drain_delay (give your load balancer time to stop routing here), then finishes in-flight
+# requests for up to drain_timeout before exiting. A --wrap'ped app is stopped after the drain.
+# Keep drain_delay + drain_timeout under your platform's kill deadline (Kubernetes: 30s default).
+drain_delay = "0s"
+drain_timeout = "25s"
+# Behind an L4 load balancer that passes TCP through (AWS NLB with IP targets, HAProxy mode tcp,
+# nginx stream, a GCP TCP proxy), every connection comes from the balancer, and X-Forwarded-For
+# cannot help: nothing writes it. Have the balancer send a PROXY protocol header (v1 or v2) and
+# read it here: the client it names is what rate limits, [access] and the logs see. It is believed
+# only from proxy_protocol_trusted (required; a /0 is refused); from anyone else a connection
+# that starts with one is closed, and one without is served as it is. Public and redirect listeners
+# only, read before the TLS handshake. Leave trust_forwarded_for off with it.
+proxy_protocol = false
+proxy_protocol_trusted = []   # the balancer's subnets, e.g. ["10.0.0.0/20"]
 
 # --- Per-path upstream overrides (optional; single upstream by default) ---
 # Everything goes to server.upstream/app_port unless a prefix below matches. The common use is a
@@ -40,6 +60,57 @@ admin_addr = "127.0.0.1"  # loopback (same-host scraper); "0.0.0.0" for a privat
 # [[upstreams]]
 # path = "/auth/"
 # target = "http://auth.internal:5000"
+#
+# Balancing and failover: `targets` instead of `target` makes a pool. balance = "priority" sends each
+# request to the first target in rotation; "round_robin" takes them in turn. `backup` targets take
+# requests only when none of `targets` will. A request that cannot connect is sent to the next
+# target, and its target is ejected for eject_for. A health check takes targets out (and back)
+# before requests find them gone. path = "/" puts the whole app behind the pool.
+# [[upstreams]]
+# path = "/"
+# name = "app"
+# targets = [{ url = "http://10.0.1.5:8080", weight = 2 }, "http://10.0.1.6:8080"]
+# balance = "round_robin"  # default "priority"; or "least_conn": fewest requests in flight per weight;
+#                          # or "hash": the same hash_on key to the same target
+# hash_on = "header:x-tenant"  # with "hash": "client_ip" (default), "path", "header:<name>",
+#                              # "cookie:<name>", "query:<name>"
+# sticky_cookie = "eg_upstream"  # keep each client on the target that answered it; empty = off
+# sticky_cookie_max_age = "8h"   # its Max-Age, from when it is set; empty = a session cookie
+# sticky_cookie_strip = true     # keep it from the upstream (the client's other cookies go)
+# backup = ["https://standby.example.com"]
+# eject_after = 1          # failed connections in a row that take a target out; 0 = off
+# eject_for = "30s"        # × ejections in a row, up to eject_for_max
+# eject_for_max = "5m"     # and back to eject_for after this long without another ejection
+# eject_after_5xx = 5      # 5xx answers in a row that take a target out (never the last); 0 = off
+# [upstreams.health_check]
+# path = "/healthz"        # 2xx/3xx passes; empty = no active checks
+# interval = "5s"
+# timeout = "2s"
+# unhealthy_after = 2
+# healthy_after = 2
+# expect_status = "200-399"  # codes, ranges, classes: "200,204", "2xx"
+# expect_body = '"status":"ok"'  # and this text within the body's first 64 KiB; empty = status only
+# expect_body_regex = '"status":\s*"(ok|degraded)"'  # or a regex over the body (not both)
+# method = "GET"           # or "HEAD" (status only), "OPTIONS", ...
+# headers = [["Host", "app.internal"]]  # sent with each check; values are never shown
+# port = 8081              # check each target's management port instead; 0 = its own
+# type = "http"            # or "tcp": only connect to each target (no path, no expect_*, method, headers)
+
+# --- TLS to https:// upstreams (optional; works with no settings) ---
+# An https:// upstream (server.upstream or a [[upstreams]] target) is verified against the public
+# web PKI by default, built into the binary. Set ca_path to trust only a private CA instead, and
+# cert_path/key_path to present a client certificate (mutual TLS). There is no "skip
+# verification": put a self-signed upstream certificate in ca_path. Read at startup; the client
+# certificate is reloaded when its files change.
+# [upstream_tls]
+# ca_path = "/etc/eggrd/upstream-ca.pem"
+# cert_path = "/etc/eggrd/edge-client.pem"
+# key_path = "/etc/eggrd/edge-client.key"
+# server_name = ""        # name to verify instead of the URL's host (for an upstream dialled by IP)
+# One upstream with its own settings; empty keys inherit the ones above.
+# [[upstream_tls.targets]]
+# target = "https://10.0.3.7:8443"
+# server_name = "api.internal"
 
 [auth]
 # Gate applied to every proxied request (the internal /__edgeguard/* endpoints are exempt):
@@ -47,6 +118,7 @@ admin_addr = "127.0.0.1"  # loopback (same-host scraper); "0.0.0.0" for a privat
 #   "basic"  — HTTP Basic against [auth].users
 #   "apikey" — a static API key / bearer token from [auth].api_keys
 #   "jwt"    — a verified JWT bearer token per [auth.jwt]
+#   "mtls"   — the client certificate verified by [tls.client_auth], per [auth.mtls]
 mode = "basic"
 realm = "EdgeGuard"
 # username -> password. A value starting with "$argon2" is verified as a PHC hash; anything
@@ -79,6 +151,12 @@ issuer = ""
 audience = ""
 leeway_secs = 60
 
+# --- Client-certificate gate (mode = "mtls"; needs [tls.client_auth]) ---
+# Which of the certificates the client CA issues may call the app: exact names, or prefixes ending
+# in `*`. The principal is the certificate's first allowed name (URI, then DNS, email, CN).
+# [auth.mtls]
+# allowed = ["spiffe://prod.example/ns/web/*"]
+
 [ratelimit]
 enabled = true
 rate = "60/min"   # default per-client-IP limit; supports N/sec, N/min, N/hour
@@ -102,6 +180,7 @@ fail_open = false
 # path = "/api/"
 # rate = "10/sec"
 # burst = 20
+# name = "api"         # the route label in edgeguard_route_* metrics (default: the path)
 # [[ratelimit.routes]]
 # path = "/api/admin/"
 # rate = "1/sec"
@@ -123,6 +202,10 @@ max_response_body = "0"
 # Max time to wait for the upstream response and to read its body, e.g. "30s", "500ms",
 # "2m". "0" disables it. A stalled upstream returns 504 instead of pinning the request.
 upstream_timeout = "30s"
+# Max time to open the connection to an upstream; past it the request fails with 502, or moves to
+# a pool's next target. An upstream whose packets are dropped never refuses, so without this it
+# holds the request for all of upstream_timeout. "0" leaves it to upstream_timeout. Read at startup.
+upstream_connect_timeout = "5s"
 # Cap on total request header bytes (sum of name + value), e.g. "32KiB". "0" disables it.
 # Requests over the limit get 431. A policy limit on top of hyper's transport-level cap.
 max_header_bytes = "0"
@@ -211,10 +294,34 @@ inspect_body = false    # inspect the (size-capped) request body — opt in
 # --- OTLP metrics (optional) ---
 # Push every metric /__edgeguard/metrics serves to an OpenTelemetry collector, for pipelines that
 # do not scrape. Edge-local: a control plane cannot repoint it.
+# Per-consumer series (edgeguard_consumer_*): one per authenticated principal, up to this many;
+# the rest share "_over_cap". 0 turns them off (for principals that are personal data).
+# [metrics]
+# consumer_series_max = 100
 # [metrics.otlp]
 # enabled = true
 # endpoint = "http://otel-collector:4318/v1/metrics"
 # interval_secs = 60
+# Every section with a URL the edge calls (metrics.otlp, tracing, log.ship, auth.jwt, alerts,
+# llm.telemetry, tls.acme, tls.acme.dns, control_plane) also takes the same four keys. A private CA (https://
+# only) replaces the public roots for that client; the client certificate is re-read on change;
+# proxy = "" takes [outbound] (then HTTPS_PROXY), "http://host:port" tunnels this client alone,
+# "none" goes direct.
+# ca_path = "/etc/eggrd/corp-ca.pem"
+# client_cert_path = "/etc/eggrd/edge.pem"
+# client_key_path = "/etc/eggrd/edge.key"
+# proxy = "http://egress.corp:3128"
+
+# Defaults for all of those sections, for the keys each leaves empty: an egress proxy, the edge's
+# identity, a corporate CA. extra_ca_path is trusted beside the public roots, not instead of them,
+# so public endpoints (a chat webhook, a SaaS JWKS) keep working; there is no ca_path here. The CA
+# and certificate reach https:// URLs only. Edge-local. A section opts out of the proxy with
+# proxy = "none".
+# [outbound]
+# proxy = "http://egress.corp:3128"
+# extra_ca_path = "/etc/eggrd/corp-ca.pem"
+# client_cert_path = "/etc/eggrd/edge.pem"
+# client_key_path = "/etc/eggrd/edge.key"
 
 [log]
 # What the access log records. The request line is the most useful field in an access log and the
@@ -238,6 +345,11 @@ query = "redact"
 # Extra parameter names to treat as sensitive, on top of the built-in list. Matched
 # case-insensitively as substrings.
 redact_params = []
+
+# Who made the request: the authenticated principal (apikey:<id> — a hash, never the key — the
+# Basic user, the JWT sub, the client certificate's name). "full" (default), "hash" (sha256:<16
+# hex>: one caller's lines still correlate, but the name is not written), or "off".
+principal = "full"
 
 [access]
 allow = []   # e.g. ["10.0.0.0/8", "203.0.113.7"]  — lock the app to an office/VPN range
@@ -328,6 +440,30 @@ redirect_hosts = []      # e.g. ["app.example.com"]
 # key_path = "/etc/eggrd/api.key"
 # hosts = ["api.example.com"]
 
+# Client certificates (mutual TLS) on this listener. "required": no certificate from a CA in
+# ca_path, no connection. "optional": verified if presented (pair with auth.mode = "mtls" to answer
+# clients without one with 401). The CA bundle and CRLs reload when they change on disk. While on,
+# TLS session resumption is off, so a revoked certificate cannot keep connecting on an old session.
+# [tls.client_auth]
+# mode = "required"
+# ca_path = "/etc/eggrd/client-ca.pem"
+# crl_paths = ["/etc/eggrd/client-ca.crl"]
+# forward_client_cert = "xfcc"   # send the app X-Forwarded-Client-Cert for the verified certificate
+
+# A client certificate a TLS-terminating load balancer verified and forwards in a header (an ALB in
+# mTLS verify mode, nginx, HAProxy, Envoy/Istio, Traefik). Believed only from the balancer: by
+# trusted_proxies (the connection's own peer, never X-Forwarded-For), or by trusted_proxy_names
+# (the TLS client certificate the connection presented); removed before forwarding either way.
+# From the balancer, the connection's own client certificate is the balancer's, never the
+# client's. Edge-local.
+# [trusted_client_cert_header]
+# name = "X-Amzn-Mtls-Clientcert"
+# format = "pem"                       # pem | der | xfcc
+# trusted_proxies = ["10.0.0.0/20"]
+# trusted_proxy_names = ["spiffe://prod.example/ns/ingress/*"]  # or by the balancer's TLS client
+#                                      # certificate (needs [tls.client_auth]); both set: both match
+# ca_path = ""                         # also verify it, for a balancer that forwards unchecked
+
 # Automatic certificates via ACME / Let's Encrypt (HTTP-01 challenge on port 80). The issued
 # certificate is written to the cert_path/key_path above. NOTE: requires a public domain and
 # inbound :80; the default directory is Let's Encrypt STAGING so a first run can't burn the
@@ -346,6 +482,11 @@ renew = true
 # record through [tls.acme.dns] instead — required for wildcards ("*.example.com") and for hosts the
 # CA cannot reach on :80.
 challenge = "http-01"
+# How ACME requests reach the CA: a proxy ("" takes [outbound], then HTTPS_PROXY), or a CA bundle
+# that replaces the trust for the directory. With neither, it trusts the operating system's store
+# (where a private ACME CA's root can be installed), not the roots built into the binary.
+# proxy = "http://egress.corp:3128"
+# ca_path = "/etc/eggrd/acme-ca.pem"
 
 # DNS-01 provider (only read when challenge = "dns-01"). The API token is read from the environment
 # variable named here, never from this file: a Cloudflare token with Zone.DNS:Edit on this zone only.
@@ -374,3 +515,17 @@ forward_csp = true     # forward received CSP reports to the control plane
 # served. Prefer EDGEGUARD_CP_QUOTA_ENFORCE.
 enforce_quota = false
 quota_poll_interval = "30s"  # how often to poll the quota verdict
+# Keep the last policy pulled from the control plane on disk (written 0600, holds its secrets), so
+# a restart while the control plane is down starts on it instead of on this file alone.
+# cache_path = "/var/lib/eggrd/policy.json"
+# Until a pushed policy is applied: "local" serves on this file; "refuse" answers 503 (and
+# /__edgeguard/ready 503) instead.
+boot_without_policy = "local"
+# A control plane behind a private CA: trust only these CAs for it (needs an https:// url).
+# ca_path = "/etc/eggrd/cp-ca.pem"
+# This edge's client certificate, for a control plane that requires one (re-read on change).
+# client_cert_path = "/etc/eggrd/edge.pem"
+# client_key_path = "/etc/eggrd/edge.key"
+# "" takes [outbound] proxy, then HTTPS_PROXY/NO_PROXY; "http://[user:pass@]host:port" tunnels
+# this client alone through that CONNECT proxy; "none" connects directly.
+# proxy = "http://egress.corp:3128"

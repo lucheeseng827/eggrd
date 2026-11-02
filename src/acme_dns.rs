@@ -100,7 +100,13 @@ impl DnsProvider {
     /// Build the provider `cfg` names. Fails, naming what is missing, when it cannot work: no
     /// provider, no zone, or the token's environment variable unset.
     pub fn from_cfg(cfg: &AcmeDnsCfg) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let api = if cfg.provider == "challtestsrv" {
+            &cfg.url
+        } else {
+            &cfg.api_base
+        };
+        let (http, _) = crate::outbound::builder(&cfg.outbound, "tls.acme.dns", api)?;
+        let http = http
             .timeout(Duration::from_secs(30))
             .build()
             .context("building the DNS provider's HTTP client")?;
@@ -374,6 +380,38 @@ mod tests {
         assert!(format!("{:#}", DnsProvider::from_cfg(&cfg).unwrap_err()).contains("route53"));
         cfg.provider.clear();
         assert!(format!("{:#}", DnsProvider::from_cfg(&cfg).unwrap_err()).contains("provider"));
+    }
+
+    /// The provider's API client takes `[tls.acme.dns]`'s CA, certificate and proxy, checked
+    /// against the URL that provider calls.
+    #[test]
+    fn the_api_client_takes_the_outbound_settings() {
+        std::env::set_var("EG_TEST_CF_TOKEN_OUTBOUND", "t");
+        let mut cfg = AcmeDnsCfg {
+            provider: "cloudflare".into(),
+            zone_id: "z".into(),
+            api_token_env: "EG_TEST_CF_TOKEN_OUTBOUND".into(),
+            ..AcmeDnsCfg::default()
+        };
+        cfg.outbound.ca_path = "/no/such/ca.pem".into();
+        let err = format!("{:#}", DnsProvider::from_cfg(&cfg).unwrap_err());
+        assert!(err.contains("tls.acme.dns.ca_path"), "{err}");
+        cfg.outbound.ca_path.clear();
+        cfg.outbound.proxy = "socks5://egress:1080".into();
+        let err = format!("{:#}", DnsProvider::from_cfg(&cfg).unwrap_err());
+        assert!(err.contains("tls.acme.dns.proxy"), "{err}");
+
+        let mut cfg = AcmeDnsCfg {
+            provider: "challtestsrv".into(),
+            url: "http://localhost:8055".into(),
+            ..AcmeDnsCfg::default()
+        };
+        cfg.outbound.ca_path = "/etc/eggrd/ca.pem".into();
+        let err = format!("{:#}", DnsProvider::from_cfg(&cfg).unwrap_err());
+        assert!(
+            err.contains("not https://"),
+            "its own url, not api_base: {err}"
+        );
     }
 
     #[tokio::test]

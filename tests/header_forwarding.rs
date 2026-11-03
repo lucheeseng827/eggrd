@@ -176,6 +176,66 @@ async fn a_websocket_handshake_forwards_repeated_headers_too() {
     assert_eq!(h["cookie"], json!(["a=1; b=2"]));
 }
 
+/// The client-address headers the client wrote, as an app behind the edge would read them.
+const SPOOFED: &str =
+    "X-Forwarded-For: 1.2.3.4\r\nX-Real-IP: 1.2.3.4\r\nTrue-Client-IP: 1.2.3.4\r\n\
+                       Forwarded: for=1.2.3.4;proto=https\r\nX-Forwarded-Host: evil.example\r\n";
+
+/// Whatever the client wrote, the upstream sees the edge's own client address in every header
+/// a framework might read it from, and the `Host` the edge was asked for as `X-Forwarded-Host`.
+fn assert_edges_own(h: &Map<String, Value>, client: &str) {
+    assert_eq!(h["x-forwarded-for"], json!([client]), "{h:?}");
+    assert_eq!(h["x-real-ip"], json!([client]), "{h:?}");
+    assert!(!h.contains_key("true-client-ip"), "{h:?}");
+    assert_eq!(
+        h["forwarded"],
+        json!([format!("for={client};proto=http")]),
+        "{h:?}"
+    );
+    assert_eq!(h["x-forwarded-host"], json!(["shop.example"]), "{h:?}");
+}
+
+#[tokio::test]
+async fn the_upstream_gets_the_edges_client_headers_not_the_clients() {
+    let (up, seen) = recorder().await;
+    let addr = edge(cfg(up)).await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("GET /orders HTTP/1.1\r\nHost: shop.example\r\n{SPOOFED}Connection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    assert!(out.starts_with(b"HTTP/1.1 200"));
+    assert_edges_own(&last(&seen), "127.0.0.1");
+}
+
+#[tokio::test]
+async fn a_websocket_handshake_gets_the_edges_client_headers_too() {
+    let (up, seen) = recorder().await;
+    // Behind a trusted balancer: the client is the entry it appended, on this path as well.
+    let mut c = cfg(up);
+    c.server.trust_forwarded_for = true;
+    let addr = edge(c).await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!(
+            "GET /ws HTTP/1.1\r\nHost: shop.example\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\
+             {SPOOFED}X-Forwarded-For: 198.51.100.7\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = [0u8; 12];
+    s.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 101");
+    // `1.2.3.4` (client-written), then `198.51.100.7` on a second line (the balancer's).
+    assert_edges_own(&last(&seen), "198.51.100.7");
+}
+
 /// The edge checks the first value; an app that read the second would believe a credential the
 /// edge never checked. So a repeated credential header never reaches the app.
 #[tokio::test]

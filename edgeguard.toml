@@ -21,6 +21,11 @@ app_port = 3000
 # below) it forwards "https"; otherwise, when this is true the edge's incoming
 # X-Forwarded-Proto is preserved, and when false a plain-HTTP hop forwards "http".
 trust_forwarded_for = false
+# With trust_forwarded_for: how many X-Forwarded-For entries the proxies in front append. The
+# client is that many entries from the RIGHT (what a client writes on the left is ignored).
+# 1 = an ALB (append mode), Cloudflare, nginx, Traefik; 2 = a GCP external Application Load
+# Balancer (it appends two), or CloudFront -> ALB. Other platforms: check before use.
+forwarded_hops = 1
 # Public/private split (optional). When admin_port is non-zero, EdgeGuard serves the internal
 # ops endpoints (/__edgeguard/health, /ready, /metrics) on a SECOND, plain-HTTP listener at
 # admin_addr:admin_port instead of the public port — so metrics/health aren't exposed publicly.
@@ -70,6 +75,8 @@ proxy_protocol_trusted = []   # the balancer's subnets, e.g. ["10.0.0.0/20"]
 # path = "/"
 # name = "app"
 # targets = [{ url = "http://10.0.1.5:8080", weight = 2 }, "http://10.0.1.6:8080"]
+# A target's table also takes check_host = "10.0.9.5": its health check goes there (with the
+# pool's health_check.port and scheme), e.g. to the server's management network address.
 # balance = "round_robin"  # default "priority"; or "least_conn": fewest requests in flight per weight;
 #                          # or "hash": the same hash_on key to the same target
 # hash_on = "header:x-tenant"  # with "hash": "client_ip" (default), "path", "header:<name>",
@@ -94,6 +101,7 @@ proxy_protocol_trusted = []   # the balancer's subnets, e.g. ["10.0.0.0/20"]
 # method = "GET"           # or "HEAD" (status only), "OPTIONS", ...
 # headers = [["Host", "app.internal"]]  # sent with each check; values are never shown
 # port = 8081              # check each target's management port instead; 0 = its own
+# scheme = "http"          # and over this scheme, e.g. a TLS app's plain-HTTP management port
 # type = "http"            # or "tcp": only connect to each target (no path, no expect_*, method, headers)
 
 # --- TLS to https:// upstreams (optional; works with no settings) ---

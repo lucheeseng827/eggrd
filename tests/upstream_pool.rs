@@ -424,11 +424,13 @@ async fn weighted_round_robin_gives_each_target_its_share() {
         TargetCfg {
             url: a.url.clone(),
             weight: Some(3),
+            check_host: None,
         },
         b.url.clone().into(),
         TargetCfg {
             url: c.url.clone(),
             weight: Some(2),
+            check_host: None,
         },
     ];
     let edge = edge(cfg).await;
@@ -620,13 +622,18 @@ async fn each_https_target_takes_its_own_upstream_tls_settings() {
 
 /// A management port on TLS, its certificate from `ca`, answering `GET /healthz` with `200`.
 async fn tls_health(dir: &Dir, ca: &Ca) -> (u16, watch::Sender<bool>) {
+    tls_health_at(dir, ca, ("127.0.0.1", 0)).await
+}
+
+/// [`tls_health`] on `addr`. Its certificate names `localhost` only.
+async fn tls_health_at(dir: &Dir, ca: &Ca, addr: (&str, u16)) -> (u16, watch::Sender<bool>) {
     edgeguard::tls::init_crypto();
     let (cert, key) = dir.pair("mgmt", &ca.server(&["localhost"]));
     let store =
         edgeguard::certstore::CertStore::load(&cert, &key, edgeguard::certstore::CertSource::File)
             .unwrap();
     let tls = edgeguard::tls::server_config(store).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind(addr).await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (stop, rx) = watch::channel(false);
     let app = Router::new().route("/healthz", get(|| async { StatusCode::OK }));
@@ -665,6 +672,222 @@ async fn a_check_on_another_port_keeps_the_targets_tls_settings() {
     .await;
     assert_eq!(last_check(&edge, &secure).await, "answered 200");
     assert_eq!(get_body(&edge).await, (200, "tls:0".into()));
+}
+
+/// A plain-HTTP management port answering `GET /healthz` with `200`.
+async fn plain_health() -> u16 {
+    let app = Router::new().route("/healthz", get(|| async { StatusCode::OK }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    port
+}
+
+#[tokio::test]
+async fn a_tls_target_can_be_checked_on_a_plain_http_management_port() {
+    let dir = Dir::new();
+    let ca = Ca::new("private CA");
+    let (secure, _stop) = tls_up(&dir, &ca).await;
+    let port = plain_health().await;
+    let with_scheme = |scheme: &str| {
+        let mut c = checked(cfg(&[&secure]));
+        c.upstreams[0].health_check.port = port;
+        c.upstreams[0].health_check.scheme = scheme.into();
+        c.upstream_tls.targets = vec![UpstreamTlsTarget {
+            target: secure.clone(),
+            ca_path: dir.write("ca.pem", &ca.pem),
+            ..Default::default()
+        }];
+        c
+    };
+    let edge = edge(with_scheme("http")).await;
+    until("the plain-HTTP check passes", || {
+        in_rotation_is(&edge.metrics, &secure, 1)
+            && series(
+                &edge.metrics,
+                &format!(
+                    "edgeguard_upstream_health_checks_total{{route=\"app\",upstream=\"{secure}\",result=\"pass\"}}"
+                ),
+            )
+            .unwrap_or(0)
+                >= 2
+    })
+    .await;
+    assert_eq!(last_check(&edge, &secure).await, "answered 200");
+    assert_eq!(
+        get_body(&edge).await,
+        (200, "tls:0".into()),
+        "requests still go over TLS"
+    );
+
+    // Over the target's own scheme, the check speaks TLS to a port that does not.
+    let tls_check = self::edge(with_scheme("")).await;
+    until("out", || in_rotation_is(&tls_check.metrics, &secure, 0)).await;
+    assert_ne!(last_check(&tls_check, &secure).await, "answered 200");
+}
+
+#[tokio::test]
+async fn a_plain_target_can_be_checked_over_https() {
+    let dir = Dir::new();
+    let ca = Ca::new("management CA");
+    let a = up("a").await;
+    // By the name the management certificate carries.
+    let target = a.url.replace("127.0.0.1", "localhost");
+    let (port, _mgmt) = tls_health(&dir, &ca).await;
+    let with_scheme = |scheme: &str| {
+        let mut c = checked(cfg(&[&target]));
+        c.upstreams[0].health_check.port = port;
+        c.upstreams[0].health_check.scheme = scheme.into();
+        // The target has no TLS settings of its own: the check takes [upstream_tls]'s.
+        c.upstream_tls.ca_path = dir.write("ca.pem", &ca.pem);
+        c
+    };
+    let edge = edge(with_scheme("https")).await;
+    until("the TLS check passes", || {
+        series(
+            &edge.metrics,
+            &format!(
+                "edgeguard_upstream_health_checks_total{{route=\"app\",upstream=\"{target}\",result=\"pass\"}}"
+            ),
+        )
+        .unwrap_or(0)
+            >= 2
+    })
+    .await;
+    assert_eq!(last_check(&edge, &target).await, "answered 200");
+    let j = status(&edge).await;
+    assert_eq!(route_named(&j, "app")["health_check"]["scheme"], "https");
+
+    let plain_check = self::edge(with_scheme("")).await;
+    until("out", || in_rotation_is(&plain_check.metrics, &target, 0)).await;
+
+    // The CA in an entry for where the check goes, not in [upstream_tls]: the check, dialling
+    // that host and port, takes it.
+    let mut c = with_scheme("https");
+    c.upstream_tls.ca_path.clear();
+    c.upstream_tls.targets = vec![UpstreamTlsTarget {
+        target: format!("https://localhost:{port}"),
+        ca_path: dir.write("entry-ca.pem", &ca.pem),
+        ..Default::default()
+    }];
+    let by_entry = self::edge(c).await;
+    until("the check passes with the entry's CA", || {
+        series(
+            &by_entry.metrics,
+            &format!(
+                "edgeguard_upstream_health_checks_total{{route=\"app\",upstream=\"{target}\",result=\"pass\"}}"
+            ),
+        )
+        .unwrap_or(0)
+            >= 2
+    })
+    .await;
+}
+
+/// A target's health on another address of the same machine: requests to `127.0.0.1`, its
+/// health on `127.0.0.2` (both loopback on Linux), at the same port number.
+#[tokio::test]
+async fn a_check_can_go_to_another_host_of_the_target() {
+    let a = up("a").await;
+    let port: u16 = a.url.rsplit(':').next().unwrap().parse().unwrap();
+    // It answers 200 only to the target's own name: the check sends that, not the address it
+    // dials.
+    let want = format!("127.0.0.1:{port}");
+    let health = Router::new().route(
+        "/healthz",
+        get(move |headers: axum::http::HeaderMap| {
+            let ok = headers.get("host").is_some_and(|h| *h == want.as_str());
+            async move {
+                if ok {
+                    StatusCode::OK
+                } else {
+                    StatusCode::MISDIRECTED_REQUEST
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(("127.0.0.2", port)).await.unwrap();
+    tokio::spawn(async move { axum::serve(listener, health).await.unwrap() });
+    // The request port has /healthz too; take it down, so only the other host can pass.
+    a.health.store(503, Ordering::Relaxed);
+    let with_host = |host: Option<&str>| {
+        let mut c = checked(cfg(&[]));
+        c.upstreams[0].targets = vec![TargetCfg {
+            url: a.url.clone(),
+            weight: None,
+            check_host: host.map(str::to_string),
+        }];
+        c
+    };
+    let edge = edge(with_host(Some("127.0.0.2"))).await;
+    let passes = format!(
+        "edgeguard_upstream_health_checks_total{{route=\"app\",upstream=\"{}\",result=\"pass\"}}",
+        a.url
+    );
+    until("checks at the other host pass", || {
+        series(&edge.metrics, &passes).unwrap_or(0) >= 2
+    })
+    .await;
+    assert!(in_rotation_is(&edge.metrics, &a.url, 1));
+    let j = status(&edge).await;
+    assert_eq!(
+        target_named(route_named(&j, "app"), &a.url)["check_host"],
+        "127.0.0.2"
+    );
+
+    let own = self::edge(with_host(None)).await;
+    until("its own host says 503", || {
+        in_rotation_is(&own.metrics, &a.url, 0)
+    })
+    .await;
+}
+
+/// Dialling an address the certificate does not name, the check still verifies the target's own
+/// name, as the target's requests do: it is the same server. The health listens only on
+/// 127.0.0.2, so a check that ignored `check_host` would go to 127.0.0.1 and be refused.
+#[tokio::test]
+async fn a_tls_check_at_another_host_verifies_the_targets_name() {
+    let dir = Dir::new();
+    let ca = Ca::new("private CA");
+    // The target: https://localhost:<port>, listening on 127.0.0.1, its certificate for localhost.
+    let (secure, _stop) = tls_up(&dir, &ca).await;
+    let own_port: u16 = secure.rsplit(':').next().unwrap().parse().unwrap();
+    let passes = format!(
+        "edgeguard_upstream_health_checks_total{{route=\"app\",upstream=\"{secure}\",result=\"pass\"}}"
+    );
+    let with = |port: u16| {
+        let mut c = checked(cfg(&[]));
+        c.upstreams[0].targets = vec![TargetCfg {
+            url: secure.clone(),
+            weight: None,
+            check_host: Some("127.0.0.2".into()),
+        }];
+        c.upstreams[0].health_check.port = port;
+        c.upstream_tls.targets = vec![UpstreamTlsTarget {
+            target: secure.clone(),
+            ca_path: dir.write("ca.pem", &ca.pem),
+            ..Default::default()
+        }];
+        c
+    };
+
+    // On another port of the other host.
+    let (mgmt_port, _mgmt) = tls_health_at(&dir, &ca, ("127.0.0.2", 0)).await;
+    let edge = edge(with(mgmt_port)).await;
+    until(
+        "the check at 127.0.0.2 passes, verified as localhost",
+        || series(&edge.metrics, &passes).unwrap_or(0) >= 2,
+    )
+    .await;
+    assert_eq!(last_check(&edge, &secure).await, "answered 200");
+
+    // On the target's own port of the other host: the host alone keeps the target's settings.
+    let (_, _same) = tls_health_at(&dir, &ca, ("127.0.0.2", own_port)).await;
+    let same_port = self::edge(with(0)).await;
+    until("the check on the target's port at 127.0.0.2 passes", || {
+        series(&same_port.metrics, &passes).unwrap_or(0) >= 2
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1320,6 +1543,16 @@ async fn hash_on_client_ip_follows_the_address_the_edge_resolved() {
         let ip = format!("203.0.113.{i}");
         let first = body_with(&edge, &[("x-forwarded-for", &ip)]).await;
         assert_eq!(body_with(&edge, &[("x-forwarded-for", &ip)]).await, first);
+        // What a client writes on the left, ahead of the balancer's entry, moves nothing: the
+        // hash is on the address the balancer appended.
+        for spoof in 1..=5 {
+            let chain = format!("198.51.100.{spoof}, {ip}");
+            assert_eq!(
+                body_with(&edge, &[("x-forwarded-for", &chain)]).await,
+                first,
+                "{chain}"
+            );
+        }
         used.insert(first);
     }
     assert_eq!(used.len(), 2, "{used:?}");
@@ -1444,6 +1677,39 @@ async fn a_websocket_upgrade_follows_the_sticky_cookie() {
     }
     assert_eq!(requests(&edge.metrics, &two, "ok"), 3);
     assert_eq!(requests(&edge.metrics, &one, "ok"), 0);
+}
+
+#[tokio::test]
+async fn a_websocket_upgrade_hashes_on_the_client_the_balancer_appended() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (one, two) = (ws_echo().await, ws_echo().await);
+    let mut c = hashing(&[&one, &two], "");
+    c.server.trust_forwarded_for = true;
+    c.validation.websocket_passthrough = true;
+    let edge = edge(c).await;
+    // The same real client (the last entry), whatever it writes on the left: one target.
+    for spoof in 1..=6 {
+        let mut s = tokio::net::TcpStream::connect(edge.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        s.write_all(
+            format!(
+                "GET /ws HTTP/1.1\r\nHost: edge\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\
+                 X-Forwarded-For: 198.51.100.{spoof}, 203.0.113.9\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut head = [0u8; 12];
+        s.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 101");
+    }
+    let (a, b) = (
+        requests(&edge.metrics, &one, "ok"),
+        requests(&edge.metrics, &two, "ok"),
+    );
+    assert!((a, b) == (6, 0) || (a, b) == (0, 6), "{a}, {b}");
 }
 
 /// An upstream that records the `Cookie` header of every request it gets, answering a `101` to

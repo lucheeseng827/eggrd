@@ -399,38 +399,86 @@ async fn startup_waits_for_the_local_app_before_serving() {
     });
 }
 
+/// The status line's code of `GET path` on a local port, sent after `preamble`.
+fn status_after(port: u16, preamble: &[u8], path: &str) -> Option<u16> {
+    use std::io::{Read, Write};
+    let mut conn = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
+    let mut bytes = preamble.to_vec();
+    bytes.extend_from_slice(
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+    );
+    conn.write_all(&bytes).ok()?;
+    let mut response = Vec::new();
+    let _ = conn.read_to_end(&mut response);
+    String::from_utf8_lossy(&response).get(9..12)?.parse().ok()
+}
+
 #[test]
-fn the_admin_listener_takes_neither_the_connection_cap_nor_proxy_protocol() {
+fn the_admin_listener_takes_no_connection_cap_and_answers_a_proxy_protocol_health_check() {
     // Probes and scrapes reach the admin port directly, and must get through while the public
-    // port is full. With PROXY protocol on it, every probe from a trusted range would count as
-    // `missing` and fire EdgeGuardProxyProtocolMissing.
+    // port is full. With PROXY protocol on, an AWS NLB's health check of the admin port sends a
+    // v2 `LOCAL` header first: the admin listener reads it (as optional), so the check is answered
+    // instead of failing every target with "invalid HTTP method parsed". A probe from a trusted
+    // range without a header counts as `direct`, so EdgeGuardProxyProtocolMissing stays quiet.
     let dir = TempDir::new("admin-opts");
     let (port, admin) = (free_port(), free_port());
+    // An upstream that accepts connections, so `/ready` is 200.
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let up = upstream.local_addr().unwrap();
     let _server = start(
         &dir,
         &format!(
-            "[server]\nport = {port}\nadmin_port = {admin}\nupstream = \"http://127.0.0.1:1\"\n\
+            "[server]\nport = {port}\nadmin_port = {admin}\nupstream = \"http://{up}\"\n\
              max_connections = 64\nproxy_protocol = true\nproxy_protocol_trusted = [\"127.0.0.0/8\"]\n"
         ),
     );
-    let metrics = within(10, "the public listener never reported", || {
+    within(10, "the public listener never reported", || {
         get(admin, "/__edgeguard/metrics")
             .filter(|m| m.contains("edgeguard_connections_max{listener=\"public\"} 64\n"))
     });
-    assert!(
-        metrics.contains("edgeguard_proxy_protocol_total{listener=\"public\","),
-        "{metrics}"
+    let local = b"\r\n\r\n\0\r\nQUIT\n\x20\x00\x00\x00";
+    assert_eq!(
+        status_after(admin, local, "/__edgeguard/ready"),
+        Some(200),
+        "an NLB health check: v2 LOCAL, then GET /__edgeguard/ready"
     );
-    assert!(
-        metrics.contains("edgeguard_connections_open{listener=\"admin\"}"),
-        "{metrics}"
+    assert_eq!(
+        status_after(admin, b"PROXY UNKNOWN\r\n", "/__edgeguard/ready"),
+        Some(200),
+        "v1"
     );
+    let metrics = get(admin, "/__edgeguard/metrics").unwrap();
+    for (series, wanted) in [
+        (
+            "edgeguard_proxy_protocol_total{listener=\"admin\",result=\"local\"} ",
+            Some("2"),
+        ),
+        (
+            "edgeguard_proxy_protocol_total{listener=\"admin\",result=\"missing\"} ",
+            Some("0"),
+        ),
+        (
+            "edgeguard_proxy_protocol_total{listener=\"public\",result=\"local\"} ",
+            Some("0"),
+        ),
+        ("edgeguard_connections_open{listener=\"admin\"} ", None),
+    ] {
+        let line = metrics.lines().find_map(|l| l.strip_prefix(series));
+        assert!(line.is_some(), "no {series}in\n{metrics}");
+        if let Some(wanted) = wanted {
+            assert_eq!(line, Some(wanted), "{series}");
+        }
+    }
     assert!(
         !metrics.contains("edgeguard_connections_max{listener=\"admin\"}"),
         "{metrics}"
     );
+    // The direct scrapes so far were counted `direct`.
     assert!(
-        !metrics.contains("edgeguard_proxy_protocol_total{listener=\"admin\","),
+        !metrics
+            .contains("edgeguard_proxy_protocol_total{listener=\"admin\",result=\"direct\"} 0\n"),
         "{metrics}"
     );
 }

@@ -6,6 +6,880 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-03
+
+eggrd 0.7.0: it stays up, shows who called what, and encrypts every hop. This section is written
+for an upgrade from 0.5.0. It collects 0.7.0-rc.1, the published release candidate, and
+0.7.0-rc.2, which was tagged but never published. The `[0.7.0-rc.2]` and `[0.7.0-rc.1]` sections
+below keep the history. There was no 0.6.0: its hardening work ships here.
+
+- **Hardening:** limits on slow and excess connections, graceful drain, and the last-known-good
+  control-plane policy on disk.
+- **API-usage monitoring:** series per route, per consumer and per upstream, schema-2 access
+  records, and monitoring bundle 1.6.2.
+- **Mutual TLS on every hop:** to clients, to upstreams, and to the control plane and every other
+  outbound client, with private CAs and an egress proxy.
+- **Hybrid connectivity:** health-checked upstream pools, PROXY protocol, and client certificates
+  forwarded by a TLS-terminating balancer.
+
+Tested end to end on EKS behind an NLB with PROXY protocol v2, an NLB doing mTLS passthrough, and
+an ALB in mTLS passthrough mode.
+
+### Security
+
+- **A credential header sent twice could pass the edge with one value and reach the app
+  with another.** The auth gate read the first `Authorization` (or API-key header), but the
+  request was forwarded with the last, so an API key, Basic credentials or a JWT the edge checked
+  could arrive at the app as a different token. An app that trusts the edge's check (decoding a
+  JWT it does not verify again, telling tenants apart by key) would then act on a credential the
+  edge never saw. Reproduced against the previous build: two `X-API-Key` headers, a valid one
+  first, passed, and the upstream received only the second.
+  - Whenever the edge authenticates with a header, a request carrying that header more than once
+    is now refused with `401` and never reaches the app. The edge cannot know which copy the app
+    will read, and RFC 9110 allows a client one.
+  - Which header counts: `Authorization` for `basic` and `jwt`. For `apikey`, the configured
+    header, and `Authorization` too when the key comes from it instead: the configured header
+    absent, or holding bytes that are not text (found in review).
+  - `mode = "none"` and `"mtls"` read no header, so they forward duplicates for the app to judge.
+    An `apikey` request whose key is in its own header does the same for `Authorization`.
+- **Any client could choose its address through an L7 balancer.** With
+  `server.trust_forwarded_for = true`, the client IP was the *first* `X-Forwarded-For` entry. A
+  balancer appends the address it saw after whatever the client sent, so the first entry is the
+  client's own writing. Any client could therefore pick its address through the balancer: a new
+  per-IP rate-limit bucket on every request, a way past `[access]` deny rules (or into allow
+  rules), and a forged address in the access log, shipped log records, spans and the
+  `X-Forwarded-For` the app receives. Letting only the balancer reach EdgeGuard did not help,
+  since the balancer forwards the header. The client is now the entry `server.forwarded_hops`
+  (default `1`) from the right: the one the trusted proxy appended. Several header lines are read
+  as one list; a header with fewer entries, or a chosen entry that is not an address, falls back
+  to the TCP peer. Every consumer of the client address goes through the one resolution, made
+  once per request: rate limits, `[access]`, pool hashing on `client_ip`, the access log and
+  shipped records, spans (which used the TCP peer before) and the upstream's forwarding headers.
+  LLM metering is keyed by virtual key, not address. Found by the eggrd site review (#1718).
+- **The client's other address headers reached the app unchanged.** Only `X-Forwarded-For` was
+  replaced upstream; `X-Real-IP`, `True-Client-IP`, `Forwarded` (RFC 7239) and `X-Forwarded-Host`
+  passed through as the client wrote them. Frameworks that prefer them (Go chi's `RealIP` reads
+  `True-Client-IP` and `X-Real-IP` first) saw a client-chosen address despite the edge, and a
+  client could send an `X-Forwarded-Host` that differed from the `Host` it asked for. On the
+  normal and the WebSocket path alike, `X-Real-IP` is now the resolved client, `Forwarded` is
+  replaced with `for=<client>;proto=<proto>` (an IPv6 client quoted and bracketed),
+  `X-Forwarded-Host` is the `Host` the edge received, and `True-Client-IP` is removed. `Host` is
+  still the client's choice and EdgeGuard has no allowed-hosts check, so an app that builds links
+  (a password-reset email) from either header must still validate the host itself. Found by the
+  post-merge review of #1721.
+
+### Upgrading from 0.5
+
+- **Connecting to an upstream now times out after 5 s** (`validation.upstream_connect_timeout`).
+  An upstream that drops packets used to answer `504` after 30 s; it now answers `502` after 5 s.
+  Set `"0"` to restore the old behaviour.
+- **A client that sends its credential header twice now gets `401`.** This covers
+  `Authorization` for `basic` and `jwt`, and the key header for `apikey`. A request like that used
+  to be checked against one value and forwarded with another; see Security above. Under
+  `auth.mode = "none"` or `"mtls"` duplicates are still forwarded.
+- **A repeated header now reaches the app with every value, in order,** where it used to arrive
+  with only its last value. An HTTP/2 client's several `Cookie` headers arrive as one, joined with
+  `"; "`.
+- **ACME requests time out:** 10 s to connect and 30 s per request. Before, they had no timeout.
+- **A bad ACME client setting now fails at startup.** The client is built at startup even when a
+  certificate is already on disk, so a directory that is not `https://`, an unreadable `ca_path` or
+  a malformed proxy stops the edge then, rather than failing the renewal two months later.
+- **Library users:** `UpstreamRoute` gained fields, and `ServeOpts` and `HealthCheckCfg` are new
+  public structs that will keep growing. All three implement `Default`, so build them with
+  `..Default::default()` rather than listing every field.
+- **With `server.trust_forwarded_for`, the client is now the `X-Forwarded-For` entry
+  `server.forwarded_hops` from the right** (see Security above). Set `forwarded_hops` from what the
+  proxies in front append, before upgrading:
+  - **GCP external Application Load Balancer: set `forwarded_hops = 2`.** It appends two entries,
+    the client and then its own address. With the default `1`, every request resolves to the
+    load balancer: one rate-limit bucket for everyone (a site-wide `429`), `[access]` allowlists
+    that lock everyone out, `hash_on = "client_ip"` on one target.
+  - **CloudFront → ALB: `forwarded_hops = 2`**, and the ALB must accept only CloudFront.
+  - **An AWS ALB in its default `append` mode, Cloudflare, Azure Application Gateway, nginx with
+    `$proxy_add_x_forwarded_for`, Traefik: nothing to do** (`1`). An ALB in `preserve` mode
+    appends nothing, so its header is the client's own: do not trust it.
+  - Anything else, Cloud Run and other Google Front End services included: check what reaches
+    EdgeGuard first (`docs/DEPLOYMENT.md`).
+  - A proxy that replaces the header with one value keeps working unchanged: a one-entry header
+    gives the same answer either way. `X-Forwarded-Proto` is now read from its last value too.
+- **The upstream no longer receives the client's `X-Real-IP`, `True-Client-IP`, `Forwarded` or
+  `X-Forwarded-Host`** (see Security above). `X-Real-IP` and `Forwarded` now carry the edge's resolved
+  client address, `X-Forwarded-Host` the `Host` the edge received, and `True-Client-IP` is
+  removed. An app that relied on a proxy in front of EdgeGuard setting one of these (a CDN's
+  `True-Client-IP`, a `Forwarded` chain, a CDN that rewrites `Host` and sends the viewer's as
+  `X-Forwarded-Host`) now sees the edge's values: read `X-Forwarded-For` or `X-Real-IP` for the
+  client, and have the CDN forward the original `Host`.
+- **Every other new setting is off by default.** A 0.5 configuration loads and behaves as before.
+  The exceptions are the changes listed above and the 30 s keep-alive idle limit described below.
+
+From 0.7.0-rc.1, also read the `[0.7.0-rc.2]` notes below.
+
+### Hardening (planned as 0.6.0)
+
+0.6.0 was never released as a final version: only `0.6.0-beta.1` was cut, and it was never tagged.
+Its hardening work ships here.
+
+- **Connection limits on every listener** (`server.header_read_timeout`, `server.max_connections`).
+  A connection that sent nothing, or sent its request a byte at a time, was held open forever on
+  both the plain and the TLS listener: hyper's own 30 s header timeout needs a timer that was never
+  installed, and its HTTP/1-or-2 check, which runs first, has no deadline at all. Every connection
+  now has to deliver a complete request head within `header_read_timeout` (30 s), which also closes
+  keep-alive connections left idle that long. The first bytes are read under that deadline before
+  hyper sees them, so cleartext HTTP/2 with prior knowledge still works. `max_connections` (off by
+  default) closes connections over the cap at accept. New series:
+  `edgeguard_connections_open{listener}` and `edgeguard_connections_rejected_total{listener}`.
+  The public, redirect and admin listeners now share one accept loop (`src/serve.rs`), so none of
+  them can miss a protection the others have.
+- **Last-known-good control-plane policy on disk** (`control_plane.cache_path`,
+  `control_plane.boot_without_policy`). Managed mode's fail-static held only for the life of the
+  process: an edge restarted while the control plane was unreachable came up on its local config
+  file alone, typically looser than the pushed policy (no auth, WAF in report mode). Each applied
+  policy is now also written to `cache_path` — `0600`, replaced atomically, never logged — and read
+  back at startup before the listener binds. The first pull then sends its ETag, so an unchanged
+  policy is a `304`. A cache for another control plane or tenant, from another format version, or
+  that no longer builds is ignored and logged. `boot_without_policy = "refuse"` answers proxied
+  requests and readiness with `503` until a policy arrives, health and metrics staying up (new
+  outcome `no_policy`). `doctor` warns about managed mode without `cache_path` and a cache
+  directory that does not exist. Proven with a stub control plane in `tests/policy_cache.rs`: the
+  restart under an outage serves the pushed policy (and, without the cache, the local one).
+- **Graceful drain** (`server.drain_delay`, `server.drain_timeout`). On `SIGTERM`,
+  `/__edgeguard/ready` answers `503` at once while `/health` stays `200`. The public listener keeps
+  accepting for `drain_delay` (default 0), then stops and lets in-flight requests finish for up to
+  `drain_timeout` (25 s). Only then is a `--wrap`ped app stopped and the admin listener closed.
+  `edgeguard doctor` warns when the drain is 30 s or longer, Kubernetes' default kill deadline, and
+  when the header timeout is off.
+- **Keep-alive connections idle for 30 s are closed** (by `server.header_read_timeout`). They
+  used to be kept until the client closed them. Clients reconnect transparently; set a longer
+  value, or `"0"` to restore the old behaviour.
+- **HTTPS requests were cut on every restart.** The TLS listener returned as soon as shutdown was
+  signalled, without waiting for its connections, and the process exited under them. It now
+  drains like the plain listener did.
+- **With `--wrap`, the app was stopped at the same moment as the listener**, so a request still in
+  flight was answered `502`. Reproduced with the 0.6.0-beta.1 binary: a 2 s request in flight at
+  `SIGTERM` got `502`, and `/ready` stopped answering instead of returning `503`. The app is now
+  stopped after the drain, and the same request gets `200`.
+- **In managed mode, editing the local config file dropped the pushed policy** until the control
+  plane published a new one: the file reload rebuilt from the file alone, and the poller, holding
+  the same ETag, kept getting `304`. The runtime is now built from both layers in one place, so a
+  file edit keeps the pushed policy on top and a pushed policy keeps the file's edge-local sections.
+
+### Added
+
+- **A workload's identity as the LLM credential.** A `[[llm.keys]]` entry may name the `claims` of
+  the request's verified JWT (`auth.mode = "jwt"`) in place of a `virtual_key`: a CI job presents
+  its run's OIDC token, and the first entry whose every claim matches (by value, or by prefix with
+  a trailing `*`) has its provider key injected upstream. The token never reaches the provider. A
+  token whose claims match no entry is `401`. Such an entry needs `auth.jwt.issuer` and
+  `auth.jwt.audience` set, and is refused at load without them.
+- **A budget per claim** (`scope = "claim:<name>"`): `claim:run_id` holds each CI run to its own
+  budget. Blocked requests count under `edgeguard_llm_budget_blocked_total{scope="claim"}`.
+- **The access record says who called, where it went and how much moved** (schema 2). The line
+  had request id, method, target, client IP, status, outcome and latency, so it could not answer
+  "who made this request" or "was the edge or the app slow". Each record now also carries `route`,
+  `principal`, `user_agent` (truncated to 256 bytes), `upstream` (`scheme://host:port`, no
+  userinfo) and `upstream_ms`, `bytes_in`/`bytes_out`, `duration_ms`, and `tls_version` /
+  `client_cert` when EdgeGuard terminates TLS. `log.principal = "full" | "hash" | "off"` decides
+  how the caller is written. The shipped record gains `schema: 2` and keeps every key, `null` when
+  it does not apply; a test pins the key set. Existing fields keep their names and meaning.
+- **API usage by route and by consumer.** Request metrics had one dimension, `outcome`: there was no
+  way to see which endpoint was slow or failing, or who was calling. New series:
+  - `edgeguard_route_requests_total{route,method,status_class}`, with a latency histogram
+    `edgeguard_route_request_duration_seconds{route}`. `route` is a configured label, never the
+    request path: the longest matching `[[upstreams]]` or `[[ratelimit.routes]]` prefix, named
+    by a new optional `name` or by the prefix, else `default`. Non-standard methods are `OTHER`.
+    So the series count is set by the config. Proven by 1,000 random paths producing exactly the
+    configured labels plus `default`.
+  - `edgeguard_consumer_requests_total{consumer,status_class}` and
+    `edgeguard_consumer_bytes_total{consumer,direction}`, keyed by the authenticated principal
+    (`apikey:<id>`, never the key; the Basic user; the JWT `sub`; the client certificate's name),
+    `_anon` without one. Capped by `metrics.consumer_series_max` (100), the rest sharing
+    `_over_cap`; `0` turns them off. Bytes are counted on the buffered and the streamed response
+    paths alike.
+
+  Every request is counted on both, the edge's own `401`/`429` included, so the route, consumer
+  and `edgeguard_requests_total` totals agree. Recording takes no lock: the counters are atomics
+  reached through a read-mostly map. They sit outside the hot-swappable policy, so a reload does
+  not reset them.
+- **Balancing and failover across upstreams** (`[[upstreams]] targets`). A prefix could name one
+  upstream, so spreading load over two servers, or an on-prem primary with a cloud standby, needed
+  a load balancer in between.
+  - **Pools:** `targets = [...]` instead of `target`. `path = "/"` puts the whole app behind a
+    pool.
+  - **Balance:** with `balance = "priority"` (the default), each request goes to the first target
+    in rotation, in the order listed. With `"round_robin"`, requests take the targets in rotation
+    in turn.
+  - **Least connections:** `balance = "least_conn"` sends each request to the target in rotation
+    with the fewest requests in flight for its weight, the least `(in flight + 1) / weight`.
+    - Ties are taken in turn, so an idle pool still spreads requests.
+    - A request is in flight until its response has been read, streamed bodies to their last
+      byte. A WebSocket tunnel counts until it closes.
+    - Only these pools count, so others pay nothing.
+    - The count is `edgeguard_upstream_in_flight{route,upstream}`, and `in_flight` in the status.
+  - **Weights:** an entry may be `{ url = "…", weight = 3 }` instead of a bare URL, giving that
+    target three turns for each one a weight-1 target gets (round-robin), or three times the
+    in-flight requests (least-connections).
+    - Turns interleave: weights 3, 1, 2 go a, b, c, a, c, a.
+    - Each cycle gives every target in rotation exactly its share, so a target out of rotation
+      leaves the rest their ratio.
+    - The pick is computed from the turn counter, with no lock.
+    - A misspelled key in the table, a weight of 0, or a weight with `balance = "priority"` fails
+      at load.
+  - **Hashing:** `balance = "hash"` sends each request to the target its key ranks first, so the
+    same key reaches the same target.
+    - `hash_on` names the key: `"client_ip"` (default), `"path"`, `"header:<name>"`,
+      `"cookie:<name>"` or `"query:<name>"`. A request without it is balanced in turn.
+    - `"query:<name>"` hashes the first `<name>=` value as sent, not percent-decoded (HAProxy's
+      `url_param`). An empty one counts as none, wherever the parameter sits in the query.
+    - Ranking is rendezvous hashing with a fixed hash function, so every edge, of any version,
+      ranks a key the same way with nothing shared, and a test pins the function.
+    - A target leaving rotation moves only its own keys, each to its next-ranked target, which is
+      also where a request goes when its target refuses the connection. Weights give a target its
+      share of keys.
+  - **Sticky sessions:** `sticky_cookie = "<name>"` keeps a client on the target that answered it.
+    - The edge sets the cookie (`Path` set to the prefix, `HttpOnly`, `SameSite=Lax`, `Secure` as
+      for every cookie) to a hash of the target's URL, shown as `sticky_cookie_value` in the
+      status. Any edge reads another's.
+    - A request carrying it goes to that target while it is in rotation, ahead of `balance`. One
+      naming a target out of rotation is balanced as usual, and the cookie is replaced.
+    - A backup target it names waits until no main target is in rotation. A WebSocket handshake
+      follows the cookie but does not set it.
+    - `sticky_cookie_max_age = "8h"` gives it a `Max-Age`, so a client stays across browser
+      restarts. It counts from when the cookie was set and is not refreshed, so an active client
+      is rebalanced when it runs out. Empty keeps a session cookie.
+    - `sticky_cookie_strip = true` removes it from requests before the upstream sees them,
+      WebSocket handshakes included, keeping the client's other cookies (HAProxy's `indirect`).
+      What is left goes as one `Cookie` header, and a request without the cookie is untouched.
+  - **Backup:** `backup = [...]` targets take requests only when no target in `targets` is in
+    rotation, or when all of them refused the request.
+  - **Failover:** a request that cannot connect to its target (refused, unreachable, past the new
+    connect timeout, a failed TLS handshake) reached nothing, so it is sent to the next target,
+    the backups last.
+    That holds for a buffered body and for a WebSocket handshake, but not for a streamed body,
+    which cannot be sent twice. A request that got an answer, even a `5xx`, is never retried.
+  - **Ejection:** after `eject_after` (1) such failures in a row, a target is out of rotation for
+    `eject_for` (30 s).
+    - Repeat ejections grow: `eject_for` × the ejections in a row, up to `eject_for_max` (5 min,
+      or `eject_for` if longer).
+    - A target not ejected again for `eject_for_max` after its last ejection ends starts over.
+    - The status shows `ejections_in_a_row` and each ejection's `length_s`.
+  - **5xx ejection:** with `eject_after_5xx` (off by default), that many `5xx` answers in a row
+    eject a target too: one that is up but broken. Any other answer resets the count. It never
+    takes out the last target in rotation, since when every target answers `5xx` rotation can't
+    help, and readiness would fail for the app's fault. Each `5xx` still reaches its client.
+  - **Health checks:** `[upstreams.health_check]` `path` is fetched from each target every
+    `interval` (5 s). A target is out after `unhealthy_after` (2) failures and back after
+    `healthy_after` (2) passes. An answer in `expect_status` within `timeout` (2 s) passes.
+    `expect_status` takes codes, ranges and classes (`"200,204"`, `"2xx"`; default `"200-399"`),
+    and a failed check's reason names both.
+    - `expect_body = '"status":"ok"'` also requires that text within the body's first 64 KiB,
+      for an endpoint that answers `200` while saying it is degraded. The text may arrive split
+      over several reads.
+    - `expect_body_regex` matches a regular expression instead, in linear time whatever the
+      pattern. It is matched once the body has ended or reached 64 KiB, never on part of it, so
+      `^ok# Changelog
+
+All notable changes to EdgeGuard are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+ cannot pass on a body that only starts with `ok`.
+    - `method` (default `GET`; `HEAD` for the status alone, never `CONNECT`) and `headers`
+      (`[["Host", "app.internal"]]`, a token) shape the request. A `User-Agent` among them
+      replaces the edge's, and headers about a body or a connection fail at load. The status
+      endpoint shows header names, never values.
+    - `port = 8081` checks each target on another port, for an app whose health lives on a
+      separate management port. HTTP or TCP, with the target's host, scheme and path kept, and
+      for an `https://` target the TLS settings its requests use (its `[[upstream_tls.targets]]`
+      entry included). The target is still named and ejected by the port requests use.
+    - `type = "tcp"` only connects to each target's host and port, for a target with no health
+      endpoint. HTTP settings set with it fail at load, since they would do nothing.
+    - A check's log line names the target by label, never by its configured URL.
+  - **Nothing in rotation:** requests try every target in order anyway, and
+    `/__edgeguard/ready` answers `503` for a pool at `"/"`.
+  - **Reloads:** pools are reloadable, and a reload keeps each kept target's health, so it neither
+    restores an ejected target nor restarts its checks.
+  - **TLS:** each `https://` target takes its own `[[upstream_tls.targets]]` settings.
+  - **Visibility:**
+    - `edgeguard_upstream_in_rotation{route,upstream}`,
+      `edgeguard_upstream_health_checks_total{route,upstream,result}` and
+      `edgeguard_upstream_ejections_total{route,upstream,reason}`.
+    - Alerts: `EdgeGuardUpstreamTargetOut` (warning), `EdgeGuardUpstreamPoolDown` (critical), and
+      `EdgeGuardUpstreamTargetFlapping` (warning: ejected 3 times in 15m), with promtool tests. `EdgeGuardUpstreamNotAnswering` no longer fires for a pool's targets,
+      whose requests fail over.
+    - Three dashboard panels (bundle 1.6.0), and log lines when a target leaves or rejoins.
+    - `doctor` warns on a pool that cannot tell a target is gone.
+    - `GET /__edgeguard/upstreams`, an ops endpoint (admin port in split mode), shows every route:
+      - each target, by `scheme://host:port` and never the configured URL with any credentials;
+      - each target's request counts by result;
+      - for a pool, its `balance` and `state` (`normal`, `backup`, `all_out`);
+      - for each pool target, whether it is in rotation and, if not, why: its last health check
+        (time, result), or what ejected it and how long it stays out.
+
+      Reading it does not advance round-robin.
+  - `UpstreamRoute` gains fields, so a struct literal needs `..Default::default()`.
+- **The client's address from an L4 load balancer** (`server.proxy_protocol`). A balancer that
+  passes TCP through without keeping the client's address cannot add `X-Forwarded-For`. Behind
+  one (an AWS NLB with IP targets, HAProxy `mode tcp`, nginx `stream`, a GCP TCP proxy), every
+  connection came from the balancer. Rate limits were shared by every client, `[access]` rules
+  saw one address, and so did the logs.
+  - **Reading:** with `proxy_protocol = true`, the public and redirect listeners read a PROXY
+    protocol header (v1 or v2) first, before the TLS handshake on a TLS listener. They serve the
+    connection as the client it names: rate limits, `[access]`, `X-Forwarded-For`, the access log
+    and spans see it. v2 TLVs (an AWS VPC endpoint id) are skipped. Only the bytes needed to tell
+    a header from a request are read, so a connection without one loses nothing and cleartext
+    HTTP/2 still works.
+  - **Trust:** a header is believed only from `proxy_protocol_trusted`, which is required; a `/0`
+    is refused. From any other peer a connection that starts with one is closed, because it would
+    be a client choosing its own address. One that does not is served as it is. A header that
+    names no client (v2 `LOCAL`, v1 `UNKNOWN`: the balancer's health check) is served as the
+    balancer, and so is a trusted peer without one. A header that does not parse, or nothing
+    within `header_read_timeout`, closes the connection. The admin listener never reads one.
+  - **Certificate header:** `[trusted_client_cert_header]` stays trusted by the connection's own
+    peer, the hop that wrote it, not the client a PROXY header names. Requests carry that peer as
+    the `TcpPeer` extension.
+  - **Visibility:**
+    - `edgeguard_proxy_protocol_total{listener,result}` (`proxied`, `local`, `missing`, `direct`,
+      `untrusted`, `invalid`, `timeout`).
+    - Alerts: `EdgeGuardProxyProtocolRefused` for the balancer being cut off, and
+      `EdgeGuardProxyProtocolMissing` for a balancer sending no headers. Both have promtool tests.
+    - A dashboard panel (bundle 1.4.0).
+    - `doctor` reports settings that refuse startup. It warns on `trust_forwarded_for` alongside
+      it, and on a certificate header trusted from the PROXY balancer.
+  - `docs/DEPLOYMENT.md` gains where the client's address is behind each kind of balancer, and
+    each balancer's setting.
+  - `ServeOpts` gains a `proxy_protocol` field.
+- **Client certificates from a TLS-terminating load balancer** (`[trusted_client_cert_header]`).
+  Behind an L7 balancer the client's TLS ends at the balancer, so mutual TLS could not work: the
+  certificate never reached the edge. Balancers that do the mTLS themselves forward it in a header.
+  - **Formats:** `format = "pem"` (URL-encoded or not: ALB, nginx), `"der"` (base64, URL-escaped
+    or not: HAProxy, Traefik) and `"xfcc"` (Envoy, Istio, with or without `Cert`).
+  - **Trust:** the header is believed only from `trusted_proxies`, matched against the
+    connection's own peer, never `X-Forwarded-For`; a `/0` is refused. It is removed before
+    forwarding whoever sent it.
+  - **Trust by name:** `trusted_proxy_names` trusts the balancer by the TLS client certificate it
+    presents, verified by `[tls.client_auth]`, rather than by its address. That is the answer for
+    a shared edge network, where everyone's traffic shares the balancer's ranges.
+    - Exact names or prefixes ending in `*`, as `[auth.mtls] allowed`.
+    - With `trusted_proxies` too, both must match.
+    - Set without `[tls.client_auth]`, or set to a bare `*`, it fails at load.
+    - `GET /__edgeguard/tls` and the startup log list them. The `untrusted_peer` metric help and
+      the dashboard panel's description say what it now covers (bundle 1.6.1).
+  - **Use:** from a trusted peer it is the request's client certificate. `auth.mode = "mtls"`,
+    `[auth.mtls] allowed`, `forward_client_cert = "xfcc"`, the access log and the consumer series
+    take it, and the first two no longer need `[tls.client_auth]`.
+  - **The balancer's own certificate is never the client's:** from a trusted peer, a request
+    without the header, or with one refused, has no client certificate, even when the balancer
+    presented one in its TLS handshake.
+  - **Verification:** `ca_path`/`crl_paths` re-verify it for a balancer that forwards unchecked.
+    They are watched, and in the certificate series as `header-ca:<CN>`.
+  - **Visibility:** `edgeguard_client_cert_header_total{result}` (`accepted`, `untrusted_peer`,
+    `invalid`, `unverified`), the `EdgeGuardClientCertHeaderRefused` alert with a promtool test,
+    and a dashboard panel (bundle 1.3.0). `GET /__edgeguard/tls` reports the settings. `doctor`
+    flags settings that refuse startup, and a header nothing requires.
+  - **Edge-local:** a pushed policy cannot change it.
+  - **Docs:** `docs/DEPLOYMENT.md` gains the matrix of what in front of the edge allows what, with
+    each balancer's header and format. It also explains why a shared edge network's addresses are
+    not enough on their own.
+  - **Proven** in `tests/client_cert_header.rs`, one case per format, from an untrusted peer,
+    garbage and duplicates, with `ca_path` and a CRL. The tests caught that base64 starting with
+    a DER byte was taken for a certificate; the header path now parses it fully, as the handshake
+    does.
+- **Visibility for the certificates the edge depends on beyond the one it serves.**
+  - **The client certificates it presents.** Upstream, control plane, collectors, JWKS, alerts:
+    each appears in the expiry series as `cert="client:<path>"`, so the existing
+    `EdgeGuardCertExpiringSoon` alert fires for one with no rule change (a promtool test proves
+    it). They are listed in `GET /__edgeguard/tls` under `client_certs`, with `used_by`, and
+    `doctor` warns 21 days ahead. Reported only while something presents the certificate, so a
+    pair a reload stopped using drops out rather than paging about a file nothing reads. They
+    show even when the listener serves plain HTTP, and the endpoint answers then too.
+  - **The CAs in `tls.client_auth.ca_path`.** `cert="client-ca:<CN>"`, listed in the endpoint's
+    `client_auth.cas`, with a `doctor` warning before one expires.
+  - **CRL staleness.** `edgeguard_tls_crl_next_update_seconds{crl}`, `client_auth.crls[].stale`,
+    a `doctor` warning, and the `EdgeGuardCrlStale` alert. rustls goes on using a CRL past its
+    `nextUpdate`, so revocations since it are not applied. Nothing said so before.
+  - Monitoring bundle 1.2.0 adds that alert and a CRL panel, and labels the overview's days-left
+    panel by `cert`. Proven in `tests/cert_visibility.rs`, and live against OpenSSL-made
+    certificates and an overdue CRL.
+- **Monitoring bundle 1.1.0: an API usage dashboard and five alerts.**
+  - **The dashboard** (`monitoring/grafana/dashboards/edgeguard-api-usage.json`) shows per-route
+    rate, 5xx ratio and p99, per-upstream error ratio, failures by result and time to headers,
+    the edge's own overhead, connections against the cap, refused client certificates, and the
+    top consumers by requests, bytes and errors.
+  - **The alerts** (group `edgeguard-api`): `EdgeGuardUpstreamErrorRatio` (over 5% for 5m, with a
+    traffic floor), `EdgeGuardUpstreamNotAnswering` (no answers for 5m, at any traffic level),
+    `EdgeGuardRouteLatencyRegression` (p99 over 250ms and double the same hour yesterday; a
+    recent baseline would absorb the regression within minutes), `EdgeGuardConnectionsNearCap`
+    (over 80% of `server.max_connections`) and `EdgeGuardClientCertRejectSpike`.
+  - **Unit tests** in `monitoring/prometheus/alerts.test.yml` cover a firing input and inputs
+    that must stay quiet for each alert.
+  - **The bundle check** now runs those tests and parses every dashboard query with promtool. It
+    also fails when a rule or panel names a metric the crate does not export, when panels overlap
+    or miss the datasource variable, and when an `edgeguard-api` alert has no test.
+  - Two series the dashboard and alerts need: `edgeguard_connections_max{listener}`, set for
+    listeners with a cap, and `edgeguard_edge_overhead_seconds`. The overhead is the time to
+    response headers less the wait on the upstream (headers, and the body when buffered), with
+    buckets from 100 µs.
+- **Per-upstream health** (`edgeguard_upstream_requests_total{upstream,result}`,
+  `edgeguard_upstream_duration_seconds{upstream}`). An upstream failure showed only as an edge
+  `outcome` (`upstream_error`, `upstream_timeout`), with no way to tell which upstream or why.
+  Each exchange is now counted by upstream (`scheme://host:port`, as the access log's
+  `upstream`) and by result: `ok`, `http_5xx`, `connect_error`, `tls_error` (TLS errors are
+  found anywhere in the error chain), `timeout`, `reset` (a body cut short included) and
+  `error`. Every result is written from an upstream's first request, so an error ratio is defined
+  from the start. The histogram is the time to the upstream's headers, from the same reading as the
+  access log's `upstream_ms`. Requests the edge answers or cuts short itself are not counted, and
+  a body over `max_response_body` counts as an answer. Proven in `tests/upstream_metrics.rs`: a
+  stopped upstream, a hung one, one that closes without answering, one that cuts its body short
+  (with and without a response cap), an untrusted TLS one, a `503`, a streamed response and a
+  refused WebSocket handshake, plus agreement with the access log to within a millisecond.
+- **The same private-CA, client-certificate and proxy settings on every outbound client.**
+  `ca_path`, `client_cert_path`/`client_key_path` and `proxy` now work, with the same meaning, in
+  `[log.ship]`, `[tracing]`, `[metrics.otlp]`, `[auth.jwt]` (the JWKS fetch), `[alerts]`,
+  `[llm.telemetry]` and `[tls.acme.dns]`, as well as `[control_plane]`. Each of those clients
+  previously trusted only the public roots and the process-wide `HTTPS_PROXY`, so a collector or
+  an identity provider on a corporate CA was unreachable. A certificate file pair is loaded once
+  per process, whichever client names it, and watched once. Clients a config reload rebuilds
+  present the same watched store, so a rotation reaches them without a reload. The JWKS fetch
+  settings are edge-local: a pushed policy can change `jwks_url` but not how it is reached.
+  Settings that do not load fail at startup and are reported by `doctor`. The log shipper, span
+  shipper and OTLP exporter used to start silently without a client in that case. Their failure
+  logs now carry the TLS cause (`UnknownIssuer`, `CertificateRequired`). Proven against a TLS
+  endpoint that requires client certificates, one test per client, in `tests/outbound_tls.rs`.
+  - **Defaults, written once** (`[outbound]`): `proxy`, `client_cert_path`/`client_key_path` and
+    `extra_ca_path` apply to every one of those sections that leaves its own key empty, so an
+    egress proxy or the edge's identity is set in one place rather than eight. A section's own
+    value always wins, key by key. A certificate is inherited only as a pair, never half from
+    each. `proxy = "none"` in a section opts it out of the proxy.
+  - **No replacing CA as a default.** `extra_ca_path` is trusted beside the public roots, not
+    instead of them, so the default reaches a public endpoint (an alert webhook on a chat
+    service, a SaaS JWKS) without breaking it. `[outbound] ca_path` is refused at startup with
+    that reason, rather than ignored. A section that should trust only a private CA keeps its
+    own `ca_path`.
+  - **TLS defaults reach `https://` URLs only.** On a plain `http://` URL they are left out rather
+    than refused, unlike a section's own. `doctor` warns when a section on plain `http://` to
+    another machine would otherwise have taken them.
+  - **Checked and visible.** `[outbound]` is checked at startup, on every reload and by `doctor`,
+    whether or not anything uses it yet. An inherited setting that fails names both places
+    (`outbound.client_cert_path (inherited by log.ship)`). `doctor` and the startup log say which
+    sections take which keys. An inherited certificate is linted for expiry once, and
+    `GET /__edgeguard/tls` lists every section that presents it.
+  - **Edge-local:** a control-plane policy cannot change it, since a pushed proxy plus a pushed CA
+    could read every connection the edge opens, its own included. Upstreams (`[upstream_tls]`)
+    do not use it.
+  - Tested from a config file through `Config::load`: the sections that set nothing reach a
+    private-CA endpoint that requires a client certificate, through a `CONNECT` proxy. One with
+    `proxy = "none"` goes direct, and one with its own `ca_path` trusts only that.
+- **ACME through an egress proxy** (`[tls.acme]` `proxy`, `ca_path`,
+  `client_cert_path`/`client_key_path`, and `[outbound]`). instant-acme's own HTTP client honoured
+  no proxy at all, not even `HTTPS_PROXY`. An edge whose only way out is an egress proxy therefore
+  could not obtain or renew a certificate. Every ACME request (directory, account, orders,
+  challenges, certificate download, renewal information) now goes out on the same outbound client
+  as everything else the edge calls.
+  - **Proxy:** `[tls.acme] proxy`, the `[outbound]` default, or `HTTPS_PROXY`/`NO_PROXY`, through a
+    `CONNECT` tunnel with TLS end to end.
+  - **Trust is unchanged by default:** with no `ca_path`, the directory is still verified against
+    the operating system's trust store, not the roots built into the binary, so a private ACME CA
+    whose root is installed on the host keeps working. `[outbound] extra_ca_path` is added to that
+    store. `[tls.acme] ca_path` replaces it with one CA bundle, which suits Pebble or step-ca
+    without touching the host.
+  - **Fails early:** the client is built at startup even when a certificate is on disk, so a bad
+    `ca_path` or proxy, or a directory that is not `https://`, is caught now rather than at the
+    renewal two months later. `doctor` checks it too. Each request times out after 30 s, where
+    instant-acme's client had no timeout. Every URL the directory hands out must be `https://`,
+    as before.
+  - Tested against a stub ACME server on a private CA, through `obtain_certificate`: registration
+    and the refused order go through a `CONNECT` proxy with the JWS intact. The inherited
+    `[outbound]` CA and proxy work, as does `proxy = "none"`. With nothing set the CA is trusted
+    only once it is in the system store (`SSL_CERT_FILE`), and a directory pointing at plain
+    `http://` gets no request. Run live against a fake ACME server through a proxy, both from
+    `[tls.acme]` and from `HTTPS_PROXY` + `SSL_CERT_FILE` alone, in `tests/acme_client.rs`.
+- **A control plane behind a private CA, client-certificate identity, and an egress proxy**
+  (`control_plane.ca_path`, `client_cert_path`/`client_key_path`, `proxy`). The managed-mode
+  client trusted only the public web PKI, presented no certificate and could reach the control
+  plane only through the process-wide `HTTPS_PROXY`, so a self-hosted control plane on a corporate
+  CA was unreachable. `ca_path` replaces the public roots for this connection. The client
+  certificate is presented to a control plane that requires one. The bearer token is still sent:
+  the certificate identifies the edge and the token binds it to the tenant. The certificate is
+  re-read when it changes on disk, and the next request presents the new one. A client that
+  presents a certificate neither resumes TLS sessions nor keeps idle connections, because both
+  would carry the old certificate past a rotation; the live run caught each in turn. It gets the
+  same expiry warnings as the listener's. `proxy = "http://…"` routes this client alone through a `CONNECT`
+  proxy, with TLS end to end through the tunnel. `proxy = "none"` ignores the environment. The
+  private settings with an `http://` URL are a startup error. `doctor` warns about plain `http://`
+  to a control plane on another machine. Proven against a TLS control-plane stub that requires
+  client certificates, directly and through a `CONNECT` proxy stub, in `tests/cp_tls.rs`.
+- **Client certificates on the TLS listener: mutual TLS** (`[tls.client_auth]`, `auth.mode =
+  "mtls"`). The listener verified no client certificates. Now `mode = "required"` refuses any
+  handshake without a certificate from a CA in `ca_path`. `"optional"` verifies one if presented.
+  `crl_paths` refuses revoked certificates. The CA bundle and CRLs reload when they change on disk,
+  so a revocation applies to the next connection with no restart. **TLS session resumption is off
+  while this is on**: a resumed session is not verified again, so a certificate revoked after its
+  first connection kept connecting — reproduced in the tests, which fail with resumption back on.
+  `auth.mode = "mtls"` authenticates by the certificate: `[auth.mtls] allowed` narrows it to names
+  (exact, or a `*` prefix such as `spiffe://prod.example/ns/web/*`), and the first allowed name —
+  URI (SPIFFE ID), DNS, email, then CN — is the principal per-key limits and budgets key on.
+  `forward_client_cert = "xfcc"` sends the app `X-Forwarded-Client-Cert` with the certificate's
+  SHA-256 and names; a client's own copy of that header is always removed while client
+  authentication is on. Refusals are counted in a new series,
+  `edgeguard_tls_handshake_failures_total{listener,reason}` (`client_cert`, `timeout`, `other`),
+  since a refused handshake never reaches the request log. `auth.mode = "mtls"` without
+  `[tls.client_auth]` is refused at load, so a pushed policy cannot ask for it either, and
+  `doctor` reports client authentication without TLS, a CA or CRL that will not load, and
+  `"optional"` with nothing reading the certificate. Names are read by the existing DER walker; the
+  verifier is rustls's own. The only new dependency edge is `ring`, the provider already in use, for
+  the fingerprint.
+- **TLS and mutual TLS to upstreams** (`[upstream_tls]`). The upstream client spoke plain HTTP
+  only: an `https://` upstream loaded without complaint, then every request was answered `502`
+  and the upstream never saw a connection. `https://` upstreams now work with no configuration,
+  verified against the public web PKI (the Mozilla roots, compiled in, so a distroless image needs
+  no CA bundle). `ca_path` trusts only a private CA instead. `cert_path`/`key_path` present a client
+  certificate to upstreams that require one, reloaded when the files change and warned about as
+  they near expiry. A connection that presents one never resumes a TLS session, because a resumed
+  session carries the certificate of the handshake it resumes: an upstream that issues tickets
+  went on seeing the replaced certificate after a rotation (reproduced in the tests). `server_name` verifies an upstream dialled by IP against the name on its
+  certificate. `[[upstream_tls.targets]]` gives one upstream its own settings. There is no option
+  to skip verification. Edge-local: a control-plane policy cannot change it. WebSocket tunnels use
+  it too. Built on tokio-rustls, already a dependency; the only new edge is `webpki-roots`, which
+  reqwest already compiled in. Proven against rustls upstreams in `tests/upstream_tls.rs`: private
+  CA, refused public-roots and wrong-CA cases, required client certificates, a name mismatch by IP,
+  two upstreams with different CAs, and a client certificate replaced on disk.
+- **`server.forwarded_hops`** (default `1`, `1` to `10`): how many `X-Forwarded-For` entries the
+  trusted proxies in front of EdgeGuard append (`2` for a GCP external Application Load
+  Balancer). `doctor` names it with `trust_forwarded_for`, and warns when it is set without. **`edgeguard_forwarded_for_total{result}`**, with
+  `trust_forwarded_for`: `used`, or the TCP peer instead because the header was `absent`, `short`
+  or `invalid`.
+- **A pool's health check can go over another scheme, or to another address, than its requests**
+  (#1713). This builds on `health_check.port` for an app whose health lives on a management port.
+  - `health_check.scheme = "http"` (or `"https"`) checks over another scheme, for a TLS app whose
+    management port is plain HTTP, or the reverse. The port is always written out, so
+    `https://a` checked over HTTP goes to `http://a:443`. An `https://` check of an `https://`
+    target uses the TLS settings its requests use. One of an `http://` target takes
+    `[upstream_tls]`, or an entry naming the check's host and port, which `doctor` no longer
+    reports as unused. Refused with `type = "tcp"` or without a `path`.
+  - `check_host` in a target's table (`{ url = "…", check_host = "10.0.9.5" }`) sends that
+    target's check to another host, such as the server's management network address, with the
+    pool's `port` and `scheme`. It is per target, since a pool's targets are different servers.
+    The check still sends the target's own name as `Host`. An `https://` check of an
+    `https://` target verifies the target's own name and uses its TLS settings, as its requests
+    do, whatever address it dials. Anything but a host name or IP address is refused, as is a
+    `check_host` in a pool with no active check.
+  - `GET /__edgeguard/upstreams` shows the check's `scheme` and each target's `check_host`.
+- **Requests in flight and a TLS handshake total** (the last of the listener series planned for
+  0.6.0).
+  - `edgeguard_requests_in_flight{listener}` counts requests still being answered, from the
+    request's head until the end of its response body. A streamed response counts until it
+    ends, a WebSocket upgrade until its `101`. Beside `edgeguard_connections_open`, it
+    tells idle or slow connections from a backed-up app. The admin listener counts its own
+    (`listener="admin"`), never the public listener's.
+  - `edgeguard_tls_handshakes_total{listener}` counts every handshake that ended on a TLS
+    listener, successful or not. The existing `edgeguard_tls_handshake_failures_total` is a
+    subset, so a failure ratio needs no other series. A connection that closes before its
+    ClientHello is not a handshake and is in neither (see the next entry).
+  - Both are in the OTLP export too.
+- **`edgeguard_tls_no_client_hello_total{listener}`:** connections to a TLS listener that closed,
+  or were reset, before sending a byte of handshake (TCP and PROXY protocol health checks, scans).
+  In neither `edgeguard_tls_handshakes_total` nor the failures.
+- **`doctor` warns about `trusted_proxy_names` with `auth.mode = "mtls"` and an empty
+  `[auth.mtls] allowed`.** The balancer is trusted by a certificate from the CA in
+  `tls.client_auth.ca_path`, so any other certificate from that CA, presented by a client that
+  connects directly, authenticates as itself. With `allowed` set it is a note instead: `allowed`
+  narrows who may connect directly, not the path. To require the balancer, give it a CA of its
+  own, or let only the balancer reach the listener.
+
+### Changed
+
+- **Connecting to an upstream times out after 5 s** (`validation.upstream_connect_timeout`, new).
+  It was bounded only by `upstream_timeout`, so an upstream whose packets are dropped (a
+  partitioned network, a firewall) held each request for 30 s before a `504`. It now fails after
+  5 s with `502` (`connect_error`), which is also what lets a pool move on in time. For an
+  `https://` upstream it covers the TLS handshake too, so one that accepts the connection and
+  never answers the handshake fails the same way. `"0"` restores the old behaviour.
+- **A streamed response's access line is written when its last byte is sent**, rather than when
+  its headers were, so its `bytes_out` and `duration_ms` are what was actually sent. `latency_ms`
+  keeps its meaning, the time to the response headers. A long stream's line now appears when the
+  stream ends.
+- **An upstream URL that is not `http://` or `https://` fails at load** (`server.upstream`,
+  `[[upstreams]] target`). It used to load and then answer every request with `502`.
+- **Upstream connection errors are logged with their cause**: `client error (Connect): invalid peer
+  certificate: UnknownIssuer` rather than hyper's bare `client error (Connect)`.
+
+### Fixed
+
+- **A header sent more than once reached the upstream with only its last value.** Headers were
+  copied to the upstream request one value at a time with a replacing insert, so `Accept` sent
+  twice, or any repeated field, lost all but its last value, on proxied requests and WebSocket
+  handshakes alike. Every value is now forwarded, in the order sent.
+  - Several `Cookie` headers become one, joined with `"; "`, as RFC 9113 §8.2.3 asks of a hop
+    from HTTP/2 to HTTP/1.1. That is how HTTP/2 clients (the plain listener accepts h2c) send
+    cookies, and until now an h2c client's request reached the app with one cookie.
+  - Headers the edge sets itself (`X-Forwarded-For`, `X-Forwarded-Proto`, the request id,
+    `traceparent`, a key-vault `Authorization`) still replace every value the client sent.
+  - Tested over HTTP/1.1, HTTP/2 with prior knowledge and a WebSocket handshake, in
+    `tests/header_forwarding.rs`.
+- **A `[[upstreams]]` route at `path = "/"` delayed startup by 30 s.** With no `server.upstream`,
+  startup waited for the local `app_port` to accept connections. A `/` route sends it no
+  requests, so the wait was pointless, and the startup log named that unused upstream. Startup no
+  longer waits unless `--wrap` started the app, and the log names the route's upstreams.
+
+### Fixed since 0.7.0-rc.1
+
+These fix features new in 0.7, so they matter only to anyone who ran rc.1.
+
+- **An NLB's HTTP health check of the admin port failed every target with PROXY protocol on.** The
+  NLB sends a v2 `LOCAL` header on health-check connections, also to a separate health-check
+  port, and the admin listener read no header, so the request did not parse (`invalid HTTP method
+  parsed`) and the NLB failed open. With `server.proxy_protocol`, the admin listener now reads a
+  v1 or v2 header with the public listener's parsing and `proxy_protocol_trusted`: from a trusted
+  peer it is read (`LOCAL` serves the check), from anyone else it is refused. A connection without
+  a header is served as itself and counted `direct`, from a trusted address or not, so kubelet
+  probes and Prometheus scrapes keep working and don't fire `EdgeGuardProxyProtocolMissing`.
+- **Health checks inflated the TLS handshake failure count.** On a TLS listener, a connection that
+  sent only a PROXY header (an NLB's `LOCAL` check) or nothing, and closed, counted as
+  `edgeguard_tls_handshake_failures_total{reason="other"}`, about 0.6/s per target behind an NLB.
+  It now counts in `edgeguard_tls_no_client_hello_total`. A ClientHello cut off partway is still
+  a failed handshake. With `proxy_protocol` on, a connection reset before sending any byte (no
+  header, no ClientHello) is counted there too, as it is without PROXY protocol; it used to count
+  nowhere.
+- **With PROXY protocol, a slow client was held for two `header_read_timeout`s.** The PROXY
+  header had the timeout to itself, and hyper's timeout for the request head started only after
+  it. A client dripping both kept a connection for about twice `header_read_timeout` (60 s at
+  the default) before it was closed, on the public listeners and, now that it reads PROXY
+  headers, the admin listener. A new connection now gets one deadline from accept to its first
+  complete request head, PROXY header included. A TLS handshake between them keeps its own 10 s
+  bound and is not counted. Later requests on a kept-alive connection get the timeout each, as
+  before. With `header_read_timeout = "0"`, nothing changes. Without PROXY protocol, one corner
+  case tightens the same way: a client that sent a first byte just before the deadline used to
+  get a second timeout for the rest of the head. HTTP/2 connections are unchanged; the timeout
+  is HTTP/1's.
+
+### Docs
+
+- Health checks behind an NLB with PROXY protocol (`DEPLOYMENT.md`, `OPERATIONS.md`): check
+  `/__edgeguard/ready` on the admin port over HTTP from this release, and what to do on 0.7.0-rc.1
+  and earlier. A TCP check reports targets healthy while every connection is refused for a wrong
+  `proxy_protocol_trusted`. The HTTP check catches the NLB's subnets leaving the list, but not
+  client IP preservation, where its checks still come from trusted addresses; deploy
+  `EdgeGuardProxyProtocolRefused`, which catches both. `doctor`'s drain warning (30 s or more) is
+  expected behind an NLB once `terminationGracePeriodSeconds` is raised, and says so.
+- What a client sees behind an NLB: a connection closed at accept (over `max_connections`) or for
+  idling looks open until the client writes, then is reset; idle connections count as a PROXY
+  protocol `timeout`, since the NLB sends the header with the first data.
+- A NetworkPolicy that locks egress to the proxy, with the EKS note: the VPC CNI's network policy
+  agent needed an `ipBlock` for the service CIDR to reach a multi-port Service's ClusterIP.
+- A dedicated CA for balancers trusted by `trusted_proxy_names`, or `[auth.mtls] allowed`.
+- `trust_forwarded_for` behind an L7 balancer (`DEPLOYMENT.md`, `OPERATIONS.md`, `CONFIG.md`):
+  how `forwarded_hops` counts a chain, and that the header is still believed from every peer, so
+  only the balancer should reach the traffic port. A trusted-forwarder address list is planned for
+  0.8 (`docs/RELEASE-0.8.0-PLAN.md`).
+- Rolling restarts behind an NLB: `drain_delay` of 20–30 s, and `terminationGracePeriodSeconds`
+  that covers `drain_delay` + `drain_timeout`. The NLB keeps opening connections to a draining
+  target for about 15 s, and in the EKS re-run `drain_delay = 15s` let 1 of 7,963 requests be
+  refused.
+- Troubleshooting rows for each of the above.
+- Monitoring bundle 1.6.2: the "TLS handshakes refused" panel says that connections closed before
+  a ClientHello are not in it.
+
+### CI
+
+- **The crate's own `Cargo.lock` is checked on every change to a manifest or the lock.** #1712
+  added a dependency without updating the crate's own `Cargo.lock`, so the `--locked` builds of
+  this repository and of the image broke, while the development build, which resolves through a
+  different lock, passed. Each such change is now resolved standalone, as this repository has it,
+  with `cargo metadata --locked`.
+
+## [0.7.0-rc.2] — 2026-11-03
+
+Tagged in the monorepo but never published; its changes ship in 0.7.0. It brings:
+
+- fixes from the 0.7 end-to-end run on EKS: an NLB with PROXY protocol v2, an NLB doing mTLS
+  passthrough, and an ALB in mTLS passthrough mode;
+- the last listener series planned for 0.6.0 (M5);
+- the pool health-check settings from #1713, which did not ship in 0.7.0-rc.1.
+- two security fixes for the client address. With `server.trust_forwarded_for`, it is now the
+  `X-Forwarded-For` entry the trusted proxies appended (`server.forwarded_hops`; GCP needs `2`),
+  not the one the client wrote. The client's own `X-Real-IP`, `True-Client-IP`, `Forwarded` and
+  `X-Forwarded-Host` no longer reach the app.
+
+### Upgrading from 0.7.0-rc.1
+
+- **A single `target` now refuses its `health_check` settings rather than ignoring them.**
+  0.7.0-rc.1 refused only `path` and `type = "tcp"` there. Any other setting (`port`, `method`,
+  `headers`, `expect_status`, `interval`, …) was accepted and did nothing, since a single target
+  keeps no health. Now any `health_check` setting that differs from its default fails at load with
+  `health_check needs a pool`. One written out at its default, such as `type = "http"`, is still
+  accepted. To keep the check, write the target as a one-entry pool (`targets = ["…"]`).
+  Otherwise, remove the setting.
+- **With `server.proxy_protocol` on, the admin listener reads PROXY headers too** (as optional),
+  and exports `edgeguard_proxy_protocol_total{listener="admin",…}`. A connection to it without a
+  header is served as before. `EdgeGuardProxyProtocolRefused` can therefore now fire with
+  `listener="admin"`, for example when the NLB's health checks come from an address outside
+  `proxy_protocol_trusted`.
+- **TLS connections that close before a ClientHello are no longer counted in
+  `edgeguard_tls_handshake_failures_total{reason="other"}`,** but in the new
+  `edgeguard_tls_no_client_hello_total`. Behind a balancer, `reason="other"` drops by its health
+  check rate.
+- **With `server.trust_forwarded_for`, the client is now the `X-Forwarded-For` entry
+  `server.forwarded_hops` from the right** (see Security). Set `forwarded_hops` from what the
+  proxies in front append, before upgrading:
+  - **GCP external Application Load Balancer: set `forwarded_hops = 2`.** It appends two entries,
+    the client and then its own address. With the default `1`, every request resolves to the
+    load balancer: one rate-limit bucket for everyone (a site-wide `429`), `[access]` allowlists
+    that lock everyone out, `hash_on = "client_ip"` on one target.
+  - **CloudFront → ALB: `forwarded_hops = 2`**, and the ALB must accept only CloudFront.
+  - **An AWS ALB in its default `append` mode, Cloudflare, Azure Application Gateway, nginx with
+    `$proxy_add_x_forwarded_for`, Traefik: nothing to do** (`1`). An ALB in `preserve` mode
+    appends nothing, so its header is the client's own: do not trust it.
+  - Anything else, Cloud Run and other Google Front End services included: check what reaches
+    EdgeGuard first (`docs/DEPLOYMENT.md`).
+  - A proxy that replaces the header with one value keeps working unchanged: a one-entry header
+    gives the same answer either way. `X-Forwarded-Proto` is now read from its last value too.
+- **The upstream no longer receives the client's `X-Real-IP`, `True-Client-IP`, `Forwarded` or
+  `X-Forwarded-Host`** (see Security). `X-Real-IP` and `Forwarded` now carry the edge's resolved
+  client address, `X-Forwarded-Host` the `Host` the edge received, and `True-Client-IP` is
+  removed. An app that relied on a proxy in front of EdgeGuard setting one of these (a CDN's
+  `True-Client-IP`, a `Forwarded` chain, a CDN that rewrites `Host` and sends the viewer's as
+  `X-Forwarded-Host`) now sees the edge's values: read `X-Forwarded-For` or `X-Real-IP` for the
+  client, and have the CDN forward the original `Host`.
+
+### Security
+
+- **Any client could choose its address through an L7 balancer.** With
+  `server.trust_forwarded_for = true`, the client IP was the *first* `X-Forwarded-For` entry. A
+  balancer appends the address it saw after whatever the client sent, so the first entry is the
+  client's own writing. Any client could therefore pick its address through the balancer: a new
+  per-IP rate-limit bucket on every request, a way past `[access]` deny rules (or into allow
+  rules), and a forged address in the access log, shipped log records, spans and the
+  `X-Forwarded-For` the app receives. Letting only the balancer reach EdgeGuard did not help,
+  since the balancer forwards the header. The client is now the entry `server.forwarded_hops`
+  (default `1`) from the right: the one the trusted proxy appended. Several header lines are read
+  as one list; a header with fewer entries, or a chosen entry that is not an address, falls back
+  to the TCP peer. Every consumer of the client address goes through the one resolution, made
+  once per request: rate limits, `[access]`, pool hashing on `client_ip`, the access log and
+  shipped records, spans (which used the TCP peer before) and the upstream's forwarding headers.
+  LLM metering is keyed by virtual key, not address. Found by the eggrd site review (#1718).
+- **The client's other address headers reached the app unchanged.** Only `X-Forwarded-For` was
+  replaced upstream; `X-Real-IP`, `True-Client-IP`, `Forwarded` (RFC 7239) and `X-Forwarded-Host`
+  passed through as the client wrote them. Frameworks that prefer them (Go chi's `RealIP` reads
+  `True-Client-IP` and `X-Real-IP` first) saw a client-chosen address despite the edge, and a
+  client could send an `X-Forwarded-Host` that differed from the `Host` it asked for. On the
+  normal and the WebSocket path alike, `X-Real-IP` is now the resolved client, `Forwarded` is
+  replaced with `for=<client>;proto=<proto>` (an IPv6 client quoted and bracketed),
+  `X-Forwarded-Host` is the `Host` the edge received, and `True-Client-IP` is removed. `Host` is
+  still the client's choice and EdgeGuard has no allowed-hosts check, so an app that builds links
+  (a password-reset email) from either header must still validate the host itself. Found by the
+  post-merge review of #1721.
+
+### Added
+
+- **`server.forwarded_hops`** (default `1`, `1` to `10`): how many `X-Forwarded-For` entries the
+  trusted proxies in front of EdgeGuard append (`2` for a GCP external Application Load
+  Balancer). `doctor` names it with `trust_forwarded_for`, and warns when it is set without. **`edgeguard_forwarded_for_total{result}`**, with
+  `trust_forwarded_for`: `used`, or the TCP peer instead because the header was `absent`, `short`
+  or `invalid`.
+
+- **A pool's health check can go over another scheme, or to another address, than its requests**
+  (#1713). This builds on `health_check.port` for an app whose health lives on a management port.
+  - `health_check.scheme = "http"` (or `"https"`) checks over another scheme, for a TLS app whose
+    management port is plain HTTP, or the reverse. The port is always written out, so
+    `https://a` checked over HTTP goes to `http://a:443`. An `https://` check of an `https://`
+    target uses the TLS settings its requests use. One of an `http://` target takes
+    `[upstream_tls]`, or an entry naming the check's host and port, which `doctor` no longer
+    reports as unused. Refused with `type = "tcp"` or without a `path`.
+  - `check_host` in a target's table (`{ url = "…", check_host = "10.0.9.5" }`) sends that
+    target's check to another host, such as the server's management network address, with the
+    pool's `port` and `scheme`. It is per target, since a pool's targets are different servers.
+    The check still sends the target's own name as `Host`. An `https://` check of an
+    `https://` target verifies the target's own name and uses its TLS settings, as its requests
+    do, whatever address it dials. Anything but a host name or IP address is refused, as is a
+    `check_host` in a pool with no active check.
+  - `GET /__edgeguard/upstreams` shows the check's `scheme` and each target's `check_host`.
+
+- **Requests in flight and a TLS handshake total** (the last of the listener series planned for
+  0.6.0).
+  - `edgeguard_requests_in_flight{listener}` counts requests still being answered, from the
+    request's head until the end of its response body. A streamed response counts until it
+    ends, a WebSocket upgrade until its `101`. Beside `edgeguard_connections_open`, it
+    tells idle or slow connections from a backed-up app. The admin listener counts its own
+    (`listener="admin"`), never the public listener's.
+  - `edgeguard_tls_handshakes_total{listener}` counts every handshake that ended on a TLS
+    listener, successful or not. The existing `edgeguard_tls_handshake_failures_total` is a
+    subset, so a failure ratio needs no other series. A connection that closes before its
+    ClientHello is not a handshake and is in neither (see the next entry).
+  - Both are in the OTLP export too.
+- **`edgeguard_tls_no_client_hello_total{listener}`:** connections to a TLS listener that closed,
+  or were reset, before sending a byte of handshake (TCP and PROXY protocol health checks, scans).
+  In neither `edgeguard_tls_handshakes_total` nor the failures.
+- **`doctor` warns about `trusted_proxy_names` with `auth.mode = "mtls"` and an empty
+  `[auth.mtls] allowed`.** The balancer is trusted by a certificate from the CA in
+  `tls.client_auth.ca_path`, so any other certificate from that CA, presented by a client that
+  connects directly, authenticates as itself. With `allowed` set it is a note instead: `allowed`
+  narrows who may connect directly, not the path. To require the balancer, give it a CA of its
+  own, or let only the balancer reach the listener.
+
+### Fixed
+
+- **An NLB's HTTP health check of the admin port failed every target with PROXY protocol on.** The
+  NLB sends a v2 `LOCAL` header on health-check connections, also to a separate health-check
+  port, and the admin listener read no header, so the request did not parse (`invalid HTTP method
+  parsed`) and the NLB failed open. With `server.proxy_protocol`, the admin listener now reads a
+  v1 or v2 header with the public listener's parsing and `proxy_protocol_trusted`: from a trusted
+  peer it is read (`LOCAL` serves the check), from anyone else it is refused. A connection without
+  a header is served as itself and counted `direct`, from a trusted address or not, so kubelet
+  probes and Prometheus scrapes keep working and don't fire `EdgeGuardProxyProtocolMissing`.
+- **Health checks inflated the TLS handshake failure count.** On a TLS listener, a connection that
+  sent only a PROXY header (an NLB's `LOCAL` check) or nothing, and closed, counted as
+  `edgeguard_tls_handshake_failures_total{reason="other"}`, about 0.6/s per target behind an NLB.
+  It now counts in `edgeguard_tls_no_client_hello_total`. A ClientHello cut off partway is still
+  a failed handshake. With `proxy_protocol` on, a connection reset before sending any byte (no
+  header, no ClientHello) is counted there too, as it is without PROXY protocol; it used to count
+  nowhere.
+- **With PROXY protocol, a slow client was held for two `header_read_timeout`s.** The PROXY
+  header had the timeout to itself, and hyper's timeout for the request head started only after
+  it. A client dripping both kept a connection for about twice `header_read_timeout` (60 s at
+  the default) before it was closed, on the public listeners and, now that it reads PROXY
+  headers, the admin listener. A new connection now gets one deadline from accept to its first
+  complete request head, PROXY header included. A TLS handshake between them keeps its own 10 s
+  bound and is not counted. Later requests on a kept-alive connection get the timeout each, as
+  before. With `header_read_timeout = "0"`, nothing changes. Without PROXY protocol, one corner
+  case tightens the same way: a client that sent a first byte just before the deadline used to
+  get a second timeout for the rest of the head. HTTP/2 connections are unchanged; the timeout
+  is HTTP/1's.
+
+### CI
+
+- **The crate's own `Cargo.lock` is checked on every change to a manifest or the lock.** #1712
+  added a dependency without updating the crate's own `Cargo.lock`, so the `--locked` builds of
+  this repository and of the image broke, while the development build, which resolves through a
+  different lock, passed. Each such change is now resolved standalone, as this repository has it,
+  with `cargo metadata --locked`.
+
+### Docs
+
+- Health checks behind an NLB with PROXY protocol (`DEPLOYMENT.md`, `OPERATIONS.md`): check
+  `/__edgeguard/ready` on the admin port over HTTP from this release, and what to do on 0.7.0-rc.1
+  and earlier. A TCP check reports targets healthy while every connection is refused for a wrong
+  `proxy_protocol_trusted`. The HTTP check catches the NLB's subnets leaving the list, but not
+  client IP preservation, where its checks still come from trusted addresses; deploy
+  `EdgeGuardProxyProtocolRefused`, which catches both. `doctor`'s drain warning (30 s or more) is
+  expected behind an NLB once `terminationGracePeriodSeconds` is raised, and says so.
+- What a client sees behind an NLB: a connection closed at accept (over `max_connections`) or for
+  idling looks open until the client writes, then is reset; idle connections count as a PROXY
+  protocol `timeout`, since the NLB sends the header with the first data.
+- A NetworkPolicy that locks egress to the proxy, with the EKS note: the VPC CNI's network policy
+  agent needed an `ipBlock` for the service CIDR to reach a multi-port Service's ClusterIP.
+- A dedicated CA for balancers trusted by `trusted_proxy_names`, or `[auth.mtls] allowed`.
+- `trust_forwarded_for` behind an L7 balancer (`DEPLOYMENT.md`, `OPERATIONS.md`, `CONFIG.md`):
+  how `forwarded_hops` counts a chain, and that the header is still believed from every peer, so
+  only the balancer should reach the traffic port. A trusted-forwarder address list is planned for
+  0.8 (`docs/RELEASE-0.8.0-PLAN.md`).
+- Rolling restarts behind an NLB: `drain_delay` of 20–30 s, and `terminationGracePeriodSeconds`
+  that covers `drain_delay` + `drain_timeout`. The NLB keeps opening connections to a draining
+  target for about 15 s, and in the EKS re-run `drain_delay = 15s` let 1 of 7,963 requests be
+  refused.
+- Troubleshooting rows for each of the above.
+- Monitoring bundle 1.6.2: the "TLS handshakes refused" panel says that connections closed before
+  a ClientHello are not in it.
+
 ## [0.7.0-rc.1] — 2026-11-02
 
 A release candidate. 0.7.0 final will be cut from this same code after a soak, so it is published
@@ -1408,7 +2282,8 @@ unchanged). Ships the v0–v2.5 feature set below.
 - Added an optional `validation.max_response_body` cap so a huge upstream response can't
   OOM the proxy.
 
-[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.7.0-rc.1...HEAD
+[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/lucheeseng827/eggrd/compare/v0.5.0...v0.7.0
 [0.7.0-rc.1]: https://github.com/lucheeseng827/eggrd/compare/v0.5.0...v0.7.0-rc.1
 [0.5.0]: https://github.com/lucheeseng827/eggrd/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/lucheeseng827/eggrd/compare/v0.3.1...v0.4.0

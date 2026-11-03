@@ -7,18 +7,31 @@
 //!   requests. hyper has this timeout built in, but it only applies once a `Timer` is installed, and
 //!   it only starts after HTTP-version detection, which has no timeout of its own: a client that
 //!   connects and sends nothing would otherwise hold its socket forever. So the first bytes are read
-//!   here, under the same deadline, and replayed to hyper ([`Prefixed`]).
+//!   here, under the same deadline, and replayed to hyper ([`Prefixed`]). For a new connection
+//!   it is one deadline from accept to the first complete request head, a PROXY header included
+//!   (a TLS handshake between them has its own 10 s bound and is not counted), so dripping the
+//!   header and then the request head cannot hold a socket for two timeouts. Each later request
+//!   on a kept-alive connection gets hyper's timeout of its own. HTTP/1 only, as hyper's is.
 //! * **Connection cap.** `server.max_connections` open connections at most; one more is closed as
 //!   soon as it is accepted, and counted.
 //! * **PROXY protocol.** With `server.proxy_protocol`, a header a trusted load balancer sends at
 //!   the start of the connection names the client, before anything else is read (before the TLS
-//!   handshake, which it precedes on the wire). See [`crate::proxy_protocol`].
+//!   handshake, which it precedes on the wire). See [`crate::proxy_protocol`]. The admin listener
+//!   reads it too, as optional ([`ServeOpts::for_admin`]).
+//! * **No ClientHello.** On a TLS listener, a connection that closes before sending a byte of
+//!   handshake (a TCP health check, or a balancer's PROXY `LOCAL` check that sends only the header)
+//!   is not a handshake, failed or otherwise: it is counted apart, in
+//!   [`ListenerStats::no_client_hello`], and in neither handshake series.
 //! * **Graceful drain.** When `shutdown` flips, keep accepting for `drain_delay` (so a load balancer
 //!   has time to stop routing here), then stop accepting, ask every connection to finish its
 //!   in-flight request and close, and wait up to `drain_timeout` for them.
 //!
 //! Upgraded connections (WebSocket tunnels) leave hyper's connection once the upgrade completes,
 //! so they are not counted here and are not waited for.
+//!
+//! Each listener's [`ListenerStats`] also counts its requests in flight, from a request's head
+//! until hyper has taken the end of its response body (or dropped it), and on TLS listeners every
+//! handshake that ended. The metrics render them per listener.
 
 use std::io;
 use std::net::SocketAddr;
@@ -107,6 +120,28 @@ impl ServeOpts {
         self.stats = stats;
         self
     }
+
+    /// The admin listener's settings, from the public listener's. No connection cap and no drain
+    /// delay: it must answer probes while the public port is full, and has nothing to hand off.
+    ///
+    /// PROXY protocol, when the public listener reads it, is read here too, from the same
+    /// `proxy_protocol_trusted` peers and with the same rules, but a header is optional: an AWS
+    /// NLB's health check sends a v2 `LOCAL` header even to a separate health-check port, and
+    /// without reading it the check's request is unparseable and every target fails. A probe or
+    /// scrape that sends no header is served as itself and counted `direct`, from a trusted
+    /// address or not; a header from outside `proxy_protocol_trusted` is still refused.
+    pub fn for_admin(&self) -> Self {
+        ServeOpts {
+            max_connections: 0,
+            drain_delay: Duration::ZERO,
+            proxy_protocol: self
+                .proxy_protocol
+                .as_ref()
+                .map(|pp| Arc::new(pp.header_optional())),
+            stats: Arc::default(),
+            ..self.clone()
+        }
+    }
 }
 
 /// The address at the other end of a request's TCP connection, attached to every request. The
@@ -142,6 +177,13 @@ pub struct ListenerStats {
     tls: std::sync::atomic::AtomicBool,
     /// Failed handshakes, parallel to [`TLS_FAILURE_REASONS`].
     tls_failures: [AtomicU64; 3],
+    /// TLS connections closed before sending any of a ClientHello. Not handshakes: in neither
+    /// `tls_failures` nor `tls_handshakes`.
+    no_client_hello: AtomicU64,
+    /// Handshakes that ended, successful or not: the failures above are a subset.
+    tls_handshakes: AtomicU64,
+    /// Requests still being answered. See [`InFlight`].
+    in_flight: AtomicUsize,
     /// Set once the listener reads PROXY protocol headers.
     proxy_protocol: std::sync::atomic::AtomicBool,
     /// Connections by what their first bytes were, parallel to [`Outcome::ALL`].
@@ -176,6 +218,35 @@ impl ListenerStats {
         std::array::from_fn(|i| self.tls_failures[i].load(Ordering::Relaxed))
     }
 
+    /// Connections to a TLS listener that closed, or were reset, before sending a byte of the
+    /// handshake: TCP health checks, port scans, and a balancer's PROXY protocol health check
+    /// (a `LOCAL` header, then nothing). No handshake was attempted, so they are in neither
+    /// [`Self::tls_failures`] nor [`Self::tls_handshakes`].
+    pub fn no_client_hello(&self) -> u64 {
+        self.no_client_hello.load(Ordering::Relaxed)
+    }
+
+    /// TLS handshakes that ended, successful or not: [`Self::tls_failures`] are among them. A
+    /// handshake cut short by shutdown is in neither, and neither is a connection that closed
+    /// before its ClientHello ([`Self::no_client_hello`]). One that sent nothing until the
+    /// handshake deadline is a `timeout` failure, and counted.
+    pub fn tls_handshakes(&self) -> u64 {
+        self.tls_handshakes.load(Ordering::Relaxed)
+    }
+
+    /// Requests on this listener still being answered: from the request's head until hyper has
+    /// taken the end of its response body (a streamed one included), or gives the request up
+    /// because its connection closed. A WebSocket upgrade counts until its `101`, not for the
+    /// life of the tunnel.
+    ///
+    /// The end of the body is the last point hyper exposes per request. Its last bytes may still
+    /// be in the connection's write buffer then, not yet handed to the socket. So a client that
+    /// stops reading near the end of a response holds its connection, which
+    /// [`Self::open`] counts, not a request.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
     /// Whether this listener reads PROXY protocol headers.
     pub fn reads_proxy_protocol(&self) -> bool {
         self.proxy_protocol.load(Ordering::Relaxed)
@@ -192,10 +263,18 @@ impl ListenerStats {
         }
     }
 
+    /// Count a handshake that failed for `reason` (one of [`TLS_FAILURE_REASONS`]), in the
+    /// total as well as by reason.
     fn tls_failed(&self, reason: &str) {
+        self.tls_handshakes.fetch_add(1, Ordering::Relaxed);
         if let Some(i) = TLS_FAILURE_REASONS.iter().position(|r| *r == reason) {
             self.tls_failures[i].fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Count a handshake that succeeded: in the total only.
+    fn tls_succeeded(&self) {
+        self.tls_handshakes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Resolve once no connection is open.
@@ -215,6 +294,54 @@ impl ListenerStats {
 
 /// Holds one slot in [`ListenerStats::open`] for the life of a connection task.
 struct ConnSlot(Arc<ListenerStats>);
+
+/// Holds one count in [`ListenerStats::in_flight`] for one request: taken when hyper hands the
+/// request over, carried by its response body ([`Counted`]), and given back when that body is
+/// dropped. hyper drops it once it has taken the body's last frame (before flushing what it has
+/// buffered: it has no per-request point after the flush), when the connection closes under it,
+/// or with the request's future if no response was produced.
+struct InFlight(Arc<ListenerStats>);
+
+impl InFlight {
+    fn start(stats: &Arc<ListenerStats>) -> Self {
+        stats.in_flight.fetch_add(1, Ordering::AcqRel);
+        InFlight(Arc::clone(stats))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A response body that holds its request's [`InFlight`] count. Everything else is the inner
+/// body's, so hyper frames the response exactly as it would without the count: its framing reads
+/// `size_hint` and `is_end_stream`.
+struct Counted<B> {
+    body: B,
+    _in_flight: InFlight,
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for Counted<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
 
 impl Drop for ConnSlot {
     fn drop(&mut self) {
@@ -314,21 +441,29 @@ pub async fn serve(
         tokio::spawn(async move {
             let _slot = slot;
             let mut stream = stream;
+            let accepted_at = tokio::time::Instant::now();
             // The client this connection is served as, and what was read past its PROXY header.
-            let (client, rest) = match &proxy_protocol {
+            let (client, mut rest) = match &proxy_protocol {
                 None => (peer, Vec::new()),
                 Some(pp) => {
                     // A balancer sends the header as soon as it connects. With the header-read
                     // timeout off, the handshake's bound still keeps a silent peer from staying.
                     let limit = header_read_timeout.unwrap_or(TLS_HANDSHAKE_TIMEOUT);
                     let read = tokio::select! {
-                        read = tokio::time::timeout(limit, pp.accept(&mut stream, peer)) => read,
+                        read = tokio::time::timeout_at(accepted_at + limit, pp.accept(&mut stream, peer)) => read,
                         _ = signalled(&mut drain) => return,
                     };
                     let accepted = match read {
                         Ok(Ok(accepted)) => accepted,
                         Ok(Err(e)) => {
-                            debug!(error = %e, %peer, "read error before the PROXY protocol header");
+                            // Reset before a single byte: on a TLS listener that is a connection
+                            // that never sent a ClientHello, as it is without PROXY protocol.
+                            if acceptor.is_some() && e.nothing_read {
+                                stats.no_client_hello.fetch_add(1, Ordering::Relaxed);
+                                debug!(error = %e, %peer, "reset before sending a PROXY header or a ClientHello");
+                            } else {
+                                debug!(error = %e, %peer, "read error before the PROXY protocol header");
+                            }
                             return;
                         }
                         Err(_) => {
@@ -345,6 +480,44 @@ pub async fn serve(
                     (accepted.client, accepted.rest)
                 }
             };
+            // One `header_read_timeout` covers the PROXY header and the first request head
+            // together: what the PROXY stage used is taken off what the request head gets, so a
+            // client dripping both is closed after one timeout, not two. A TLS handshake between
+            // them has its own bound and is not counted against it.
+            let head_timeouts = header_read_timeout.map(|limit| HeadTimeouts {
+                each: limit,
+                first: limit.saturating_sub(accepted_at.elapsed()),
+            });
+            // The handshake's bound covers the wait for its first byte too.
+            let handshake_deadline = tokio::time::Instant::now() + TLS_HANDSHAKE_TIMEOUT;
+            if acceptor.is_some() && rest.is_empty() {
+                // Wait for the ClientHello's first bytes before starting the handshake, so that a
+                // connection that closes without sending any (a TCP health check, or a balancer's
+                // PROXY `LOCAL` check, which sends the header and nothing more) is counted as what
+                // it is, not as a failed handshake.
+                let mut first = vec![0u8; 1024];
+                let read = tokio::select! {
+                    read = tokio::time::timeout_at(handshake_deadline, stream.read(&mut first)) => read,
+                    _ = signalled(&mut drain) => return,
+                };
+                match read {
+                    Ok(Ok(n)) if n > 0 => {
+                        first.truncate(n);
+                        rest = first;
+                    }
+                    // Closed or reset before a byte of handshake.
+                    Ok(_) => {
+                        stats.no_client_hello.fetch_add(1, Ordering::Relaxed);
+                        debug!(%peer, "closed before sending a ClientHello");
+                        return;
+                    }
+                    Err(_) => {
+                        stats.tls_failed("timeout");
+                        debug!(%peer, "TLS handshake timed out");
+                        return;
+                    }
+                }
+            }
             let stream = Prefixed {
                 prefix: rest,
                 pos: 0,
@@ -358,16 +531,20 @@ pub async fn serve(
                         stream,
                         peer,
                         tower_service,
-                        header_read_timeout,
+                        head_timeouts,
                         None,
                         drain,
+                        stats,
                     )
                     .await
                 }
                 Some(acceptor) => {
                     let tls_stream = tokio::select! {
-                        handshake = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)) => match handshake {
-                            Ok(Ok(s)) => s,
+                        handshake = tokio::time::timeout_at(handshake_deadline, acceptor.accept(stream)) => match handshake {
+                            Ok(Ok(s)) => {
+                                stats.tls_succeeded();
+                                s
+                            }
                             Ok(Err(e)) => {
                                 let reason = if is_client_cert_error(&e) { "client_cert" } else { "other" };
                                 stats.tls_failed(reason);
@@ -400,9 +577,10 @@ pub async fn serve(
                         tls_stream,
                         peer,
                         tower_service,
-                        header_read_timeout,
+                        head_timeouts,
                         Some(tls),
                         drain,
+                        stats,
                     )
                     .await
                 }
@@ -431,24 +609,34 @@ pub async fn serve(
 }
 
 /// Serve one connection with hyper: under the header-read timeout when one is set, and shutting
-/// down gracefully (finish the in-flight request, then close) when `drain` flips. `peer` is the
+/// down gracefully (finish the in-flight request, then close) when `drain` flips. `head_timeouts`
+/// is `None` when `header_read_timeout` is off. `peer` is the
 /// TCP peer, attached to every request as [`TcpPeer`]. On a TLS connection, the version and any
-/// verified client certificate are attached too.
+/// verified client certificate are attached too. Each request is counted in `stats`' in-flight
+/// count until hyper has taken the end of its response body.
 async fn serve_connection<I>(
     mut io: I,
     peer: SocketAddr,
     service: AddExtension<Router, ConnectInfo<SocketAddr>>,
-    header_read_timeout: Option<Duration>,
+    head_timeouts: Option<HeadTimeouts>,
     tls: Option<TlsConn>,
     mut drain: watch::Receiver<bool>,
+    stats: Arc<ListenerStats>,
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut builder = ConnBuilder::new(TokioExecutor::new());
-    let prefix = match header_read_timeout {
-        Some(limit) => {
+    // When the first request's head must be complete: what is left of `header_read_timeout`
+    // after a PROXY header, from now. hyper's own header timeout covers each request head, but
+    // starts only when it begins reading one, after the bytes read here; so without this a client
+    // dripping a PROXY header (or the first byte) and then the head held the connection for two
+    // timeouts. Later requests on a kept-alive connection get hyper's timeout alone.
+    let first_head_by = head_timeouts.map(|t| tokio::time::Instant::now() + t.first);
+    let prefix = match head_timeouts {
+        Some(HeadTimeouts { each: limit, .. }) => {
+            let first_by = first_head_by.expect("set with head_timeouts");
             let first = tokio::select! {
-                first = tokio::time::timeout(limit, read_preface(&mut io)) => first,
+                first = tokio::time::timeout_at(first_by, read_preface(&mut io)) => first,
                 _ = signalled(&mut drain) => return,
             };
             let prefix = match first {
@@ -478,12 +666,20 @@ async fn serve_connection<I>(
         }
     };
 
+    // Like hyper's header timeout, the first-head deadline is HTTP/1's: an HTTP/2 connection
+    // that has sent its preface may wait idle for its first request.
+    let first_head_by = first_head_by.filter(|_| prefix != H2_PREFACE);
+    // Set once the first request's head has arrived, which ends the first-head deadline.
+    let first_head = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let io = TokioIo::new(Prefixed {
         prefix,
         pos: 0,
         inner: io,
     });
+    let seen = Arc::clone(&first_head);
     let hyper_service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
+        seen.store(true, Ordering::Release);
+        let in_flight = InFlight::start(&stats);
         request.extensions_mut().insert(TcpPeer(peer));
         if let Some(tls) = &tls {
             if let Some(version) = tls.version {
@@ -493,12 +689,35 @@ async fn serve_connection<I>(
                 request.extensions_mut().insert(Arc::clone(cert));
             }
         }
-        service.clone().oneshot(request)
+        let response = service.clone().oneshot(request);
+        async move {
+            let response = response.await?;
+            Ok::<_, std::convert::Infallible>(response.map(|body| Counted {
+                body,
+                _in_flight: in_flight,
+            }))
+        }
     });
     let conn = builder.serve_connection_with_upgrades(io, hyper_service);
     tokio::pin!(conn);
+    // Resolves at the first-head deadline if no request head has arrived by then; never otherwise.
+    let first_head_late = async {
+        match first_head_by {
+            Some(at) => {
+                tokio::time::sleep_until(at).await;
+                if first_head.load(Ordering::Acquire) {
+                    std::future::pending::<()>().await;
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
     let result = tokio::select! {
         result = conn.as_mut() => result,
+        _ = first_head_late => {
+            debug!(%peer, "closed: no complete request within header_read_timeout");
+            return;
+        }
         _ = signalled(&mut drain) => {
             conn.as_mut().graceful_shutdown();
             conn.await
@@ -507,6 +726,16 @@ async fn serve_connection<I>(
     if let Err(e) = result {
         debug!(error = %e, %peer, "connection ended with an error");
     }
+}
+
+/// `header_read_timeout` for one connection.
+#[derive(Debug, Clone, Copy)]
+struct HeadTimeouts {
+    /// For each request head (hyper's), from when it starts reading one.
+    each: Duration,
+    /// For the first request head, from when the connection reaches hyper: what is left of the
+    /// timeout after the PROXY header.
+    first: Duration,
 }
 
 /// Read until the bytes either rule out the HTTP/2 preface or complete it, so the version check

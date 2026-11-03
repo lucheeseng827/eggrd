@@ -450,7 +450,7 @@ async fn main() -> Result<()> {
     // before anything starts.
     let serve_opts = serve::ServeOpts::from_cfg(&cfg.server)?;
     if serve_opts.proxy_protocol.is_some() {
-        info!(trusted = ?cfg.server.proxy_protocol_trusted, "reading PROXY protocol headers on the public and redirect listeners");
+        info!(trusted = ?cfg.server.proxy_protocol_trusted, "reading PROXY protocol headers on the public and redirect listeners, and as optional on the admin listener");
     }
     // Likewise the client-certificate verifier: a CA bundle or CRL that does not load, or client
     // authentication asked for without TLS, fails here.
@@ -595,16 +595,12 @@ async fn main() -> Result<()> {
             .with_context(|| format!("binding admin listener on {admin_addr}"))?;
         let admin_app = build_admin_router(state.clone());
         // Stopped after the public drain (on `stop`, not `shutdown`), so probes and scrapes see
-        // the drain. No connection cap and no drain delay: it must answer while the public port is
-        // full, and it has nothing to hand off. No PROXY protocol: probes and scrapes reach it
-        // directly, not through the balancer.
-        let admin_opts = serve::ServeOpts {
-            max_connections: 0,
-            drain_delay: Duration::ZERO,
-            proxy_protocol: None,
-            ..serve_opts.clone()
-        }
-        .with_stats(state.metrics.listener_stats("admin"));
+        // the drain. No connection cap and no drain delay, and PROXY protocol headers read as
+        // optional, so a balancer's health check (an NLB's brings a `LOCAL` header) is answered
+        // beside direct probes and scrapes: see `ServeOpts::for_admin`.
+        let admin_opts = serve_opts
+            .for_admin()
+            .with_stats(state.metrics.listener_stats("admin"));
         let admin_rx = stop_rx.clone();
         info!(listen = %admin_addr, "EdgeGuard admin endpoints listening (health/ready/metrics)");
         tokio::spawn(async move {

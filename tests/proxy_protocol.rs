@@ -435,6 +435,458 @@ async fn only_listeners_that_read_headers_export_the_series() {
     assert!(text.contains("edgeguard_connections_open{listener=\"admin\"}"));
 }
 
+/// The admin listener as `main` runs it: the admin router, on [`ServeOpts::for_admin`] of the
+/// public listener's settings, registered as `admin`.
+async fn admin_edge(cfg: Config) -> Edge {
+    let opts = ServeOpts::from_cfg(&cfg.server).unwrap().for_admin();
+    let state = build_state(Arc::new(cfg)).unwrap();
+    let metrics = Arc::clone(&state.metrics);
+    let opts = opts.with_stats(metrics.listener_stats("admin"));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, rx) = watch::channel(false);
+    tokio::spawn(serve(
+        listener,
+        None,
+        edgeguard::build_admin_router(state),
+        opts,
+        rx,
+    ));
+    Edge {
+        addr,
+        metrics,
+        _stop: stop,
+    }
+}
+
+/// `GET /__edgeguard/ready` after `preamble`, as an NLB health check sends it.
+async fn ready_after(addr: SocketAddr, preamble: &[u8]) -> Option<u16> {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut bytes = preamble.to_vec();
+    bytes.extend_from_slice(
+        b"GET /__edgeguard/ready HTTP/1.1\r\nHost: 10.0.0.1:9090\r\nConnection: close\r\n\r\n",
+    );
+    s.write_all(&bytes).await.ok()?;
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .expect("the edge answered or closed");
+    String::from_utf8_lossy(&out).get(9..12)?.parse().ok()
+}
+
+/// `edgeguard_proxy_protocol_total{listener="admin",result}` as the registry renders it.
+fn admin_counter(metrics: &Metrics, result: &str) -> u64 {
+    let line = format!("edgeguard_proxy_protocol_total{{listener=\"admin\",result=\"{result}\"}} ");
+    metrics
+        .render()
+        .lines()
+        .find_map(|l| l.strip_prefix(&line)?.parse().ok())
+        .unwrap_or_else(|| panic!("no {line}"))
+}
+
+#[tokio::test]
+async fn the_admin_listener_answers_a_balancers_health_check_that_carries_a_header() {
+    // An AWS NLB with proxy protocol v2 on sends a `LOCAL` header on every health-check
+    // connection, also to a separate health-check port. Unread, it made `GET /ready` unparseable
+    // ("invalid HTTP method parsed") and failed every target.
+    let up = upstream().await;
+    let edge = admin_edge(cfg(up, "127.0.0.0/8")).await;
+    assert_eq!(
+        ready_after(edge.addr, &v2_local()).await,
+        Some(200),
+        "v2 LOCAL"
+    );
+    assert_eq!(
+        ready_after(edge.addr, b"PROXY UNKNOWN\r\n").await,
+        Some(200),
+        "v1 UNKNOWN"
+    );
+    assert_eq!(
+        ready_after(edge.addr, &v1("203.0.113.7:51234")).await,
+        Some(200),
+        "v1 TCP4"
+    );
+    assert_eq!(
+        ready_after(edge.addr, &v2("198.51.100.9:4000".parse().unwrap())).await,
+        Some(200),
+        "v2 PROXY"
+    );
+    assert_eq!(admin_counter(&edge.metrics, "local"), 2);
+    assert_eq!(admin_counter(&edge.metrics, "proxied"), 2);
+
+    // A kubelet probe or a Prometheus scrape from the trusted range sends no header. It is
+    // served, and counted `direct`, not `missing`: on the admin port no header is the norm, and
+    // `missing` without `proxied` would fire EdgeGuardProxyProtocolMissing.
+    assert_eq!(ready_after(edge.addr, b"").await, Some(200), "no header");
+    assert_eq!(admin_counter(&edge.metrics, "direct"), 1);
+    assert_eq!(admin_counter(&edge.metrics, "missing"), 0);
+}
+
+#[tokio::test]
+async fn the_admin_listener_refuses_a_header_from_an_untrusted_peer() {
+    let up = upstream().await;
+    let edge = admin_edge(cfg(up, "10.0.0.0/8")).await;
+    for preamble in [
+        v2_local(),
+        b"PROXY UNKNOWN\r\n".to_vec(),
+        v1("203.0.113.7:1"),
+    ] {
+        assert!(closed(edge.addr, &preamble).await, "{preamble:?}");
+    }
+    assert_eq!(admin_counter(&edge.metrics, "untrusted"), 3);
+    // Without a header, a direct caller is served as before.
+    assert_eq!(ready_after(edge.addr, b"").await, Some(200));
+    assert_eq!(admin_counter(&edge.metrics, "direct"), 1);
+}
+
+#[tokio::test]
+async fn without_proxy_protocol_the_admin_listener_reads_no_header() {
+    let up = upstream().await;
+    let mut c = cfg(up, "127.0.0.1");
+    c.server.proxy_protocol = false;
+    c.server.proxy_protocol_trusted.clear();
+    let edge = admin_edge(c).await;
+    assert_eq!(ready_after(edge.addr, b"").await, Some(200));
+    assert_ne!(
+        ready_after(edge.addr, &v2_local()).await,
+        Some(200),
+        "a header is a malformed request when proxy_protocol is off"
+    );
+    assert!(!edge
+        .metrics
+        .render()
+        .contains("edgeguard_proxy_protocol_total{listener=\"admin\""));
+}
+
+/// The value of one rendered series, given as its name and labels.
+fn tls_counter(metrics: &Metrics, series: &str) -> u64 {
+    metrics
+        .render()
+        .lines()
+        .find_map(|l| l.strip_prefix(series)?.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no {series}"))
+}
+
+#[tokio::test]
+async fn a_connection_reset_before_any_byte_counts_as_no_client_hello_with_proxy_protocol() {
+    // With PROXY protocol on, the first read is the header's. A reset there (ECONNRESET, nothing
+    // read) used to count nowhere, while the same reset without PROXY protocol counted in
+    // `no_client_hello`.
+    let dir = Dir::new();
+    let (server, _) = tls(&dir);
+    let up = upstream().await;
+    let edge = edge(cfg(up, "127.0.0.1"), Some(server)).await;
+    let series = |name: &str| tls_counter(&edge.metrics, name);
+    for _ in 0..3 {
+        let tcp = TcpStream::connect(edge.addr).await.unwrap();
+        // Wait until the edge holds it, so the reset reaches an accepted connection's read.
+        for _ in 0..100 {
+            if series("edgeguard_connections_open{listener=\"public\"}") == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Deprecated because a non-zero linger blocks the thread on drop; zero never does.
+        #[allow(deprecated)]
+        let linger = tcp.set_linger(Some(Duration::ZERO));
+        linger.unwrap();
+        drop(tcp); // SO_LINGER 0: an RST, not a FIN
+        for _ in 0..100 {
+            if series("edgeguard_connections_open{listener=\"public\"}") == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert_eq!(
+        series("edgeguard_tls_no_client_hello_total{listener=\"public\"}"),
+        3
+    );
+    assert_eq!(
+        series("edgeguard_tls_handshakes_total{listener=\"public\"}"),
+        0
+    );
+    assert_eq!(
+        series("edgeguard_tls_handshake_failures_total{listener=\"public\",reason=\"other\"}"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn an_admin_request_is_not_in_the_public_listeners_in_flight_count() {
+    // The admin listener counts its own requests; a probe on it is never a public request.
+    let up = upstream().await;
+    let cfg = cfg(up, "127.0.0.1");
+    let opts = ServeOpts::from_cfg(&cfg.server).unwrap();
+    let state = build_state(Arc::new(cfg)).unwrap();
+    let metrics = Arc::clone(&state.metrics);
+    let public = metrics.listener_stats("public");
+    let admin_opts = opts.for_admin().with_stats(metrics.listener_stats("admin"));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_stop, rx) = watch::channel(false);
+    tokio::spawn(serve(
+        listener,
+        None,
+        edgeguard::build_admin_router(state),
+        admin_opts,
+        rx,
+    ));
+    // A scrape on the admin listener counts itself while it renders.
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(b"GET /__edgeguard/metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("edgeguard_requests_in_flight{listener=\"admin\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("edgeguard_requests_in_flight{listener=\"public\"} 0\n"),
+        "{text}"
+    );
+    assert_eq!(public.in_flight(), 0);
+}
+
+#[tokio::test]
+async fn a_tls_health_check_that_closes_before_a_client_hello_is_not_a_failed_handshake() {
+    let dir = Dir::new();
+    let (server, connector) = tls(&dir);
+    let up = upstream().await;
+    let edge = edge(cfg(up, "127.0.0.1"), Some(server)).await;
+    let failures = |reason: &str| {
+        tls_counter(
+            &edge.metrics,
+            &format!(
+                "edgeguard_tls_handshake_failures_total{{listener=\"public\",reason=\"{reason}\"}}"
+            ),
+        )
+    };
+    let no_hello = || {
+        tls_counter(
+            &edge.metrics,
+            "edgeguard_tls_no_client_hello_total{listener=\"public\"}",
+        )
+    };
+
+    // An NLB's PROXY protocol health check: the LOCAL header, then close. And a plain TCP check.
+    for preamble in [v2_local(), Vec::new()] {
+        let mut tcp = TcpStream::connect(edge.addr).await.unwrap();
+        tcp.write_all(&preamble).await.unwrap();
+        tcp.shutdown().await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut buf)).await;
+    }
+    // The edge counts in its connection task, after the client sees the close.
+    for _ in 0..50 {
+        if no_hello() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let handshakes = || {
+        tls_counter(
+            &edge.metrics,
+            "edgeguard_tls_handshakes_total{listener=\"public\"}",
+        )
+    };
+    assert_eq!(no_hello(), 2);
+    assert_eq!(failures("other"), 0, "not a failed handshake");
+    assert_eq!(handshakes(), 0, "not a handshake at all");
+
+    // A ClientHello that is cut off is still one.
+    let mut tcp = TcpStream::connect(edge.addr).await.unwrap();
+    tcp.write_all(&v2_local()).await.unwrap();
+    tcp.write_all(b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03")
+        .await
+        .unwrap();
+    tcp.shutdown().await.unwrap();
+    let mut buf = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut buf)).await;
+    for _ in 0..50 {
+        if failures("other") == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(failures("other"), 1);
+    assert_eq!(no_hello(), 2);
+    assert_eq!(handshakes(), 1, "a failed handshake is in the total");
+
+    // And a real client still gets its handshake, after a header or without one.
+    let mut tcp = TcpStream::connect(edge.addr).await.unwrap();
+    tcp.write_all(&v2_local()).await.unwrap();
+    let mut s = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .expect("the handshake follows the header");
+    assert_eq!(request(&mut s, "").await.unwrap().0, 200);
+    assert_eq!(handshakes(), 2);
+    assert_eq!(no_hello(), 2);
+}
+
+/// A PROXY v1 header for a client, 44 bytes, to drip.
+const SLOW_HEADER: &[u8] = b"PROXY TCP4 203.0.113.7 10.0.0.1 51234 443\r\n";
+/// A request head that never ends: dripped until the edge closes the connection.
+const SLOW_HEAD: &[u8] = b"GET /__edgeguard/health HTTP/1.1\r\nHost: edge\r\nX-Slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+/// `bytes` to `w`, one at a time, `gap` apart.
+async fn drip<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8], gap: Duration) {
+    for b in bytes {
+        if w.write_all(std::slice::from_ref(b)).await.is_err() || w.flush().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(gap).await;
+    }
+}
+
+/// Drip `SLOW_HEAD` into `s` until the edge closes it; how long after `start` that was.
+async fn drip_head_until_closed<S>(s: S, start: tokio::time::Instant) -> Duration
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut r, mut w) = tokio::io::split(s);
+    let closed = tokio::spawn(async move {
+        let mut buf = [0u8; 256];
+        while let Ok(n) = r.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+        start.elapsed()
+    });
+    let writer = tokio::spawn(async move {
+        drip(&mut w, SLOW_HEAD, Duration::from_millis(50)).await;
+        w
+    });
+    let elapsed = tokio::time::timeout(Duration::from_secs(10), closed)
+        .await
+        .expect("the edge closed the connection")
+        .unwrap();
+    writer.abort();
+    elapsed
+}
+
+/// One `header_read_timeout` (1 s here) covers the PROXY header and the request head together:
+/// a client dripping both is closed after about 1 s. It used to get the timeout twice, about 2 s.
+fn assert_one_timeout(elapsed: Duration, what: &str) {
+    assert!(
+        elapsed >= Duration::from_millis(800) && elapsed < Duration::from_millis(1600),
+        "{what}: closed after {elapsed:?}, not about 1 s"
+    );
+}
+
+fn slow_cfg(up: SocketAddr) -> Config {
+    let mut c = cfg(up, "127.0.0.1");
+    c.server.header_read_timeout = "1s".into();
+    c
+}
+
+#[tokio::test]
+async fn a_dripped_proxy_header_and_head_get_one_header_read_timeout_on_plain_http() {
+    let up = upstream().await;
+    let edge = edge(slow_cfg(up), None).await;
+    let start = tokio::time::Instant::now();
+    let mut tcp = TcpStream::connect(edge.addr).await.unwrap();
+    // About 0.7 s of the 1 s on the header, then the head.
+    drip(&mut tcp, SLOW_HEADER, Duration::from_millis(16)).await;
+    assert_one_timeout(drip_head_until_closed(tcp, start).await, "public, plain");
+}
+
+#[tokio::test]
+async fn a_dripped_proxy_header_and_head_get_one_header_read_timeout_on_the_admin_listener() {
+    let up = upstream().await;
+    let edge = admin_edge(slow_cfg(up)).await;
+    let start = tokio::time::Instant::now();
+    let mut tcp = TcpStream::connect(edge.addr).await.unwrap();
+    drip(&mut tcp, SLOW_HEADER, Duration::from_millis(16)).await;
+    assert_one_timeout(drip_head_until_closed(tcp, start).await, "admin");
+}
+
+#[tokio::test]
+async fn a_dripped_proxy_header_and_head_get_one_header_read_timeout_on_tls() {
+    let dir = Dir::new();
+    let (server, connector) = tls(&dir);
+    let up = upstream().await;
+    let edge = edge(slow_cfg(up), Some(server)).await;
+    let start = tokio::time::Instant::now();
+    let mut tcp = TcpStream::connect(edge.addr).await.unwrap();
+    drip(&mut tcp, SLOW_HEADER, Duration::from_millis(16)).await;
+    // The handshake has a bound of its own and is not counted; it takes milliseconds here.
+    let s = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .expect("the handshake follows the header");
+    assert_one_timeout(drip_head_until_closed(s, start).await, "public, TLS");
+}
+
+#[tokio::test]
+async fn a_kept_alive_connection_is_not_cut_by_the_first_requests_deadline() {
+    let up = upstream().await;
+    let edge = admin_edge(slow_cfg(up)).await;
+    let mut tcp = TcpStream::connect(edge.addr).await.unwrap();
+    let health = b"GET /__edgeguard/health HTTP/1.1\r\nHost: edge\r\n\r\n";
+    async fn read_ok(tcp: &mut TcpStream) {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 512];
+        while !got.ends_with(b"\r\n\r\nok") {
+            let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf))
+                .await
+                .expect("an answer")
+                .unwrap();
+            assert!(n > 0, "closed: {:?}", String::from_utf8_lossy(&got));
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert!(got.starts_with(b"HTTP/1.1 200"));
+    }
+    tcp.write_all(&[SLOW_HEADER, &health[..]].concat())
+        .await
+        .unwrap();
+    read_ok(&mut tcp).await;
+    // Idle past the first request's deadline (1 s from accept) but within the next request's own.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    tcp.write_all(health).await.unwrap();
+    read_ok(&mut tcp).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    tcp.write_all(health).await.unwrap();
+    read_ok(&mut tcp).await;
+    // A dripped later request still gets its own timeout: about 1 s from when it began.
+    let start = tokio::time::Instant::now();
+    assert_one_timeout(drip_head_until_closed(tcp, start).await, "a later request");
+}
+
+#[tokio::test]
+async fn with_header_read_timeout_off_a_slow_proxy_header_and_head_are_served() {
+    let up = upstream().await;
+    let mut c = cfg(up, "127.0.0.1");
+    c.server.header_read_timeout = "0".into();
+    let edge = admin_edge(c).await;
+    let mut tcp = TcpStream::connect(edge.addr).await.unwrap();
+    drip(&mut tcp, SLOW_HEADER, Duration::from_millis(16)).await;
+    drip(
+        &mut tcp,
+        b"GET /__edgeguard/health HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n",
+        Duration::from_millis(20),
+    )
+    .await;
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), tcp.read_to_end(&mut out))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        out.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
 #[test]
 fn settings_that_would_let_a_client_choose_its_address_fail_startup() {
     let mut c = Config::default();

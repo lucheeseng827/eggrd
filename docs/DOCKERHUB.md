@@ -66,7 +66,7 @@ an identity provider.
 | `0.2.1` | cookie-hardening opt-out (`httponly_cookie_exempt`) for JS-readable / double-submit CSRF cookies |
 | `0.2.0` | per-path upstreams, request IDs, gzip, WebSocket passthrough, IP access lists |
 
-Pin a version in production: `mancube/eggrd:0.5.0`.
+Pin a version in production: `mancube/eggrd:0.7.0`.
 
 > **Upgrading to 0.5.0 turns certificate rotation on.** `[tls] watch`, `[tls.acme] renew` and
 > `self_signed_renew` all default to on, so a running proxy now reloads a certificate replaced on
@@ -106,7 +106,7 @@ Pin a version in production: `mancube/eggrd:0.5.0`.
 ```bash
 docker run -p 8080:8080 \
   -e UPSTREAM=http://app.internal:3000 \
-  mancube/eggrd:0.5.0 --config /etc/edgeguard/edgeguard.toml
+  mancube/eggrd:0.7.0 --config /etc/edgeguard/edgeguard.toml
 ```
 
 Bring your own config (overrides the baked-in default):
@@ -115,7 +115,7 @@ Bring your own config (overrides the baked-in default):
 docker run -p 8080:8080 \
   -e UPSTREAM=http://app.internal:3000 \
   -v "$PWD/edgeguard.toml:/etc/edgeguard/edgeguard.toml:ro" \
-  mancube/eggrd:0.5.0 --config /etc/edgeguard/edgeguard.toml
+  mancube/eggrd:0.7.0 --config /etc/edgeguard/edgeguard.toml
 ```
 
 > ⚠️ The shipped config's `users` value is a **non-working placeholder** — set a real credential before exposing anything (see [Auth](#auth--secrets)).
@@ -123,7 +123,7 @@ docker run -p 8080:8080 \
 **Co-process mode** (EdgeGuard supervises your app as PID 1) needs your app in the same image. Copy the binary into your app's image instead of running this one directly:
 
 ```dockerfile
-COPY --from=mancube/eggrd:0.5.0 /usr/local/bin/edgeguard /usr/local/bin/edgeguard
+COPY --from=mancube/eggrd:0.7.0 /usr/local/bin/edgeguard /usr/local/bin/edgeguard
 ENTRYPOINT ["/usr/local/bin/edgeguard", "--config", "/etc/edgeguard/edgeguard.toml", "--wrap", "node server.js"]
 ```
 
@@ -182,7 +182,7 @@ Use `ADMIN_PORT` to move these onto a private listener and keep them off the pub
 Hash a password with the built-in helper (distroless has no shell — pass `--hash` as an arg, feed the password on stdin):
 
 ```bash
-echo -n 'your-password' | docker run -i --rm mancube/eggrd:0.5.0 --hash
+echo -n 'your-password' | docker run -i --rm mancube/eggrd:0.7.0 --hash
 # paste the $argon2id$... string as the user's value in edgeguard.toml
 ```
 

@@ -39,9 +39,10 @@ pub enum Outcome {
     /// health check. The peer's address stands.
     Local,
     /// A trusted peer sent no header: its address stands. A balancer that should be sending one
-    /// is not.
+    /// is not. Never on a listener where the header is optional (the admin listener).
     Missing,
-    /// An untrusted peer sent no header: an ordinary direct connection.
+    /// An untrusted peer sent no header: an ordinary direct connection. Where the header is
+    /// optional, any peer that sends none.
     Direct,
     /// An untrusted peer sent a header: refused, it would be choosing its own address.
     Untrusted,
@@ -84,9 +85,13 @@ impl Outcome {
 }
 
 /// `server.proxy_protocol`, compiled.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProxyProtocol {
     trusted: Vec<Cidr>,
+    /// Whether a trusted peer is expected to send a header, so one without is `missing`. Off on
+    /// the admin listener, where the balancer's health checks bring one and every other probe or
+    /// scrape comes straight, from addresses that may be trusted too.
+    expect_header: bool,
 }
 
 /// A connection after its header: the client address to serve it as, and the bytes read past the
@@ -119,7 +124,22 @@ impl ProxyProtocol {
                  choose its own address. List the load balancer's addresses."
             );
         }
-        Ok(Some(ProxyProtocol { trusted: cidrs }))
+        Ok(Some(ProxyProtocol {
+            trusted: cidrs,
+            expect_header: true,
+        }))
+    }
+
+    /// The same trust, for a listener where a header is welcome but not expected: a trusted peer
+    /// that sends none is counted as `direct`, not `missing`. The admin listener reads headers
+    /// this way, so a balancer's health check there (an NLB's carries a v2 `LOCAL` header) is
+    /// answered, while kubelet probes and Prometheus scrapes from the same subnets are ordinary
+    /// direct connections and do not fire `EdgeGuardProxyProtocolMissing`.
+    pub fn header_optional(&self) -> ProxyProtocol {
+        ProxyProtocol {
+            expect_header: false,
+            ..self.clone()
+        }
     }
 
     pub fn trusts(&self, peer: IpAddr) -> bool {
@@ -129,12 +149,13 @@ impl ProxyProtocol {
 
     /// Read just enough of `io` to tell whether it starts with a PROXY header, and the header if
     /// it does. Never fails on what the peer sends: a refused or unreadable connection is an
-    /// [`Outcome`] that does not serve. An I/O error is passed up.
+    /// [`Outcome`] that does not serve. An I/O error is passed up, saying whether the peer had
+    /// sent anything before it (a reset straight after connecting has sent nothing).
     pub async fn accept<I: AsyncRead + Unpin>(
         &self,
         io: &mut I,
         peer: SocketAddr,
-    ) -> io::Result<Accepted> {
+    ) -> Result<Accepted, ReadFailed> {
         let trusted = self.trusts(peer.ip());
         let (header, rest) = read_header(io).await?;
         let refuse = |outcome| Accepted {
@@ -144,7 +165,7 @@ impl ProxyProtocol {
         };
         Ok(match header {
             Header::None => Accepted {
-                outcome: if trusted {
+                outcome: if trusted && self.expect_header {
                     Outcome::Missing
                 } else {
                     Outcome::Direct
@@ -168,6 +189,26 @@ impl ProxyProtocol {
     }
 }
 
+/// A read error before a connection's first bytes decided whether it starts with a header.
+#[derive(Debug)]
+pub struct ReadFailed {
+    pub error: io::Error,
+    /// Nothing had been read from the peer: it reset (or failed) before sending a byte.
+    pub nothing_read: bool,
+}
+
+impl std::fmt::Display for ReadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for ReadFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// What a connection started with.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Header {
@@ -183,8 +224,11 @@ pub(crate) enum Header {
 
 /// Read from `io` until its first bytes decide [`Header`]. Returns it with the bytes read past
 /// the header (everything read, when there is none). A peer that closes partway through a header
-/// gave an invalid one; one that closes before deciding anything gave none.
-pub(crate) async fn read_header<I: AsyncRead + Unpin>(io: &mut I) -> io::Result<(Header, Vec<u8>)> {
+/// gave an invalid one; one that closes before deciding anything gave none. A read error says
+/// whether anything had been read before it.
+pub(crate) async fn read_header<I: AsyncRead + Unpin>(
+    io: &mut I,
+) -> Result<(Header, Vec<u8>), ReadFailed> {
     let mut buf = Vec::with_capacity(256);
     let mut chunk = [0u8; 512];
     loop {
@@ -196,7 +240,10 @@ pub(crate) async fn read_header<I: AsyncRead + Unpin>(io: &mut I) -> io::Result<
             Parse::NotProxy => return Ok((Header::None, buf)),
             Parse::Need => {}
         }
-        let n = io.read(&mut chunk).await?;
+        let n = io.read(&mut chunk).await.map_err(|error| ReadFailed {
+            error,
+            nothing_read: buf.is_empty(),
+        })?;
         if n == 0 {
             // Closed before the header was complete; if nothing at all came, there was none.
             let header = if buf.is_empty() {
@@ -456,5 +503,68 @@ mod tests {
         assert!(pp.trusts("10.0.3.4".parse().unwrap()));
         assert!(pp.trusts("::ffff:10.0.3.4".parse().unwrap()));
         assert!(!pp.trusts("10.1.0.1".parse().unwrap()));
+    }
+
+    /// Yields its bytes, then a connection reset.
+    struct ResetAfter(Vec<u8>);
+
+    impl AsyncRead for ResetAfter {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.0.is_empty() {
+                return std::task::Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+            }
+            buf.put_slice(&std::mem::take(&mut this.0));
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_error_says_whether_anything_came_first() {
+        let err = read_header(&mut ResetAfter(Vec::new())).await.unwrap_err();
+        assert!(err.nothing_read, "reset straight after connecting");
+        assert_eq!(err.error.kind(), io::ErrorKind::ConnectionReset);
+        let err = read_header(&mut ResetAfter(V2_SIG[..6].to_vec()))
+            .await
+            .unwrap_err();
+        assert!(!err.nothing_read, "reset inside a header");
+    }
+
+    #[tokio::test]
+    async fn where_the_header_is_optional_a_trusted_peer_without_one_is_direct() {
+        let pp = ProxyProtocol::from_cfg(true, &["10.0.0.0/16".into()])
+            .unwrap()
+            .unwrap();
+        let admin = pp.header_optional();
+        let trusted: SocketAddr = "10.0.3.4:5000".parse().unwrap();
+        let other: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let outcome = |pp: &ProxyProtocol, peer, bytes: &'static [u8]| {
+            let pp = pp.clone();
+            async move {
+                let mut io = bytes;
+                pp.accept(&mut io, peer).await.unwrap().outcome
+            }
+        };
+        let get = b"GET /__edgeguard/ready HTTP/1.1\r\n";
+        assert_eq!(outcome(&pp, trusted, get).await, Outcome::Missing);
+        assert_eq!(outcome(&admin, trusted, get).await, Outcome::Direct);
+        // Everything else is as strict as the public listener.
+        assert_eq!(
+            outcome(&admin, trusted, b"PROXY UNKNOWN\r\nGET / HTTP/1.1\r\n").await,
+            Outcome::Local
+        );
+        assert_eq!(
+            outcome(&admin, other, b"PROXY UNKNOWN\r\nGET / HTTP/1.1\r\n").await,
+            Outcome::Untrusted
+        );
+        assert_eq!(outcome(&admin, other, get).await, Outcome::Direct);
+        assert_eq!(
+            outcome(&admin, trusted, b"PROXY HTTP/1.1\r\n").await,
+            Outcome::Invalid
+        );
     }
 }

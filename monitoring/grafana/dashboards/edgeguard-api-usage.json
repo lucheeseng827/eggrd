@@ -1119,7 +1119,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Failed TLS handshakes by listener and reason: client_cert (refused for its certificate), timeout, other.",
+      "description": "Failed TLS handshakes by listener and reason: client_cert (refused for its certificate), timeout, other. Connections that close before a ClientHello (load balancer TCP and PROXY protocol health checks) are not failures and are not shown here: they are edgeguard_tls_no_client_hello_total (eggrd 0.7.0-rc.2 and later; earlier versions counted them as other).",
       "fieldConfig": {
         "defaults": {
           "color": {

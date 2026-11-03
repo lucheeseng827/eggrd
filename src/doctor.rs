@@ -545,7 +545,8 @@ fn lint_listener(cfg: &Config, f: &mut Vec<Finding>) {
             "server.drain_delay + server.drain_timeout = {}s, at or over Kubernetes' default 30s \
              terminationGracePeriodSeconds: the process is killed before the drain ends and \
              in-flight requests are cut. Raise terminationGracePeriodSeconds above it, or shorten \
-             the drain.",
+             the drain. Once terminationGracePeriodSeconds is raised (as recommended behind an \
+             AWS NLB, with drain_delay 20-30s), this warning is expected and can be ignored.",
             drain.as_secs()
         )));
     }
@@ -570,6 +571,42 @@ fn lint_trusted_header(cfg: &Config, f: &mut Vec<Finding>) {
                  forward_client_cert = \"xfcc\" uses it: a request without a certificate gets the \
                  same access. Require it with auth, or pass it to the app.",
             ));
+        }
+        // The balancer is trusted by its TLS client certificate, which `[tls.client_auth]`
+        // verifies against its CA. Any other certificate from that CA, presented by a client that
+        // connects directly, passes the handshake too, and with `allowed` empty `mtls` takes it as
+        // the principal: it authenticates as itself without the balancer. `allowed` narrows who
+        // may, but not the path: a holder of an allowed certificate from that CA can still skip
+        // the balancer. Only a CA that issues nothing but the balancer's certificate, or a network
+        // that lets only the balancer reach the listener, closes it. Neither is visible here, so:
+        // a warning while any certificate passes, a note once `allowed` narrows it.
+        Ok(Some(_))
+            if !cfg
+                .trusted_client_cert_header
+                .trusted_proxy_names
+                .is_empty()
+                && cfg.auth.mode == "mtls" =>
+        {
+            let path = "Allowed names do not make requests go through the balancer: to require \
+                        it, issue the balancer's certificate from a CA of its own that issues \
+                        nothing else (then this does not apply), or let only the balancer reach \
+                        the listener.";
+            if cfg.auth.mtls.allowed.is_empty() {
+                f.push(Finding::warn(format!(
+                    "[trusted_client_cert_header] trusted_proxy_names with auth.mode = \"mtls\" \
+                     and an empty [auth.mtls] allowed: any other certificate the CA in \
+                     tls.client_auth.ca_path issues authenticates as itself when its holder \
+                     connects directly, not through the balancer. List the client names that may \
+                     call in [auth.mtls] allowed to narrow it. {path}"
+                )));
+            } else {
+                f.push(Finding::info(format!(
+                    "[trusted_client_cert_header] trusted_proxy_names with auth.mode = \"mtls\": \
+                     a certificate from the CA in tls.client_auth.ca_path with a name [auth.mtls] \
+                     allowed lists still authenticates when its holder connects directly, not \
+                     through the balancer. {path}"
+                )));
+            }
         }
         Ok(_) => {}
     }
@@ -614,6 +651,24 @@ fn lint_upstream_tls(cfg: &Config, f: &mut Vec<Finding>) {
                 .iter()
                 .flat_map(|u| u.targets.iter().chain(&u.backup).map(|t| t.url.clone())),
         )
+        // And where an HTTP check of a target that is not `https://` goes over TLS (`scheme`):
+        // it has no settings of its own, so an entry for where the check goes is used. An
+        // `https://` target's check uses the target's settings whatever port it dials.
+        .chain(cfg.upstreams.iter().flat_map(|u| {
+            crate::pool::Pool::from_route(u, "")
+                .ok()
+                .and_then(|p| {
+                    let hc = p.health_check.as_ref()?;
+                    (hc.kind == crate::pool::CheckKind::Http).then(|| {
+                        p.targets
+                            .iter()
+                            .filter(|t| !t.base.starts_with("https://"))
+                            .map(|t| hc.base_for(t))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .unwrap_or_default()
+        }))
         .filter_map(|url| crate::upstream::target_key(&url).ok())
         .collect();
     for t in &cfg.upstream_tls.targets {
@@ -747,13 +802,36 @@ fn is_remote_http(url: &str) -> bool {
     url.scheme() == "http" && !local
 }
 
+/// `server.trust_forwarded_for` and `server.forwarded_hops`: a reminder that the header is
+/// believed, which entry is the client, and a hop count that has no effect.
 fn lint_forwarded(cfg: &Config, f: &mut Vec<Finding>) {
+    let hops = cfg.server.forwarded_hops;
     if cfg.server.trust_forwarded_for {
-        f.push(Finding::info(
-            "server.trust_forwarded_for = true: only correct when EdgeGuard is behind a trusted \
-             proxy/LB that sets X-Forwarded-For. If it's directly reachable, clients can spoof \
-             their IP and defeat per-IP rate limiting.",
-        ));
+        let chain = if hops > 1 {
+            " With a chain, every proxy but the outermost must accept traffic only from the one in \
+             front of it (an ALB behind CloudFront: CloudFront's origin-facing prefix list in its \
+             security group, and a secret origin header): a client that reaches an inner proxy \
+             directly writes the entries the outer one should have."
+        } else {
+            ""
+        };
+        f.push(Finding::info(format!(
+            "server.trust_forwarded_for = true with server.forwarded_hops = {hops}: the client is \
+             the X-Forwarded-For entry {hops} from the right; entries further left are what the \
+             client sent, and are ignored. Set forwarded_hops to the number of entries the proxies \
+             in front of EdgeGuard append (1 for an ALB in its default append mode or \
+             Cloudflare; 2 for a GCP external Application Load Balancer, which appends two, or \
+             CloudFront in front of an ALB): too few takes a proxy's address for every client's, \
+             too many lets a client choose its address. Only correct when nothing but those \
+             proxies can reach EdgeGuard: a client that connects directly writes the whole \
+             header.{chain}"
+        )));
+    } else if hops > 1 {
+        f.push(Finding::warn(format!(
+            "server.forwarded_hops = {hops} without server.trust_forwarded_for: X-Forwarded-For \
+             is not read, so it has no effect. Turn trust_forwarded_for on behind the proxies, or \
+             remove forwarded_hops."
+        )));
     }
 }
 
@@ -1077,6 +1155,80 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_hops_is_named_with_trust_and_flagged_without_it() {
+        let mut cfg = Config::default();
+        let has = |cfg: &Config, level: Level, needle: &str| {
+            lint(cfg)
+                .iter()
+                .any(|f| f.level == level && f.message.contains(needle))
+        };
+        assert!(!has(&cfg, Level::Info, "forwarded_hops"));
+        cfg.server.trust_forwarded_for = true;
+        assert!(has(&cfg, Level::Info, "server.forwarded_hops = 1:"));
+        // One note, not two.
+        assert_eq!(
+            lint(&cfg)
+                .iter()
+                .filter(|f| f.message.contains("trust_forwarded_for"))
+                .count(),
+            1
+        );
+        assert!(!has(&cfg, Level::Info, "every proxy but the outermost"));
+        cfg.server.forwarded_hops = 2;
+        assert!(has(&cfg, Level::Info, "server.forwarded_hops = 2:"));
+        assert!(has(&cfg, Level::Info, "every proxy but the outermost"));
+        assert!(!has(&cfg, Level::Warn, "forwarded_hops"));
+        cfg.server.trust_forwarded_for = false;
+        assert!(has(&cfg, Level::Warn, "without server.trust_forwarded_for"));
+        // Out of range fails the runtime build, which doctor reports as the startup error it is.
+        cfg.server.forwarded_hops = 0;
+        let err = crate::build_runtime(std::sync::Arc::new(cfg.clone()))
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("server.forwarded_hops = 0"));
+        cfg.server.forwarded_hops = 11;
+        assert!(crate::build_runtime(std::sync::Arc::new(cfg)).is_err());
+    }
+
+    #[test]
+    fn a_balancer_trusted_by_name_with_any_certificate_allowed_is_flagged() {
+        let mut cfg = Config::default();
+        cfg.trusted_client_cert_header.name = "X-Forwarded-Client-Cert".into();
+        cfg.trusted_client_cert_header.format = "xfcc".into();
+        cfg.trusted_client_cert_header.trusted_proxy_names =
+            vec!["spiffe://prod.example/ns/ingress/*".into()];
+        cfg.auth.mode = "mtls".into();
+        let found = |cfg: &Config, level: Level| {
+            lint(cfg).iter().any(|f| {
+                f.level == level
+                    && f.message
+                        .contains("trusted_proxy_names with auth.mode = \"mtls\"")
+                    && f.message
+                        .contains("do not make requests go through the balancer")
+            })
+        };
+        assert!(found(&cfg, Level::Warn), "any certificate from the CA");
+        assert!(!found(&cfg, Level::Info));
+        // `allowed` narrows who may call, not the path: still reported, as a note.
+        cfg.auth.mtls.allowed = vec!["spiffe://prod.example/ns/web/*".into()];
+        assert!(!found(&cfg, Level::Warn));
+        assert!(
+            found(&cfg, Level::Info),
+            "allowed does not enforce the path"
+        );
+        cfg.auth.mtls.allowed.clear();
+        cfg.auth.mode = "jwt".into();
+        assert!(!found(&cfg, Level::Warn) && !found(&cfg, Level::Info));
+        cfg.auth.mode = "mtls".into();
+        cfg.trusted_client_cert_header.trusted_proxy_names.clear();
+        cfg.trusted_client_cert_header.trusted_proxies = vec!["10.0.0.0/16".into()];
+        assert!(
+            !found(&cfg, Level::Warn) && !found(&cfg, Level::Info),
+            "trusted by address only"
+        );
+    }
+
+    #[test]
     fn a_collector_client_that_will_not_build_is_an_error() {
         let mut cfg = Config::default();
         cfg.tracing.enabled = true;
@@ -1206,6 +1358,7 @@ mod tests {
                 targets: vec![crate::config::TargetCfg {
                     url: "https://a.internal".into(),
                     weight: None,
+                    check_host: None,
                 }],
                 backup: vec!["https://dr.example.com:8443".into()],
                 ..Default::default()
@@ -1225,6 +1378,51 @@ mod tests {
                 .any(|x| x.message.contains("matches no https:// upstream")),
             "{f:?}"
         );
+    }
+
+    #[test]
+    fn an_upstream_tls_entry_for_where_a_check_goes_over_tls_is_used() {
+        let mut cfg = Config {
+            upstreams: vec![crate::config::UpstreamRoute {
+                path: "/".into(),
+                targets: vec!["http://a.internal:8080".into()],
+                health_check: crate::config::HealthCheckCfg {
+                    path: "/healthz".into(),
+                    port: 9443,
+                    scheme: "https".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        cfg.upstream_tls.targets = vec![crate::config::UpstreamTlsTarget {
+            target: "https://a.internal:9443".into(),
+            ..Default::default()
+        }];
+        let warned = |cfg: &Config| {
+            lint(cfg)
+                .iter()
+                .any(|x| x.message.contains("matches no https:// upstream"))
+        };
+        assert!(!warned(&cfg), "the check dials it over TLS");
+        cfg.upstreams[0].health_check.scheme.clear();
+        assert!(warned(&cfg), "over plain http, nothing uses it");
+        // Nor does a TCP check, which speaks no TLS, even to an https:// target's port.
+        cfg.upstreams[0].targets = vec!["https://a.internal:8443".into()];
+        cfg.upstreams[0].health_check = crate::config::HealthCheckCfg {
+            kind: "tcp".into(),
+            port: 9443,
+            ..Default::default()
+        };
+        assert!(warned(&cfg), "a TCP check does not use it");
+        // Nor an HTTPS check of an https:// target on another port: it uses the target's entry.
+        cfg.upstreams[0].health_check = crate::config::HealthCheckCfg {
+            path: "/healthz".into(),
+            port: 9443,
+            ..Default::default()
+        };
+        assert!(warned(&cfg), "the check uses the target's own settings");
     }
 
     #[test]

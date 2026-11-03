@@ -56,6 +56,9 @@ pub struct Target {
     /// holds. The same on every edge, so any of them reads another's cookie.
     pub id: u64,
     pub health: Arc<TargetHealth>,
+    /// `check_host`: where its health check goes instead of the URL's host, as a URL writes it (an
+    /// IPv6 address in brackets).
+    pub check_host: Option<String>,
 }
 
 /// `balance`: how a pool picks among its targets in rotation.
@@ -212,6 +215,8 @@ pub struct HealthCheck {
     pub header_names: Vec<String>,
     /// `port`: the port each target is checked on, when not its own.
     pub port: Option<u16>,
+    /// `scheme`: `"http"` or `"https"`, when not the target's own.
+    pub scheme: Option<&'static str>,
 }
 
 /// What a check's body must hold.
@@ -237,24 +242,46 @@ const CHECK_HEADERS_REFUSED: [&str; 9] = [
 ];
 
 impl HealthCheck {
-    /// What each check does, for the logs: `"GET /healthz"`, `"HEAD /"`, `"tcp"`, and on another
-    /// port `"GET :8081/healthz"` or `"tcp :8081"`.
+    /// What each check does, for the logs: `"GET /healthz"`, `"HEAD /"`, `"tcp"`; on another port
+    /// `"GET :8081/healthz"` or `"tcp :8081"`; over another scheme `"GET :8081/healthz over http"`.
     pub fn label(&self) -> String {
         let port = self.port.map(|p| format!(":{p}")).unwrap_or_default();
+        let over = self
+            .scheme
+            .map(|s| format!(" over {s}"))
+            .unwrap_or_default();
         match self.kind {
-            CheckKind::Http => format!("{} {port}{}", self.method, self.path),
+            CheckKind::Http => format!("{} {port}{}{over}", self.method, self.path),
             CheckKind::Tcp if port.is_empty() => "tcp".into(),
             CheckKind::Tcp => format!("tcp {port}"),
         }
     }
 
-    /// The base URL `target` is checked at: its own, or with `port`, the same on that port.
-    fn base_for(&self, target: &Target) -> String {
-        match self.port {
-            // `check_url` let the base in only with a scheme and a host, which is all this needs.
-            Some(port) => on_port(&target.base, port).unwrap_or_else(|_| target.base.to_string()),
-            None => target.base.to_string(),
+    /// The `Host` a check of `target` at `base` sends: with a `check_host`, the target's own name
+    /// with the check's port, as a check on another port alone sends it, so a server that routes
+    /// by name answers as for the target. `None` otherwise (the URL's), and `headers` may still
+    /// name one.
+    fn host_header_for(&self, target: &Target, base: &str) -> Option<HeaderValue> {
+        target.check_host.as_ref()?;
+        let own: Uri = target.base.parse().ok()?;
+        let port = base.parse::<Uri>().ok()?.port_u16()?;
+        HeaderValue::from_str(&format!("{}:{port}", own.host()?)).ok()
+    }
+
+    /// The base URL `target` is checked at: its own, or with `port`, `scheme` and the target's
+    /// `check_host`, the same path on that host and port, over that scheme.
+    pub(crate) fn base_for(&self, target: &Target) -> String {
+        if self.port.is_none() && self.scheme.is_none() && target.check_host.is_none() {
+            return target.base.to_string();
         }
+        // `check_url` let the base in only with a scheme and a host, which is all this needs.
+        rebase(
+            &target.base,
+            self.scheme,
+            self.port,
+            target.check_host.as_deref(),
+        )
+        .unwrap_or_else(|_| target.base.to_string())
     }
 
     /// Whether a check answered `status` passes.
@@ -437,11 +464,12 @@ impl Pool {
             );
             check_url(&cfg.target)
                 .with_context(|| format!("upstreams[].target (path {path:?})"))?;
+            // Any check setting at all, even one that alone checks nothing (`expect_status`,
+            // `interval`): refused here rather than ignored, since a single target keeps no
+            // health.
+            let checks = cfg.health_check != crate::config::HealthCheckCfg::default();
             let pool_only = [
-                (
-                    "health_check",
-                    !cfg.health_check.path.is_empty() || cfg.health_check.kind == "tcp",
-                ),
+                ("health_check", checks),
                 ("backup", !cfg.backup.is_empty()),
                 ("balance", cfg.balance != "priority"),
                 ("eject_after_5xx", cfg.eject_after_5xx != 0),
@@ -560,6 +588,11 @@ impl Pool {
                 );
                 t.weight = weight;
             }
+            if let Some(host) = &entry.check_host {
+                t.check_host = Some(parse_check_host(host).with_context(|| {
+                    format!("upstreams[] (path {path:?}) {} check_host", t.label)
+                })?);
+            }
             targets.push(t);
         }
         let duration = |name: &str, value: &str| -> Result<Duration> {
@@ -586,6 +619,7 @@ impl Pool {
             ("expect_body_regex", !hc.expect_body_regex.is_empty()),
             ("method", hc.method.trim() != "GET"),
             ("headers", !hc.headers.is_empty()),
+            ("scheme", !hc.scheme.is_empty()),
         ];
         if kind == CheckKind::Tcp {
             // A TCP check sends nothing and reads nothing: these would be ignored.
@@ -646,6 +680,15 @@ impl Pool {
                 headers: check_headers(hc)
                     .with_context(|| format!("upstreams[] (path {path:?})"))?,
                 port: (hc.port != 0).then_some(hc.port),
+                scheme: match hc.scheme.trim() {
+                    "" => None,
+                    "http" => Some("http"),
+                    "https" => Some("https"),
+                    other => anyhow::bail!(
+                        "upstreams[] (path {path:?}) health_check.scheme = {other:?}: expected \
+                         \"http\" or \"https\""
+                    ),
+                },
                 header_names: {
                     let mut names: Vec<String> = hc
                         .headers
@@ -658,6 +701,14 @@ impl Pool {
                 },
             })
         };
+        if let Some(t) = targets.iter().find(|t| t.check_host.is_some()) {
+            anyhow::ensure!(
+                health_check.is_some(),
+                "upstreams[] (path {path:?}) gives {} a check_host, but the pool has no active \
+                 health check: set health_check.path, or type = \"tcp\"",
+                t.label
+            );
+        }
         let (eject_for, eject_for_max) = if cfg.eject_after == 0 && cfg.eject_after_5xx == 0 {
             (Duration::ZERO, Duration::ZERO)
         } else {
@@ -980,6 +1031,9 @@ impl Pool {
                 let h = &t.health;
                 j["backup"] = json!(t.backup);
                 j["weight"] = json!(t.weight);
+                if let Some(host) = &t.check_host {
+                    j["check_host"] = json!(host);
+                }
                 if self.sticky.is_some() {
                     j["sticky_cookie_value"] = json!(format!("{:016x}", t.id));
                 }
@@ -1045,6 +1099,7 @@ impl Pool {
                 "healthy_after": hc.healthy_after,
                 "unhealthy_after": hc.unhealthy_after,
                 "port": hc.port,
+                "scheme": hc.scheme,
                 "method": hc.method.as_str(),
                 // Names only: a value may be a token.
                 "headers": hc.header_names,
@@ -1087,6 +1142,7 @@ fn target(url: &str, backup: bool) -> Target {
         backup,
         weight: 1,
         health: Arc::default(),
+        check_host: None,
     }
 }
 
@@ -1499,16 +1555,21 @@ pub fn spawn_health_checks(
                 for target in &pool.targets {
                     match target.health.claim_check(now, hc.interval) {
                         Ok(()) => {
-                            // On another port, TLS is still the target's: the shared client
-                            // would look it up by the port it dials and get the defaults.
-                            let client = match hc.port {
-                                Some(_) if target.base.starts_with("https://") => {
-                                    hyper_util::client::legacy::Client::builder(
-                                        hyper_util::rt::TokioExecutor::new(),
-                                    )
-                                    .build(connector.with_tls_of(&target.base))
-                                }
-                                _ => client.clone(),
+                            // On another port or host, TLS is still the target's: the shared
+                            // client would look it up by the address it dials and get the
+                            // defaults. A target that is not `https://` has no TLS settings of
+                            // its own, so a check over https to it takes those of where it dials.
+                            let checked_at = hc.base_for(target);
+                            let client = if checked_at != *target.base
+                                && target.base.starts_with("https://")
+                                && checked_at.starts_with("https://")
+                            {
+                                hyper_util::client::legacy::Client::builder(
+                                    hyper_util::rt::TokioExecutor::new(),
+                                )
+                                .build(connector.with_tls_of(&target.base))
+                            } else {
+                                client.clone()
                             };
                             tokio::spawn(check(
                                 client,
@@ -1559,9 +1620,10 @@ async fn check(
         CheckKind::Http => format!("{at}{}", hc.path),
         CheckKind::Tcp => format!("tcp {at}"),
     };
+    let host = hc.host_header_for(&target, &base);
     let checking = async {
         match hc.kind {
-            CheckKind::Http => check_http(&client, &base, &hc).await,
+            CheckKind::Http => check_http(&client, &base, host, &hc).await,
             CheckKind::Tcp => check_tcp(&base).await,
         }
     };
@@ -1600,6 +1662,7 @@ async fn check(
 async fn check_http(
     client: &crate::proxy::UpstreamClient,
     base: &str,
+    host: Option<HeaderValue>,
     hc: &HealthCheck,
 ) -> Result<String, String> {
     use http_body_util::BodyExt;
@@ -1609,6 +1672,9 @@ async fn check_http(
         .body(Body::empty())
         .map_err(|e| format!("not a valid URL: {e}"))?;
     *req.headers_mut() = hc.headers.clone();
+    if let Some(host) = host {
+        req.headers_mut().entry(header::HOST).or_insert(host);
+    }
     let resp = client
         .request(req)
         .await
@@ -1669,18 +1735,64 @@ async fn check_tcp(base: &str) -> Result<String, String> {
         .map_err(|e| format!("connecting: {e}"))
 }
 
-/// `base` on `port`: its scheme, credentials, host and path kept, its port replaced.
-fn on_port(base: &str, port: u16) -> Result<String, String> {
+/// `base` with its scheme, port and host replaced where given, credentials and path kept. The
+/// port is always written out: a URL that relied on its scheme's default keeps that port when the
+/// scheme changes (`https://a` over http is `http://a:443`).
+fn rebase(
+    base: &str,
+    scheme: Option<&str>,
+    port: Option<u16>,
+    host: Option<&str>,
+) -> Result<String, String> {
     let uri: Uri = base.parse().map_err(|e| format!("not a valid URL: {e}"))?;
-    let scheme = uri.scheme_str().ok_or("no scheme")?;
+    let own = uri.scheme_str().ok_or("no scheme")?;
     let authority = uri.authority().ok_or("no host")?.as_str();
     let userinfo = authority
         .rsplit_once('@')
         .map(|(user, _)| format!("{user}@"))
         .unwrap_or_default();
-    let host = uri.host().ok_or("no host")?;
+    let host = match host {
+        Some(host) => host,
+        None => uri.host().ok_or("no host")?,
+    };
+    let port = port
+        .or(uri.port_u16())
+        .unwrap_or(if own == "https" { 443 } else { 80 });
+    let scheme = scheme.unwrap_or(own);
     let path = uri.path().trim_end_matches('/');
     Ok(format!("{scheme}://{userinfo}{host}:{port}{path}"))
+}
+
+/// `check_host` as a URL writes it: a host name or IP address, an IPv6 one put in brackets.
+/// Anything else (a scheme, a port, a path, credentials) is refused, as are the pool's `port` and
+/// `scheme`'s jobs.
+fn parse_check_host(raw: &str) -> Result<String> {
+    let host = raw.trim();
+    let bracketed = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+    let v6 = bracketed.unwrap_or(host);
+    if v6.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Ok(format!("[{v6}]"));
+    }
+    // An IPv4 address, or a DNS name: dot-separated labels of letters, digits, `-` and `_`, none
+    // empty, over 63 bytes, or starting or ending with `-`. A name a resolver could look up.
+    let name = |h: &str| {
+        h.len() <= 253
+            && h.strip_suffix('.').unwrap_or(h).split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+    };
+    anyhow::ensure!(
+        bracketed.is_none() && (host.parse::<std::net::Ipv4Addr>().is_ok() || name(host)),
+        "{raw:?} is not a host name or IP address (a port or scheme goes in health_check.port or \
+         health_check.scheme; an IPv6 zone such as %eth0 is not supported)"
+    );
+    Ok(host.to_string())
 }
 
 /// The host and port a base URL names, the port from its scheme when it gives none.
@@ -1947,6 +2059,7 @@ mod tests {
                 .map(|(url, weight)| crate::config::TargetCfg {
                     url: url.to_string(),
                     weight: *weight,
+                    check_host: None,
                 })
                 .collect(),
             ..Default::default()
@@ -2029,6 +2142,7 @@ mod tests {
         cfg.backup = vec![crate::config::TargetCfg {
             url: "http://x:1".into(),
             weight: Some(0),
+            check_host: None,
         }];
         assert!(err(cfg).contains("weight 0"));
     }
@@ -2468,6 +2582,7 @@ mod tests {
             headers: HeaderMap::new(),
             header_names: Vec::new(),
             port: None,
+            scheme: None,
         };
         let h = TargetHealth::default();
         assert_eq!(h.checked(false, &hc), None);
@@ -2554,6 +2669,7 @@ mod tests {
                 .map(|(url, w)| crate::config::TargetCfg {
                     url: url.to_string(),
                     weight: Some(*w),
+                    check_host: None,
                 })
                 .collect(),
             ..route(&[])
@@ -3139,26 +3255,304 @@ mod tests {
     }
 
     #[test]
+    fn a_target_can_be_checked_at_another_host() {
+        for (raw, want) in [
+            ("10.0.9.5", "10.0.9.5"),
+            (" mgmt.internal ", "mgmt.internal"),
+            ("::1", "[::1]"),
+            ("[fd00::5]", "[fd00::5]"),
+        ] {
+            assert_eq!(parse_check_host(raw).unwrap(), want, "{raw}");
+        }
+        for bad in [
+            "",
+            " ",
+            "a:8081",
+            "http://a",
+            "a/healthz",
+            "u@a",
+            "a b",
+            "[::1]:80",
+            "*",
+            "a;b",
+            "a,b",
+            ".",
+            "-",
+            "a$b",
+            "-a.b",
+            "a..b",
+            "[mgmt.internal]",
+            "[1.2.3.4]",
+        ] {
+            assert!(parse_check_host(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            parse_check_host("mgmt.internal.").unwrap(),
+            "mgmt.internal."
+        );
+        assert_eq!(parse_check_host("_svc.internal").unwrap(), "_svc.internal");
+        let e = format!("{:#}", parse_check_host("fe80::1%eth0").unwrap_err());
+        assert!(e.contains("zone"), "{e}");
+        assert_eq!(
+            rebase(
+                "https://u:pw@app.internal:8443/v1",
+                None,
+                Some(9443),
+                Some("10.0.9.5")
+            )
+            .unwrap(),
+            "https://u:pw@10.0.9.5:9443/v1"
+        );
+        assert_eq!(
+            rebase("http://a:8080", None, None, Some("[::1]")).unwrap(),
+            "http://[::1]:8080",
+            "its own port"
+        );
+
+        // The table form takes it; a misspelling is still refused.
+        let cfg: crate::config::Config = toml::from_str(
+            "[[upstreams]]\npath = \"/\"\ntargets = [{ url = \"https://app.internal:8443\", \
+             check_host = \"10.0.9.5\" }, \"https://b.internal:8443\"]\n\
+             [upstreams.health_check]\npath = \"/healthz\"\nport = 9443\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.upstreams[0].targets[0].check_host.as_deref(),
+            Some("10.0.9.5")
+        );
+        assert!(toml::from_str::<crate::config::Config>(
+            "[[upstreams]]\npath = \"/\"\ntargets = [{ url = \"http://a:1\", checkhost = \"b\" }]\n"
+        )
+        .is_err());
+        let pool = Pool::from_route(&cfg.upstreams[0], "app").unwrap();
+        let hc = pool.health_check.as_ref().unwrap();
+        assert_eq!(hc.base_for(&pool.targets[0]), "https://10.0.9.5:9443");
+        assert_eq!(
+            hc.base_for(&pool.targets[1]),
+            "https://b.internal:9443",
+            "only its own"
+        );
+        // It sends the target's own name, with the check's port; the other target, its URL's.
+        assert_eq!(
+            hc.host_header_for(&pool.targets[0], &hc.base_for(&pool.targets[0]))
+                .unwrap(),
+            "app.internal:9443"
+        );
+        assert!(hc
+            .host_header_for(&pool.targets[1], &hc.base_for(&pool.targets[1]))
+            .is_none());
+        // An IPv6 target's name keeps its brackets, as a Host header needs.
+        let v6: crate::config::Config = toml::from_str(
+            "[[upstreams]]\npath = \"/\"\ntargets = [{ url = \"http://[fd00::1]:8080\", \
+             check_host = \"10.0.9.5\" }]\n[upstreams.health_check]\npath = \"/healthz\"\n\
+             port = 8081\n",
+        )
+        .unwrap();
+        let v6 = Pool::from_route(&v6.upstreams[0], "app").unwrap();
+        let v6c = v6.health_check.as_ref().unwrap();
+        assert_eq!(
+            v6c.host_header_for(&v6.targets[0], &v6c.base_for(&v6.targets[0]))
+                .unwrap(),
+            "[fd00::1]:8081"
+        );
+        let j = pool.status_json(None, |_| serde_json::json!({}));
+        assert_eq!(j["targets"][0]["check_host"], "10.0.9.5");
+        assert!(j["targets"][1].get("check_host").is_none());
+
+        // A TCP check goes there too.
+        let mut tcp = cfg.upstreams[0].clone();
+        tcp.health_check = HealthCheckCfg {
+            kind: "tcp".into(),
+            ..Default::default()
+        };
+        let pool = Pool::from_route(&tcp, "app").unwrap();
+        assert_eq!(
+            pool.health_check
+                .as_ref()
+                .unwrap()
+                .base_for(&pool.targets[0]),
+            "https://10.0.9.5:8443"
+        );
+        // Without an active check it would do nothing, and a bad one says which target.
+        let mut none = cfg.upstreams[0].clone();
+        none.health_check = HealthCheckCfg::default();
+        let e = format!("{:#}", Pool::from_route(&none, "app").unwrap_err());
+        assert!(e.contains("no active health check"), "{e}");
+        let mut bad = cfg.upstreams[0].clone();
+        bad.targets[0].check_host = Some("10.0.9.5:9443".into());
+        let e = format!("{:#}", Pool::from_route(&bad, "app").unwrap_err());
+        assert!(
+            e.contains("https://app.internal:8443 check_host") && e.contains("health_check.port"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_check_can_go_over_another_scheme() {
+        // The port a URL left to its scheme stays when the scheme changes.
+        assert_eq!(
+            rebase("https://a", Some("http"), None, None).unwrap(),
+            "http://a:443"
+        );
+        assert_eq!(
+            rebase("https://u:pw@a:8443/v1", Some("http"), Some(8081), None).unwrap(),
+            "http://u:pw@a:8081/v1"
+        );
+        assert_eq!(
+            rebase("http://a:8080", Some("https"), Some(9443), None).unwrap(),
+            "https://a:9443"
+        );
+        assert_eq!(rebase("http://a", None, None, None).unwrap(), "http://a:80");
+        let with = |hc: HealthCheckCfg| UpstreamRoute {
+            health_check: HealthCheckCfg {
+                path: "/healthz".into(),
+                ..hc
+            },
+            ..route(&["https://a:8443", "http://b:8080"])
+        };
+        let pool = Pool::from_route(
+            &with(HealthCheckCfg {
+                port: 8081,
+                scheme: "http".into(),
+                ..Default::default()
+            }),
+            "api",
+        )
+        .unwrap();
+        let hc = pool.health_check.as_ref().unwrap();
+        assert_eq!(hc.label(), "GET :8081/healthz over http");
+        assert_eq!(hc.base_for(&pool.targets[0]), "http://a:8081");
+        assert_eq!(hc.base_for(&pool.targets[1]), "http://b:8081");
+        let j = pool.status_json(None, |_| serde_json::json!({}));
+        assert_eq!(j["health_check"]["scheme"], "http");
+        // Without a port, the target's own port, over the other scheme.
+        let pool = Pool::from_route(
+            &with(HealthCheckCfg {
+                scheme: " https ".into(),
+                ..Default::default()
+            }),
+            "api",
+        )
+        .unwrap();
+        let hc = pool.health_check.as_ref().unwrap();
+        assert_eq!(hc.base_for(&pool.targets[1]), "https://b:8080");
+        assert_eq!(hc.base_for(&pool.targets[0]), "https://a:8443");
+        // Unset, nothing changes, and the status says so.
+        let plain = Pool::from_route(&with(HealthCheckCfg::default()), "api").unwrap();
+        let hc = plain.health_check.as_ref().unwrap();
+        assert_eq!(hc.base_for(&plain.targets[0]), "https://a:8443");
+        assert!(
+            plain.status_json(None, |_| serde_json::json!({}))["health_check"]["scheme"].is_null()
+        );
+        let e = err(with(HealthCheckCfg {
+            scheme: "ftp".into(),
+            ..Default::default()
+        }));
+        assert!(
+            e.contains("health_check.scheme = \"ftp\": expected \"http\" or \"https\""),
+            "{e}"
+        );
+        // A TCP check speaks no scheme; without a path there is no check to send.
+        let e = err(UpstreamRoute {
+            health_check: HealthCheckCfg {
+                kind: "tcp".into(),
+                scheme: "http".into(),
+                ..Default::default()
+            },
+            ..route(&["http://a:1"])
+        });
+        assert!(
+            e.contains("health_check.scheme does nothing with type = \"tcp\""),
+            "{e}"
+        );
+        let e = err(UpstreamRoute {
+            health_check: HealthCheckCfg {
+                scheme: "http".into(),
+                ..Default::default()
+            },
+            ..route(&["http://a:1"])
+        });
+        assert!(
+            e.contains("health_check.scheme needs health_check.path"),
+            "{e}"
+        );
+        // On a single target, which keeps no health, any check setting is refused, not ignored.
+        let single = |hc: HealthCheckCfg| {
+            err(UpstreamRoute {
+                target: "https://a:8443".into(),
+                health_check: hc,
+                ..route(&[])
+            })
+        };
+        for hc in [
+            HealthCheckCfg {
+                scheme: "http".into(),
+                ..Default::default()
+            },
+            HealthCheckCfg {
+                port: 8081,
+                ..Default::default()
+            },
+            HealthCheckCfg {
+                method: "HEAD".into(),
+                ..Default::default()
+            },
+            HealthCheckCfg {
+                headers: vec![("Host".into(), "a".into())],
+                ..Default::default()
+            },
+            HealthCheckCfg {
+                expect_body_regex: "ok".into(),
+                ..Default::default()
+            },
+            // Settings that alone check nothing are refused too: they were meant for a pool.
+            HealthCheckCfg {
+                expect_status: "2xx".into(),
+                ..Default::default()
+            },
+            HealthCheckCfg {
+                interval: "10s".into(),
+                ..Default::default()
+            },
+            HealthCheckCfg {
+                unhealthy_after: 5,
+                ..Default::default()
+            },
+        ] {
+            let e = single(hc);
+            assert!(e.contains("health_check needs a pool"), "{e}");
+        }
+        assert!(Pool::from_route(
+            &UpstreamRoute {
+                target: "https://a:8443".into(),
+                ..route(&[])
+            },
+            "api"
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn a_check_can_use_another_port_of_each_target() {
         assert_eq!(
-            on_port("http://a.internal:8080", 8081).unwrap(),
+            rebase("http://a.internal:8080", None, Some(8081), None).unwrap(),
             "http://a.internal:8081"
         );
         assert_eq!(
-            on_port("https://a.internal", 9443).unwrap(),
+            rebase("https://a.internal", None, Some(9443), None).unwrap(),
             "https://a.internal:9443"
         );
         assert_eq!(
-            on_port("http://a:8080/v1", 8081).unwrap(),
+            rebase("http://a:8080/v1", None, Some(8081), None).unwrap(),
             "http://a:8081/v1",
             "path kept"
         );
         assert_eq!(
-            on_port("http://[::1]:8080", 8081).unwrap(),
+            rebase("http://[::1]:8080", None, Some(8081), None).unwrap(),
             "http://[::1]:8081"
         );
         assert_eq!(
-            on_port("http://u:pw@a:8080", 8081).unwrap(),
+            rebase("http://u:pw@a:8080", None, Some(8081), None).unwrap(),
             "http://u:pw@a:8081",
             "credentials kept"
         );

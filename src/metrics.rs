@@ -329,6 +329,9 @@ pub struct Metrics {
     /// `edgeguard_client_cert_header_total`, by [`HeaderResult::ALL`](crate::client_cert_header::HeaderResult::ALL)
     /// order; rendered only when `[trusted_client_cert_header]` is on.
     client_cert_header: [AtomicU64; 4],
+    /// `edgeguard_forwarded_for_total`, by [`ForwardedFor::ALL`](crate::proxy::ForwardedFor::ALL)
+    /// order; counted, and rendered, only with `server.trust_forwarded_for`.
+    forwarded_for: [AtomicU64; 4],
     /// The header's settings, when it is on: its `ca_path` CAs and CRLs join the certificate series.
     trusted_header: std::sync::OnceLock<std::sync::Arc<crate::client_cert_header::TrustedHeader>>,
     /// The hot-swapped runtime, for the upstream pool series ([`Metrics::watch_runtime`]).
@@ -454,6 +457,7 @@ impl Default for Metrics {
             client_auth: std::sync::OnceLock::new(),
             client_certs: std::sync::atomic::AtomicBool::new(false),
             client_cert_header: std::array::from_fn(|_| AtomicU64::new(0)),
+            forwarded_for: std::array::from_fn(|_| AtomicU64::new(0)),
             trusted_header: std::sync::OnceLock::new(),
             runtime: std::sync::OnceLock::new(),
             listeners: Mutex::new(Vec::new()),
@@ -708,6 +712,14 @@ impl Metrics {
         let all = crate::client_cert_header::HeaderResult::ALL;
         if let Some(i) = all.iter().position(|r| *r == result) {
             self.client_cert_header[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count how one request's `X-Forwarded-For` was read (with `trust_forwarded_for` on).
+    pub fn record_forwarded_for(&self, result: crate::proxy::ForwardedFor) {
+        let all = crate::proxy::ForwardedFor::ALL;
+        if let Some(i) = all.iter().position(|r| *r == result) {
+            self.forwarded_for[i].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1170,6 +1182,21 @@ impl Metrics {
                     stats.rejected()
                 ));
             }
+            // Requests, not connections: one HTTP/2 connection can carry many, and an idle
+            // keep-alive connection none. Counted until hyper has taken the end of the response
+            // body, so a long stream holds its count. A scrape on the listener it reads counts
+            // itself.
+            out.push_str(
+                "# HELP edgeguard_requests_in_flight Requests still being answered, from the \
+                 request head until the end of the response body, by listener.\n\
+                 # TYPE edgeguard_requests_in_flight gauge\n",
+            );
+            for (name, stats) in &listeners {
+                out.push_str(&format!(
+                    "edgeguard_requests_in_flight{{listener=\"{name}\"}} {}\n",
+                    stats.in_flight()
+                ));
+            }
             // Only listeners with a cap, so `open / max` is defined wherever `max` exists.
             let capped: Vec<_> = listeners.iter().filter(|(_, s)| s.max() > 0).collect();
             if !capped.is_empty() {
@@ -1189,12 +1216,27 @@ impl Metrics {
             // clients refused for their certificate never reach the request log.
             let tls: Vec<_> = listeners.iter().filter(|(_, s)| s.is_tls()).collect();
             if !tls.is_empty() {
+                // Every handshake that ended, failures included, so the failure ratio is
+                // failures / handshakes.
+                out.push_str(
+                    "# HELP edgeguard_tls_handshakes_total TLS handshakes that ended, successful \
+                     or not, by listener. Failures are also in \
+                     edgeguard_tls_handshake_failures_total. A connection that closed before \
+                     its ClientHello is not a handshake (edgeguard_tls_no_client_hello_total).\n\
+                     # TYPE edgeguard_tls_handshakes_total counter\n",
+                );
+                for (name, stats) in &tls {
+                    out.push_str(&format!(
+                        "edgeguard_tls_handshakes_total{{listener=\"{name}\"}} {}\n",
+                        stats.tls_handshakes()
+                    ));
+                }
                 out.push_str(
                     "# HELP edgeguard_tls_handshake_failures_total Failed TLS handshakes, by \
                      listener and reason (client_cert = refused for its client certificate).\n\
                      # TYPE edgeguard_tls_handshake_failures_total counter\n",
                 );
-                for (name, stats) in tls {
+                for (name, stats) in &tls {
                     for (reason, v) in crate::serve::TLS_FAILURE_REASONS
                         .iter()
                         .zip(stats.tls_failures())
@@ -1203,6 +1245,21 @@ impl Metrics {
                             "edgeguard_tls_handshake_failures_total{{listener=\"{name}\",reason=\"{reason}\"}} {v}\n"
                         ));
                     }
+                }
+                // Not failures: no handshake was attempted. A load balancer's TCP or PROXY
+                // `LOCAL` health checks land here, a few a second behind an NLB.
+                out.push_str(
+                    "# HELP edgeguard_tls_no_client_hello_total Connections to a TLS listener \
+                     that closed before sending a ClientHello (TCP and PROXY protocol health \
+                     checks, scans), by listener. Not handshakes: in neither \
+                     edgeguard_tls_handshakes_total nor edgeguard_tls_handshake_failures_total.\n\
+                     # TYPE edgeguard_tls_no_client_hello_total counter\n",
+                );
+                for (name, stats) in &tls {
+                    out.push_str(&format!(
+                        "edgeguard_tls_no_client_hello_total{{listener=\"{name}\"}} {}\n",
+                        stats.no_client_hello()
+                    ));
                 }
             }
             // Listeners with `server.proxy_protocol` only. `untrusted` climbing means a balancer
@@ -1496,6 +1553,30 @@ impl Metrics {
                     "edgeguard_client_cert_header_total{{result=\"{}\"}} {}\n",
                     result.label(),
                     self.client_cert_header[i].load(Ordering::Relaxed)
+                ));
+            }
+        }
+
+        // With `trust_forwarded_for` (in the current runtime), or once anything was counted, so a
+        // reload that turns it off does not hide what was seen.
+        let trusts_xff = self
+            .runtime
+            .get()
+            .is_some_and(|rt| rt.load().cfg.server.trust_forwarded_for);
+        let counts: [u64; 4] =
+            std::array::from_fn(|i| self.forwarded_for[i].load(Ordering::Relaxed));
+        if trusts_xff || counts.iter().any(|c| *c > 0) {
+            out.push_str(
+                "# HELP edgeguard_forwarded_for_total Requests by how X-Forwarded-For named the \
+                 client, with server.trust_forwarded_for: used (the entry server.forwarded_hops \
+                 from the right), or the TCP peer instead: absent, short (fewer entries than \
+                 forwarded_hops), invalid (the entry is not an address).\n\
+                 # TYPE edgeguard_forwarded_for_total counter\n",
+            );
+            for (result, v) in crate::proxy::ForwardedFor::ALL.iter().zip(counts) {
+                out.push_str(&format!(
+                    "edgeguard_forwarded_for_total{{result=\"{}\"}} {v}\n",
+                    result.label()
                 ));
             }
         }
@@ -1798,6 +1879,18 @@ mod tests {
         assert!(
             text.contains("edgeguard_connections_rejected_total{listener=\"public\"} 0"),
             "{text}"
+        );
+        assert!(
+            text.contains("# TYPE edgeguard_requests_in_flight gauge"),
+            "{text}"
+        );
+        assert!(
+            text.contains("edgeguard_requests_in_flight{listener=\"admin\"} 0"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("edgeguard_tls_handshakes_total"),
+            "only for TLS listeners: {text}"
         );
     }
 

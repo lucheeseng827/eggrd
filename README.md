@@ -35,7 +35,7 @@ hardening) in a single static binary.
 ```bash
 cargo install eggrd && edgeguard init && edgeguard doctor
 # or
-docker run -p 8080:8080 mancube/eggrd:0.5.0
+docker run -p 8080:8080 mancube/eggrd:0.7.0
 ```
 
 ## Status
@@ -598,7 +598,8 @@ edge DLP, compiled in only with `--features ner`).
 
 **Request:** client-IP resolution (the client a trusted balancer's PROXY protocol header names,
 with `server.proxy_protocol`; `X-Forwarded-For` only when `server.trust_forwarded_for = true`,
-disabled by default so clients cannot spoof their IP) → IP access control (`[access]`, allow-all by default) → header-size limit →
+disabled by default so clients cannot spoof their IP, and then the entry the trusted proxy appended,
+`server.forwarded_hops` from the right) → IP access control (`[access]`, allow-all by default) → header-size limit →
 pooled-quota hard-stop (managed mode only, when `control_plane.enforce_quota` is on —
 `429` + `Retry-After`) → rate-limit (per-IP / per-route) → CORS preflight
 (answered before auth, when `[cors]` is on) → auth → per-key
@@ -1215,7 +1216,9 @@ The client it names is the address rate limits, `[access]`, the access log and t
 
 The header is believed only from `proxy_protocol_trusted`. From any other peer, a connection that
 starts with one is closed, since its client would be choosing its own address. One that does not is
-served as it is, so in-cluster callers and probes keep working.
+served as it is, so in-cluster callers and probes keep working. The admin listener reads the
+header as optional, so an NLB's HTTP health check of `/__edgeguard/ready` there, which starts with
+a v2 `LOCAL` header, is answered.
 
 `edgeguard_proxy_protocol_total{listener,result}` counts what each connection sent.
 `EdgeGuardProxyProtocolRefused` fires when the balancer's own connections are being closed. See
@@ -1342,7 +1345,8 @@ path = "/healthz"                        # GET every 5s; out after 2 failures, b
 - **Beyond a status:** `health_check.expect_body = '"status":"ok"'` (or `expect_body_regex`)
   fails a target whose health endpoint answers `200` while saying it is degraded.
   `health_check.method` and `headers` shape the request (`HEAD`, a `Host` the target routes by),
-  and `health_check.port` sends it to a separate management port.
+  and `health_check.port` (with `scheme`, and a target's own `check_host`) sends it to a separate
+  management port or address.
   `health_check.type = "tcp"` only connects, for a target with no health endpoint.
 - **Expected status:** `health_check.expect_status = "200,204"` says which answers pass
   (default `"200-399"`).

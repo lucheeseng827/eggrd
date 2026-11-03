@@ -1,9 +1,13 @@
 //! The shared accept loop (`edgeguard::serve`) on real sockets: header-read timeouts, the
-//! connection cap, and the graceful drain, on plain HTTP and over TLS.
+//! connection cap, the graceful drain, and the in-flight and handshake counts, on plain HTTP and
+//! over TLS.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::extract::Query;
@@ -16,19 +20,63 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// `/` answers `ok`; `/slow?ms=N` answers `slow` after N milliseconds.
+/// `/` answers `ok`; `/slow?ms=N` answers `slow` after N milliseconds; `/stream?ms=N` sends its
+/// head and `first` at once, then `last` after N milliseconds, then ends.
 fn app() -> Router {
     #[derive(serde::Deserialize)]
     struct Delay {
         ms: u64,
     }
-    Router::new().route("/", get(|| async { "ok" })).route(
-        "/slow",
-        get(|Query(d): Query<Delay>| async move {
-            tokio::time::sleep(Duration::from_millis(d.ms)).await;
-            "slow"
-        }),
-    )
+    Router::new()
+        .route("/", get(|| async { "ok" }))
+        .route(
+            "/slow",
+            get(|Query(d): Query<Delay>| async move {
+                tokio::time::sleep(Duration::from_millis(d.ms)).await;
+                "slow"
+            }),
+        )
+        .route(
+            "/stream",
+            get(|Query(d): Query<Delay>| async move {
+                axum::body::Body::new(Trickle {
+                    first: true,
+                    last: Box::pin(tokio::time::sleep(Duration::from_millis(d.ms))),
+                    done: false,
+                })
+            }),
+        )
+}
+
+/// A streamed body of unknown length: `first`, then `last` once `last` fires.
+struct Trickle {
+    first: bool,
+    last: Pin<Box<tokio::time::Sleep>>,
+    done: bool,
+}
+
+impl hyper::body::Body for Trickle {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<bytes::Bytes>, Self::Error>>> {
+        if std::mem::take(&mut self.first) {
+            return Poll::Ready(Some(Ok(hyper::body::Frame::data("first".into()))));
+        }
+        if self.done {
+            return Poll::Ready(None);
+        }
+        match self.last.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => {
+                self.done = true;
+                Poll::Ready(Some(Ok(hyper::body::Frame::data("last".into()))))
+            }
+        }
+    }
 }
 
 fn opts(header_read_timeout: Option<Duration>) -> ServeOpts {
@@ -115,6 +163,27 @@ async fn get_on<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, path: &str) -> (u1
         status,
         String::from_utf8_lossy(&buf[head_end..head_end + len]).to_string(),
     )
+}
+
+/// Wait until `f` holds, for up to 5 s; `what` names it if it never does.
+async fn until(what: &str, mut f: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !f() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("never: {what}"));
+}
+
+/// Read from `s` until `needle` has arrived; everything read so far.
+async fn read_until<S: AsyncRead + Unpin>(s: &mut S, needle: &str, buf: &mut Vec<u8>) {
+    let mut chunk = [0u8; 1024];
+    while !String::from_utf8_lossy(buf).contains(needle) {
+        let n = s.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "closed before {needle:?}");
+        buf.extend_from_slice(&chunk[..n]);
+    }
 }
 
 /// Wait until `stats` shows `n` open connections (the accept loop runs on its own task).
@@ -286,6 +355,91 @@ async fn a_listener_without_a_cap_exports_no_max() {
     let text = metrics.render();
     assert!(text.contains("edgeguard_connections_open{listener=\"public\"}"));
     assert!(!text.contains("edgeguard_connections_max"), "{text}");
+}
+
+// ---- requests in flight -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_request_is_in_flight_until_its_response_is_sent_and_a_connection_is_not() {
+    let metrics = edgeguard::metrics::Metrics::new();
+    let srv = start(
+        ServeOpts {
+            stats: metrics.listener_stats("public"),
+            ..opts(Some(Duration::from_secs(10)))
+        },
+        None,
+    )
+    .await;
+    // An open connection with no request is not a request in flight.
+    let _idle = TcpStream::connect(srv.addr).await.unwrap();
+    until_open(&srv.stats, 1).await;
+    assert_eq!(srv.stats.in_flight(), 0);
+
+    let mut s = TcpStream::connect(srv.addr).await.unwrap();
+    let slow = tokio::spawn(async move { get_on(&mut s, "/slow?ms=600").await });
+    let stats = Arc::clone(&srv.stats);
+    until("the slow request in flight", || stats.in_flight() == 1).await;
+    assert!(
+        metrics
+            .render()
+            .contains("edgeguard_requests_in_flight{listener=\"public\"} 1"),
+        "{}",
+        metrics.render()
+    );
+    assert_eq!(slow.await.unwrap(), (200, "slow".into()));
+    until("the count given back", || stats.in_flight() == 0).await;
+    let text = metrics.render();
+    assert!(
+        text.contains("# TYPE edgeguard_requests_in_flight gauge"),
+        "{text}"
+    );
+    assert!(
+        text.contains("edgeguard_requests_in_flight{listener=\"public\"} 0"),
+        "{text}"
+    );
+    // A plain listener has no handshakes to count.
+    assert!(!text.contains("edgeguard_tls_handshakes_total"), "{text}");
+}
+
+#[tokio::test]
+async fn a_streamed_response_is_in_flight_until_its_body_ends() {
+    let srv = start(opts(Some(Duration::from_secs(10))), None).await;
+    let mut s = TcpStream::connect(srv.addr).await.unwrap();
+    s.write_all(b"GET /stream?ms=500 HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    read_until(&mut s, "first", &mut buf).await;
+    // The head and part of the body are out, so the handler has returned: the request is still
+    // in flight while the rest of its body is to come.
+    assert_eq!(srv.stats.in_flight(), 1);
+    read_until(&mut s, "0\r\n\r\n", &mut buf).await;
+    assert!(String::from_utf8_lossy(&buf).contains("last"));
+    let stats = Arc::clone(&srv.stats);
+    until("the count given back at the body's end", || {
+        stats.in_flight() == 0
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn requests_sharing_an_http2_connection_each_count() {
+    let srv = start(opts(Some(Duration::from_secs(10))), None).await;
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .http2_only(true)
+        .build_http::<axum::body::Body>();
+    let url: axum::http::Uri = format!("http://{}/slow?ms=600", srv.addr).parse().unwrap();
+    let (a, b) = (client.get(url.clone()), client.get(url));
+    let both = tokio::spawn(async move { tokio::join!(a, b) });
+    let stats = Arc::clone(&srv.stats);
+    until("two requests in flight", || stats.in_flight() == 2).await;
+    assert_eq!(srv.stats.open(), 1, "on one connection");
+    let (a, b) = both.await.unwrap();
+    assert_eq!(
+        (a.unwrap().status().as_u16(), b.unwrap().status().as_u16()),
+        (200, 200)
+    );
+    until("both counts given back", || stats.in_flight() == 0).await;
 }
 
 // ---- drain ------------------------------------------------------------------------------------
@@ -499,4 +653,57 @@ async fn tls_shutdown_does_not_wait_for_a_handshake_in_progress() {
         .expect("a pending handshake is abandoned on drain")
         .unwrap()
         .unwrap();
+    // It neither succeeded nor failed, so it is not counted as either.
+    assert_eq!(srv.stats.tls_handshakes(), 0);
+    assert_eq!(srv.stats.tls_failures(), [0, 0, 0]);
+}
+
+#[tokio::test]
+async fn tls_handshakes_are_counted_whether_they_succeed_or_fail() {
+    let t = tls();
+    let metrics = edgeguard::metrics::Metrics::new();
+    let srv = start(
+        ServeOpts {
+            stats: metrics.listener_stats("public"),
+            ..opts(Some(Duration::from_secs(10)))
+        },
+        Some(Arc::clone(&t.server)),
+    )
+    .await;
+    let mut ok = tls_connect(&t, srv.addr).await;
+    assert_eq!(get_on(&mut ok, "/").await, (200, "ok".into()));
+    // Plain HTTP to the TLS port: a handshake that fails, for a reason other than a certificate.
+    let mut plain = TcpStream::connect(srv.addr).await.unwrap();
+    plain
+        .write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    closed_within(&mut plain, Duration::from_secs(5))
+        .await
+        .expect("a plain request to the TLS port is closed");
+    let stats = Arc::clone(&srv.stats);
+    until("both handshakes counted", || stats.tls_handshakes() == 2).await;
+    assert_eq!(srv.stats.tls_failures(), [0, 0, 1], "one, as `other`");
+
+    // A plain listener beside it (the admin port, say) has no handshake series.
+    metrics.listener_stats("admin");
+    let text = metrics.render();
+    assert!(
+        !text.contains("edgeguard_tls_handshakes_total{listener=\"admin\"}"),
+        "{text}"
+    );
+    assert!(
+        text.contains("# TYPE edgeguard_tls_handshakes_total counter"),
+        "{text}"
+    );
+    assert!(
+        text.contains("edgeguard_tls_handshakes_total{listener=\"public\"} 2"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "edgeguard_tls_handshake_failures_total{listener=\"public\",reason=\"other\"} 1"
+        ),
+        "the failures are a subset of the total: {text}"
+    );
 }

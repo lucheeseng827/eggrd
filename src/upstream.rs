@@ -184,9 +184,10 @@ pub struct UpstreamConnector {
     http: HttpConnector,
     tls: Arc<UpstreamTls>,
     connect_timeout: Option<std::time::Duration>,
-    /// Pick the TLS settings of this `(host, port)` rather than of the one dialled. Set only on
-    /// the connector a health check uses for another port of an `https://` target, so the check
-    /// verifies and presents as requests to that target do.
+    /// Pick the TLS settings of this `(host, port)` rather than of the one dialled, and verify
+    /// this host's name unless they name another. Set only on the connector a health check uses
+    /// for another port or host of an `https://` target, so the check verifies and presents as
+    /// requests to that target do.
     tls_as: Option<(String, u16)>,
 }
 
@@ -208,10 +209,12 @@ impl UpstreamConnector {
         }
     }
 
-    /// This connector, choosing the TLS settings of `target` (an upstream base URL) whatever port
-    /// it dials: `[[upstream_tls.targets]]`'s entry for that target, or `[upstream_tls]`. For a
-    /// health check on another port (`health_check.port`), which would otherwise be looked up by
-    /// that port and get the defaults. Itself, for a target that is not `https://`.
+    /// This connector, choosing the TLS settings of `target` (an upstream base URL) whatever
+    /// address it dials: `[[upstream_tls.targets]]`'s entry for that target, or `[upstream_tls]`,
+    /// and verifying the target's name unless those name another (`server_name`). For a health
+    /// check on another port or host (`health_check.port`, `check_host`), which would otherwise be
+    /// looked up by where it dials and get the defaults. Itself, for a target that is not
+    /// `https://`.
     pub fn with_tls_of(&self, target: &str) -> UpstreamConnector {
         UpstreamConnector {
             tls_as: target_key(target).ok(),
@@ -243,9 +246,12 @@ impl Service<Uri> for UpstreamConnector {
                         Some((host, port)) => tls.profile(host, *port),
                         None => tls.profile(host, uri.port_u16().unwrap_or(443)),
                     };
+                    // As the target's own requests verify it: a check dialling the same server at
+                    // another address (`check_host`) still expects the target's certificate.
+                    let name_of = tls_as.as_ref().map_or(host, |(host, _)| host.as_str());
                     let server_name = match &profile.server_name {
                         Some(name) => name.clone(),
-                        None => url_server_name(host)?,
+                        None => url_server_name(name_of)?,
                     };
                     let config = Arc::clone(&profile.config);
                     let connect = async {

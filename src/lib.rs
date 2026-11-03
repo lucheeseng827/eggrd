@@ -91,6 +91,13 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
     // Checked whether or not a section inherits it now, so a broken default fails here and not on
     // the reload that first turns on a client using it.
     crate::outbound::check_defaults(&cfg.outbound)?;
+    anyhow::ensure!(
+        (1..=crate::proxy::MAX_FORWARDED_HOPS).contains(&cfg.server.forwarded_hops),
+        "server.forwarded_hops = {}: it counts the trusted proxies in front of EdgeGuard that \
+         each append an X-Forwarded-For entry, from 1 to {}",
+        cfg.server.forwarded_hops,
+        crate::proxy::MAX_FORWARDED_HOPS
+    );
     let rl = &cfg.ratelimit;
 
     // Pick the limiter backend. `local` keeps the in-process `governor` limiters below; a

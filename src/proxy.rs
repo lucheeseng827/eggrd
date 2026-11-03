@@ -253,11 +253,22 @@ pub async fn handle(
     // when a shipper actually exists: with tracing off this is one Option check, not a trace-id mint
     // and a pile of header reads on every request.
     let mut req = req;
+    // The client, resolved once: the span, rate limits, `[access]`, routing, the log and the
+    // upstream's forwarding headers all use this one address.
+    let (ip, forwarded_for) = client_ip(
+        req.headers(),
+        peer,
+        rt.cfg.server.trust_forwarded_for,
+        rt.cfg.server.forwarded_hops,
+    );
+    if let Some(result) = forwarded_for {
+        state.metrics.record_forwarded_for(result);
+    }
     let span_pre = state
         .metrics
         .span_shipper()
         .is_some()
-        .then(|| ServerSpanPre::capture(&req, &rt, peer));
+        .then(|| ServerSpanPre::capture(&req, &rt, ip));
     // Hand the context to the forward path so it can rewrite `traceparent` for the upstream. Only
     // when recording: an unsampled request forwards the client's headers untouched.
     if let Some(pre) = &span_pre {
@@ -299,7 +310,7 @@ pub async fn handle(
         .cloned();
     let ctx = Arc::new(RequestCtx::default());
 
-    let mut resp = handle_inner(&state, &rt, policy_pending, peer, req, &ctx).await;
+    let mut resp = handle_inner(&state, &rt, policy_pending, ip, req, &ctx).await;
     if let Some(origin) = &origin {
         if let Some(cors) = &rt.cors {
             cors.decorate_origin(origin, &mut resp);
@@ -408,7 +419,7 @@ struct ServerSpanPre {
 }
 
 impl ServerSpanPre {
-    fn capture(req: &Request<Body>, rt: &Runtime, peer: SocketAddr) -> ServerSpanPre {
+    fn capture(req: &Request<Body>, rt: &Runtime, client: IpAddr) -> ServerSpanPre {
         let inbound = req
             .headers()
             .get("traceparent")
@@ -446,7 +457,8 @@ impl ServerSpanPre {
             url_path: path,
             url_query,
             url_scheme: if rt.cfg.tls.enabled { "https" } else { "http" }.to_string(),
-            client_address: Some(peer.ip().to_string()),
+            // The same client the request is limited, logged and routed as.
+            client_address: Some(client.to_string()),
             server_address: req
                 .headers()
                 .get(header::HOST)
@@ -502,7 +514,8 @@ async fn handle_inner(
     state: &AppState,
     rt: &Runtime,
     policy_pending: bool,
-    peer: SocketAddr,
+    // The client, resolved once in `handle` ([`client_ip`]).
+    ip: IpAddr,
     req: Request<Body>,
     ctx: &Arc<RequestCtx>,
 ) -> Response<Body> {
@@ -527,7 +540,6 @@ async fn handle_inner(
     let path =
         crate::accesslog::sanitize_target(&raw_path, rt.cfg.log.query, &rt.cfg.log.redact_params);
 
-    let ip = client_ip(req.headers(), peer, rt.cfg.server.trust_forwarded_for);
     // Request id for correlation: reuse a well-formed inbound one, else generate. Echoed on the
     // response and the access log by `finish`, and forwarded upstream below.
     let rid = resolve_request_id(req.headers());
@@ -1352,13 +1364,13 @@ async fn handle_inner(
         forwarded.remove(header::CONTENT_LENGTH);
         forward_headers(&forwarded, headers);
         set_client_cert_header(headers, rt.client_cert_header, client_cert.as_deref());
-        // Standard forwarding headers.
-        if let Ok(v) = HeaderValue::from_str(&ip.to_string()) {
-            headers.insert(HeaderName::from_static("x-forwarded-for"), v);
-        }
-        headers.insert(
-            HeaderName::from_static("x-forwarded-proto"),
-            HeaderValue::from_static(forwarded_proto(&rt.cfg, &parts.headers)),
+        // Standard forwarding headers, every client-address one the edge's own.
+        set_forwarding_headers(
+            headers,
+            ip,
+            forwarded_proto(&rt.cfg, &parts.headers),
+            &parts.headers,
+            &parts.uri,
         );
         // Forward the (resolved/generated) request id so the upstream logs the same correlation id.
         if let Ok(v) = HeaderValue::from_str(&rid) {
@@ -2319,22 +2331,106 @@ fn resolve_request_id(headers: &HeaderMap) -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Resolve the client IP. The peer socket address is authoritative; `X-Forwarded-For`
-/// (first hop) is honored only when `trust_forwarded` is set, because a directly
-/// reachable client can otherwise spoof it to forge their identity.
-fn client_ip(headers: &HeaderMap, peer: SocketAddr, trust_forwarded: bool) -> IpAddr {
-    if trust_forwarded {
-        if let Some(xff) = headers.get("x-forwarded-for") {
-            if let Ok(s) = xff.to_str() {
-                if let Some(first) = s.split(',').next() {
-                    if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                        return ip;
-                    }
-                }
-            }
+/// The most trusted proxies `server.forwarded_hops` may name.
+pub const MAX_FORWARDED_HOPS: usize = 10;
+
+/// How a request's `X-Forwarded-For` was read, with `trust_forwarded_for` on:
+/// `edgeguard_forwarded_for_total{result}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardedFor {
+    /// The entry `forwarded_hops` from the right is the client.
+    Used,
+    /// No header: the TCP peer is the client.
+    Absent,
+    /// Fewer entries than `forwarded_hops`: the TCP peer is the client.
+    Short,
+    /// The chosen entry is not an IP address (or not text): the TCP peer.
+    Invalid,
+}
+
+impl ForwardedFor {
+    /// Every result, in the order the metric renders them.
+    pub const ALL: [ForwardedFor; 4] = [
+        ForwardedFor::Used,
+        ForwardedFor::Absent,
+        ForwardedFor::Short,
+        ForwardedFor::Invalid,
+    ];
+
+    /// The `result` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            ForwardedFor::Used => "used",
+            ForwardedFor::Absent => "absent",
+            ForwardedFor::Short => "short",
+            ForwardedFor::Invalid => "invalid",
         }
     }
-    peer.ip()
+}
+
+/// Resolve the client IP: the one function every consumer of the client address goes through
+/// (rate limits, `[access]`, pool hashing on `client_ip`, the access log and shipped records,
+/// spans and the `X-Forwarded-For` sent upstream).
+///
+/// The connection's peer is authoritative (with PROXY protocol, the client the header named).
+/// `X-Forwarded-For` is read only with `trust_forwarded_for`, and then from the RIGHT: each proxy
+/// appends the address it accepted the connection from, so the entries a client sends itself are
+/// on the left and must never be believed. With `hops` trusted proxies in front, each appending
+/// one entry, the client is the entry `hops` from the right. Several header lines are one list,
+/// in order (RFC 9110 §5.3). Anything short of that falls back to the peer, and says why.
+pub(crate) fn client_ip(
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    trust_forwarded: bool,
+    hops: usize,
+) -> (IpAddr, Option<ForwardedFor>) {
+    // A dual-stack socket reports an IPv4 client as `::ffff:a.b.c.d`; key it as the IPv4 it is.
+    let peer_ip = peer.ip().to_canonical();
+    if !trust_forwarded {
+        return (peer_ip, None);
+    }
+    let mut lines = headers.get_all("x-forwarded-for").iter().rev().peekable();
+    if lines.peek().is_none() {
+        return (peer_ip, Some(ForwardedFor::Absent));
+    }
+    // Walked from the right, as bytes, never further than the chosen entry (at most
+    // MAX_FORWARDED_HOPS): the entries left of it are the client's, and whatever a client puts
+    // there (bytes that are not text, thousands of entries) must not matter, or a client could
+    // make itself the balancer, for rate limits and `[access]`. Only the chosen entry has to be
+    // text, and an address.
+    let hops = hops.clamp(1, MAX_FORWARDED_HOPS);
+    let chosen = lines
+        .flat_map(|line| line.as_bytes().rsplit(|b| *b == b','))
+        .map(<[u8]>::trim_ascii)
+        .filter(|e| !e.is_empty())
+        .nth(hops - 1);
+    let Some(chosen) = chosen else {
+        return (peer_ip, Some(ForwardedFor::Short));
+    };
+    match std::str::from_utf8(chosen)
+        .ok()
+        .and_then(parse_forwarded_ip)
+    {
+        Some(ip) => (ip, Some(ForwardedFor::Used)),
+        None => (peer_ip, Some(ForwardedFor::Invalid)),
+    }
+}
+
+/// One `X-Forwarded-For` entry as an address: `1.2.3.4`, `1.2.3.4:5678`, `2001:db8::1`,
+/// `[2001:db8::1]` or `[2001:db8::1]:5678`. An IPv4-mapped IPv6 address is the IPv4 one.
+fn parse_forwarded_ip(entry: &str) -> Option<IpAddr> {
+    let ip = if let Ok(ip) = entry.parse::<IpAddr>() {
+        ip
+    } else if let Ok(sock) = entry.parse::<SocketAddr>() {
+        sock.ip()
+    } else {
+        entry
+            .strip_prefix('[')
+            .and_then(|e| e.strip_suffix(']'))?
+            .parse::<IpAddr>()
+            .ok()?
+    };
+    Some(ip.to_canonical())
 }
 
 /// Total size of the request headers (sum of name + value bytes), used for the header-size
@@ -2431,12 +2527,12 @@ async fn proxy_upgrade(
         if let Some(v) = upgrade {
             headers.insert(header::UPGRADE, v);
         }
-        if let Ok(v) = HeaderValue::from_str(&ip.to_string()) {
-            headers.insert(HeaderName::from_static("x-forwarded-for"), v);
-        }
-        headers.insert(
-            HeaderName::from_static("x-forwarded-proto"),
-            HeaderValue::from_static(forwarded_proto(&rt.cfg, req.headers())),
+        set_forwarding_headers(
+            headers,
+            ip,
+            forwarded_proto(&rt.cfg, req.headers()),
+            req.headers(),
+            req.uri(),
         );
         if let Ok(v) = HeaderValue::from_str(request_id) {
             headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), v);
@@ -3167,6 +3263,65 @@ fn forward_headers(from: &HeaderMap, to: &mut HeaderMap) {
     }
 }
 
+/// Set the headers that tell the upstream who the client is, after [`forward_headers`] copied the
+/// client's: every one of them is the edge's own, never what the client wrote. Frameworks read
+/// different ones (Go's chi `RealIP` prefers `True-Client-IP` and `X-Real-IP`; RFC 7239 ones read
+/// `Forwarded`), and a client value left in any of them would undo the edge's resolution.
+///
+/// * `X-Forwarded-For` and `X-Real-IP`: the resolved client address, one value.
+/// * `X-Forwarded-Proto`: `proto`.
+/// * `Forwarded`: replaced by `for=<ip>;proto=<proto>` (RFC 7239, an IPv6 address quoted and
+///   bracketed). The client's, and any proxy's before the edge, are dropped: the edge has already
+///   decided which of them to believe.
+/// * `True-Client-IP`: removed (a CDN's header, which only the CDN should write).
+/// * `X-Forwarded-Host`: the `Host` the edge received (the URI's authority for HTTP/2), since the
+///   upstream request carries the upstream's own; removed when there is none. A client's separate
+///   `X-Forwarded-Host` never passes. `Host` itself is still the client's choice (the edge checks
+///   no allowed-hosts list), so an app building links from it must validate the host. A CDN that
+///   rewrites `Host` should forward the viewer's `Host` to the edge instead.
+fn set_forwarding_headers(
+    headers: &mut HeaderMap,
+    ip: IpAddr,
+    proto: &'static str,
+    inbound: &HeaderMap,
+    uri: &axum::http::Uri,
+) {
+    let ip_text = ip.to_string();
+    if let Ok(v) = HeaderValue::from_str(&ip_text) {
+        headers.insert(HeaderName::from_static("x-forwarded-for"), v.clone());
+        headers.insert(HeaderName::from_static("x-real-ip"), v);
+    }
+    headers.insert(
+        HeaderName::from_static("x-forwarded-proto"),
+        HeaderValue::from_static(proto),
+    );
+    headers.remove(HeaderName::from_static("true-client-ip"));
+    let node = match ip {
+        IpAddr::V4(_) => ip_text,
+        IpAddr::V6(_) => format!("\"[{ip_text}]\""),
+    };
+    match HeaderValue::from_str(&format!("for={node};proto={proto}")) {
+        Ok(v) => {
+            headers.insert(header::FORWARDED, v);
+        }
+        Err(_) => {
+            headers.remove(header::FORWARDED);
+        }
+    }
+    let host = inbound.get(header::HOST).cloned().or_else(|| {
+        uri.authority()
+            .and_then(|a| HeaderValue::from_str(a.as_str()).ok())
+    });
+    match host {
+        Some(host) => {
+            headers.insert(HeaderName::from_static("x-forwarded-host"), host);
+        }
+        None => {
+            headers.remove(HeaderName::from_static("x-forwarded-host"));
+        }
+    }
+}
+
 fn strip_hop_by_hop(headers: &mut HeaderMap) {
     // Header names listed in any `Connection` header are connection-specific; collect them
     // before mutating (the borrow of `headers` must end before we remove).
@@ -3196,10 +3351,14 @@ fn forwarded_proto(cfg: &Config, headers: &HeaderMap) -> &'static str {
     }
     if cfg.server.trust_forwarded_for {
         if let Some(value) = headers
-            .get("x-forwarded-proto")
+            .get_all("x-forwarded-proto")
+            .iter()
+            .next_back()
             .and_then(|v| v.to_str().ok())
         {
-            match value.split(',').next().map(str::trim) {
+            // The last value: the one the nearest (trusted) proxy wrote. An appending proxy keeps
+            // whatever the client sent on the left, as with `X-Forwarded-For`.
+            match value.rsplit(',').next().map(str::trim) {
                 Some(p) if p.eq_ignore_ascii_case("https") => return "https",
                 Some(p) if p.eq_ignore_ascii_case("http") => return "http",
                 _ => {}
@@ -3820,22 +3979,202 @@ mod tests {
         let peer: SocketAddr = "203.0.113.9:55000".parse().unwrap();
         let h = headers_with("x-forwarded-for", "1.2.3.4");
         // Untrusted: a directly reachable client must not be able to spoof its IP.
-        assert_eq!(client_ip(&h, peer, false), peer.ip());
+        assert_eq!(client_ip(&h, peer, false, 1), (peer.ip(), None));
+        // An IPv4 client on a dual-stack socket is keyed as the IPv4 address, trusted or not.
+        let mapped: SocketAddr = "[::ffff:203.0.113.9]:55000".parse().unwrap();
+        assert_eq!(client_ip(&h, mapped, false, 1).0, peer.ip());
+        assert_eq!(client_ip(&HeaderMap::new(), mapped, true, 1).0, peer.ip());
     }
 
     #[test]
-    fn client_ip_uses_first_xff_hop_when_trusted() {
-        let peer: SocketAddr = "203.0.113.9:55000".parse().unwrap();
-        let h = headers_with("x-forwarded-for", "1.2.3.4, 5.6.7.8");
-        assert_eq!(client_ip(&h, peer, true).to_string(), "1.2.3.4");
+    fn client_ip_walks_no_further_than_the_chosen_entry() {
+        let peer: SocketAddr = "10.0.0.5:55000".parse().unwrap();
+        // A client can send thousands of entries; only `hops` from the right are looked at.
+        let long = format!("{}198.51.100.7", "1.2.3.4, ".repeat(5000));
+        assert_eq!(
+            client_ip(&xff(&[&long]), peer, true, 1).0.to_string(),
+            "198.51.100.7"
+        );
+        // Out-of-range hop counts are clamped (the runtime build refuses them anyway).
+        assert_eq!(
+            client_ip(&xff(&["1.2.3.4, 198.51.100.7"]), peer, true, 0)
+                .0
+                .to_string(),
+            "198.51.100.7"
+        );
     }
 
     #[test]
-    fn client_ip_falls_back_to_peer_on_missing_or_garbage_xff() {
-        let peer: SocketAddr = "203.0.113.9:55000".parse().unwrap();
-        assert_eq!(client_ip(&HeaderMap::new(), peer, true), peer.ip());
-        let garbage = headers_with("x-forwarded-for", "not-an-ip");
-        assert_eq!(client_ip(&garbage, peer, true), peer.ip());
+    fn the_upstream_gets_the_edges_client_headers_not_the_clients() {
+        let mut inbound = HeaderMap::new();
+        for (k, v) in [
+            ("host", "shop.example"),
+            ("x-real-ip", "1.2.3.4"),
+            ("true-client-ip", "1.2.3.4"),
+            ("forwarded", "for=1.2.3.4;proto=https"),
+            ("x-forwarded-host", "evil.example"),
+        ] {
+            inbound.append(k, HeaderValue::from_static(v));
+        }
+        let mut out = HeaderMap::new();
+        forward_headers(&inbound, &mut out);
+        let uri: axum::http::Uri = "/reset".parse().unwrap();
+        set_forwarding_headers(
+            &mut out,
+            "198.51.100.7".parse().unwrap(),
+            "https",
+            &inbound,
+            &uri,
+        );
+        let one = |name: &str| {
+            let all: Vec<_> = out.get_all(name).iter().collect();
+            assert!(all.len() <= 1, "{name}: {all:?}");
+            all.first().map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(one("x-forwarded-for").as_deref(), Some("198.51.100.7"));
+        assert_eq!(one("x-real-ip").as_deref(), Some("198.51.100.7"));
+        assert_eq!(one("true-client-ip"), None);
+        assert_eq!(
+            one("forwarded").as_deref(),
+            Some("for=198.51.100.7;proto=https")
+        );
+        assert_eq!(one("x-forwarded-host").as_deref(), Some("shop.example"));
+        assert_eq!(one("x-forwarded-proto").as_deref(), Some("https"));
+
+        // IPv6, quoted and bracketed (RFC 7239 §6); an HTTP/2 request's authority as the host.
+        let mut out = HeaderMap::new();
+        let uri: axum::http::Uri = "https://shop.example:8443/reset".parse().unwrap();
+        set_forwarding_headers(
+            &mut out,
+            "2001:db8::7".parse().unwrap(),
+            "http",
+            &HeaderMap::new(),
+            &uri,
+        );
+        assert_eq!(out["forwarded"], "for=\"[2001:db8::7]\";proto=http");
+        assert_eq!(out["x-forwarded-host"], "shop.example:8443");
+        // No host at all: the client's X-Forwarded-Host is not left behind.
+        let mut out = HeaderMap::new();
+        out.insert("x-forwarded-host", HeaderValue::from_static("evil.example"));
+        set_forwarding_headers(
+            &mut out,
+            "198.51.100.7".parse().unwrap(),
+            "http",
+            &HeaderMap::new(),
+            &"/".parse().unwrap(),
+        );
+        assert!(!out.contains_key("x-forwarded-host"));
+    }
+
+    /// A header map with one `X-Forwarded-For` line per value, in order.
+    fn xff(values: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append("x-forwarded-for", HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn client_ip_takes_the_entry_the_trusted_proxy_appended_not_the_clients() {
+        let peer: SocketAddr = "10.0.0.5:55000".parse().unwrap();
+        let ip = |values: &[&str], hops| client_ip(&xff(values), peer, true, hops);
+        // A client writes `1.2.3.4`; the balancer appends the address it saw, `198.51.100.7`.
+        assert_eq!(
+            ip(&["1.2.3.4, 198.51.100.7"], 1),
+            ("198.51.100.7".parse().unwrap(), Some(ForwardedFor::Used))
+        );
+        // A one-entry header (a proxy that overwrites) gives the same answer as before.
+        assert_eq!(ip(&["198.51.100.7"], 1).0.to_string(), "198.51.100.7");
+        // Two proxies (CloudFront → ALB): the client is two from the right.
+        assert_eq!(
+            ip(&["1.2.3.4, 198.51.100.7, 130.176.0.1"], 2).0.to_string(),
+            "198.51.100.7"
+        );
+        // Several header lines are one list, in order.
+        assert_eq!(
+            ip(&["1.2.3.4", "198.51.100.7"], 1).0.to_string(),
+            "198.51.100.7"
+        );
+        assert_eq!(
+            ip(&["1.2.3.4, 198.51.100.7", "130.176.0.1"], 2)
+                .0
+                .to_string(),
+            "198.51.100.7"
+        );
+        // Spaces, empty entries, ports and brackets.
+        assert_eq!(
+            ip(&[" 1.2.3.4 ,, 198.51.100.7:4711 "], 1).0.to_string(),
+            "198.51.100.7"
+        );
+        assert_eq!(
+            ip(&["1.2.3.4, 2001:db8::7"], 1).0.to_string(),
+            "2001:db8::7"
+        );
+        assert_eq!(
+            ip(&["1.2.3.4, [2001:db8::7]"], 1).0.to_string(),
+            "2001:db8::7"
+        );
+        assert_eq!(
+            ip(&["1.2.3.4, [2001:db8::7]:4711"], 1).0.to_string(),
+            "2001:db8::7"
+        );
+        assert_eq!(
+            ip(&["::ffff:198.51.100.7"], 1).0.to_string(),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_the_peer_and_says_why() {
+        let peer: SocketAddr = "10.0.0.5:55000".parse().unwrap();
+        let ip = |values: &[&str], hops| client_ip(&xff(values), peer, true, hops);
+        assert_eq!(ip(&[], 1), (peer.ip(), Some(ForwardedFor::Absent)));
+        assert_eq!(
+            ip(&["198.51.100.7"], 2),
+            (peer.ip(), Some(ForwardedFor::Short))
+        );
+        assert_eq!(ip(&[" , "], 1), (peer.ip(), Some(ForwardedFor::Short)));
+        // The chosen entry does not parse: never walk on to another one.
+        assert_eq!(
+            ip(&["198.51.100.7, unknown"], 1),
+            (peer.ip(), Some(ForwardedFor::Invalid))
+        );
+        assert_eq!(
+            ip(&["198.51.100.7, 1.2.3.4.5"], 1),
+            (peer.ip(), Some(ForwardedFor::Invalid))
+        );
+        // A bad entry further left is the client's, and does not matter.
+        assert_eq!(
+            ip(&["garbage, 198.51.100.7"], 1),
+            ("198.51.100.7".parse().unwrap(), Some(ForwardedFor::Used))
+        );
+        // Bytes that are not text: in the chosen entry, the peer; on the left, where the client
+        // writes, they do not matter (or any client could make itself the balancer).
+        let raw = |lines: &[&[u8]]| {
+            let mut h = HeaderMap::new();
+            for line in lines {
+                h.append("x-forwarded-for", HeaderValue::from_bytes(line).unwrap());
+            }
+            client_ip(&h, peer, true, 1)
+        };
+        assert_eq!(
+            raw(&[&b"198.51.100.7\xff"[..]]),
+            (peer.ip(), Some(ForwardedFor::Invalid))
+        );
+        assert_eq!(
+            raw(&[&b"1.2.3.4, 198.51.100.7\xff"[..]]),
+            (peer.ip(), Some(ForwardedFor::Invalid))
+        );
+        assert_eq!(
+            raw(&[&b"\xff\xfe garbage, 198.51.100.7"[..]]),
+            ("198.51.100.7".parse().unwrap(), Some(ForwardedFor::Used))
+        );
+        assert_eq!(
+            raw(&[&b"\xffclient-written"[..], &b"198.51.100.7"[..]]),
+            ("198.51.100.7".parse().unwrap(), Some(ForwardedFor::Used)),
+            "a whole line of it, in its own header line"
+        );
     }
 
     #[test]
@@ -3927,10 +4266,27 @@ mod tests {
             forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "https")),
             "https"
         );
+        // The last value is the nearest proxy's; the first may be the client's own.
         assert_eq!(
             forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "http, https")),
+            "https"
+        );
+        assert_eq!(
+            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "https, http")),
             "http"
         );
+        // Over several header lines, the last line's last value.
+        let mut lines = HeaderMap::new();
+        lines.append("x-forwarded-proto", HeaderValue::from_static("http"));
+        lines.append("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert_eq!(forwarded_proto(&cfg, &lines), "https");
+        let mut lines = HeaderMap::new();
+        lines.append("x-forwarded-proto", HeaderValue::from_static("https"));
+        lines.append(
+            "x-forwarded-proto",
+            HeaderValue::from_static("garbage, http"),
+        );
+        assert_eq!(forwarded_proto(&cfg, &lines), "http");
         // Missing or unrecognized -> http.
         assert_eq!(forwarded_proto(&cfg, &HeaderMap::new()), "http");
         assert_eq!(

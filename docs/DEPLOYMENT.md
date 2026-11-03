@@ -184,9 +184,85 @@ decides where the client's real address is:
 | In front of EdgeGuard | Where the client's address is | Configure |
 |---|---|---|
 | Nothing | The connection's own peer | Nothing |
-| An L7 balancer (AWS ALB, a GCP HTTPS LB, nginx `http`, Envoy, Cloudflare) | `X-Forwarded-For` | `server.trust_forwarded_for = true` |
+| An L7 balancer (AWS ALB, a GCP HTTPS LB, nginx `http`, Envoy, Cloudflare) | `X-Forwarded-For` | `server.trust_forwarded_for = true`, and `server.forwarded_hops` from the table below (`2` for a GCP load balancer) |
 | An L4 balancer that keeps the client's address (an NLB with client IP preservation, a passthrough GCP network LB, `externalTrafficPolicy: Local`) | The connection's own peer | Nothing |
 | An L4 balancer that does not (an NLB with IP targets, HAProxy `mode tcp`, nginx `stream`, a GCP TCP proxy) | A PROXY protocol header at the start of the connection | `server.proxy_protocol = true` |
+
+**Behind an L7 balancer** (`server.trust_forwarded_for`). A balancer *appends* to whatever
+`X-Forwarded-For` the client sent, so only the entries on the right are the balancer's.
+EdgeGuard takes the entry `server.forwarded_hops` from the right (default `1`) and ignores
+everything further left. **Set it from what your balancer appends**, not from how many boxes there
+are:
+
+| In front of EdgeGuard | It appends | `forwarded_hops` |
+|---|---|---|
+| AWS ALB, in its default `append` mode ([AWS](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/x-forwarded-headers.html#x-forwarded-for)) | the client | `1` |
+| GCP external Application Load Balancer ([Google](https://cloud.google.com/load-balancing/docs/https#x-forwarded-for_header)) | **two**: the client, then the load balancer's own address | `2` |
+| CloudFront → ALB ([AWS](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/RequestAndResponseBehaviorCustomOrigin.html#RequestCustomIPAddresses)) | CloudFront the viewer, then the ALB CloudFront's edge | `2` |
+| Cloudflare ([Cloudflare](https://developers.cloudflare.com/fundamentals/reference/http-headers/)) | the client | `1` |
+| Azure Application Gateway ([Microsoft](https://learn.microsoft.com/en-us/azure/application-gateway/how-application-gateway-works#modifications-to-the-request)) | the client, as `IP:port` (the port is stripped) | `1` |
+| nginx with `$proxy_add_x_forwarded_for`, Traefik | the client | `1` |
+| nginx with `proxy_set_header X-Forwarded-For $remote_addr` (replaces the header) | the client, alone | `1` |
+
+Any other platform, Cloud Run and other Google Front End services, PaaS routers included: **check
+before use**. Look at the raw header the platform delivers *before* choosing `forwarded_hops`:
+EdgeGuard sends the app only the one address it resolved, so the upstream's `X-Forwarded-For`
+cannot show the chain. Point the platform at a request-echo server for a moment (or capture at
+EdgeGuard's port with `tcpdump -A`), send a request with `X-Forwarded-For: 192.0.2.1` from a
+known address, and count the entries after `192.0.2.1`, your own address among them: the
+client's real address must be exactly `forwarded_hops` from the right. Then set it, and confirm
+the access log's `client_ip` is your address.
+
+```toml
+[server]
+trust_forwarded_for = true
+forwarded_hops = 1        # an ALB, Cloudflare, nginx, Traefik
+# forwarded_hops = 2      # a GCP external Application LB; CloudFront → ALB
+```
+
+- **Too low, and every client is the balancer.** With a GCP load balancer and `forwarded_hops = 1`,
+  every request resolves to the load balancer's own address: one rate-limit bucket for everyone
+  (a site-wide `429`), `[access]` allowlists that lock everyone out, `hash_on = "client_ip"` on one
+  target. The metric still says `used`, so check the access log's `client_ip` after setting it.
+  Too high lets a client choose its address again.
+- **AWS ALB: the `X-Forwarded-For` processing mode.** The table assumes
+  `routing.http.xff_header_processing.mode = append`, the default. With `preserve`, the ALB passes
+  the client's header unchanged and appends nothing, so the rightmost entry is the client's own
+  writing: do not use `trust_forwarded_for` with it. With `remove`, there is no header, and every
+  client is the ALB (`absent`).
+- **In a chain, only the outermost proxy may be reachable.** With CloudFront → ALB and
+  `forwarded_hops = 2`, a client that sends `X-Forwarded-For: 1.2.3.4` straight to the ALB gets
+  `1.2.3.4` as its address: the ALB appends the client, and that entry is now second from the
+  right. Every proxy but the outermost must accept traffic only from the one in front of it. For
+  CloudFront → ALB: allow only CloudFront's origin-facing managed prefix list
+  (`com.amazonaws.global.cloudfront.origin-facing`) in the ALB's security group, and have
+  CloudFront add a secret origin header that an ALB rule requires, since the prefix list admits
+  every CloudFront distribution, not only yours. `doctor` says so with `forwarded_hops > 1`.
+- A header with fewer entries than `forwarded_hops`, or a chosen entry that is not an address,
+  falls back to the TCP peer. `edgeguard_forwarded_for_total{result}` counts `used`, `absent`,
+  `short` and `invalid`; a rise in `short` usually means `forwarded_hops` is higher than the
+  chain.
+- **Up to 0.7.0-rc.1, the leftmost entry was taken.** That one is client-written, so any client
+  could choose its address *through* the balancer, getting a fresh rate-limit bucket per request
+  or passing `[access]` rules. Fixed in 0.7.0.
+- **Still let only the balancer reach EdgeGuard.** `trust_forwarded_for` believes the header on
+  any connection, so a client that bypasses the balancer and connects directly (another pod, a
+  host in the VPC) writes all of it. Admit only the balancer: a NetworkPolicy whose ingress rule
+  allows only its subnets, or a security group that allows only its. A list of trusted forwarder
+  addresses, to enforce this in EdgeGuard itself, is planned for 0.8. `proxy_protocol` and
+  `[trusted_client_cert_header]` already have their own (`proxy_protocol_trusted`,
+  `trusted_proxies`).
+- **What the app receives.** EdgeGuard sends its own client headers upstream and drops the
+  client's: `X-Forwarded-For` and `X-Real-IP` are the resolved address, `Forwarded` is
+  `for=<address>;proto=<http|https>` (an IPv6 address as `"[…]"`), `X-Forwarded-Proto` its own,
+  `X-Forwarded-Host` the `Host` EdgeGuard received, and `True-Client-IP` is removed. Frameworks
+  that read any of these (chi's `RealIP` prefers `True-Client-IP` and `X-Real-IP`) see the same
+  client the edge rate-limited. A CDN that rewrites `Host` and sends the viewer's host as
+  `X-Forwarded-Host` should forward the original `Host` instead. `X-Forwarded-Host` now always
+  matches the `Host` the request asked for, but that `Host` is the client's choice: EdgeGuard has
+  no allowed-hosts setting, so an app that builds absolute links (password-reset emails,
+  redirects) must still check the host against its own list (Django's `ALLOWED_HOSTS`, Rails'
+  `config.hosts`) or use a configured public URL.
 
 **Behind an L4 balancer** (`server.proxy_protocol`). The balancer writes one line (v1) or a binary
 block (v2) naming the client before anything else on the connection, and before the TLS handshake
@@ -230,14 +306,88 @@ How each connection is treated:
   peer already is the client.
 - Don't combine it with `trust_forwarded_for`: an L4 balancer passes the client's own
   `X-Forwarded-For` through (`doctor` warns).
-- Applies to the public and redirect listeners. The admin listener never reads a header: probes and
-  scrapes reach it directly.
+- Applies to the public and redirect listeners, and, from 0.7.0, to the admin listener with
+  the header optional: a header from `proxy_protocol_trusted` is read the same way (so a
+  balancer's health check is answered), a header from anyone else is refused, and a connection
+  without one is served as itself and counted `direct`, whatever its address. Probes and scrapes
+  that reach the admin port directly keep working, and don't count as `missing`. Up to 0.7.0-rc.1
+  the admin listener read no header; see the health checks below.
 - `[trusted_client_cert_header]` is still trusted by the connection's own peer, the hop that wrote
   it, not by the client a PROXY header names. Behind an L4 balancer that peer is the balancer,
   and the client writes the header, so leave the balancer out of `trusted_proxies` (`doctor`
   warns). An L7 balancer that also sends PROXY headers (HAProxy `mode http` with `send-proxy`)
   writes both itself, and belongs in both lists.
 - Listener settings: read at startup, not on reload.
+
+**Health checks behind an NLB with PROXY protocol.** With proxy protocol v2 on its target group,
+an NLB sends a v2 `LOCAL` header on every health-check connection, including to a health-check
+port other than the traffic port. Check the admin port over HTTP:
+
+```yaml
+# EKS, AWS Load Balancer Controller: Service annotations
+service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
+service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: http
+service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "9090"   # server.admin_port
+service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /__edgeguard/ready
+```
+
+- **From 0.7.0** this works: the admin listener reads the `LOCAL` header from
+  `proxy_protocol_trusted` and answers `/__edgeguard/ready`, which turns `503` during a drain, so
+  the NLB stops routing to a pod before it closes. The checks count as
+  `edgeguard_proxy_protocol_total{listener="admin",result="local"}`. Set `server.admin_addr` so the
+  NLB can reach the port (`0.0.0.0`, or the pod's address), and allow it in the security group.
+- **Up to 0.7.0-rc.1** the admin listener reads no header: the check's request does not parse
+  (`invalid HTTP method parsed` in the debug log), every target is unhealthy, and the NLB fails
+  open, routing to all of them. Check the traffic port instead: a TCP check
+  (`healthcheck-protocol: tcp`, `healthcheck-port: traffic-port`), or, without `admin_port`, an
+  HTTP check of `/__edgeguard/ready` on the traffic port, whose listener reads the header.
+- **A health check cannot see every refused header.** When `proxy_protocol_trusted` no longer
+  matches, EdgeGuard closes the NLB's client connections, yet a TCP check still passes because
+  the port accepts. The HTTP check sees one of the two causes, not the other:
+  - **The NLB's subnets changed** (left `proxy_protocol_trusted`): its health checks come from
+    the new addresses too, their `LOCAL` header is refused, and the HTTP check fails.
+  - **Client IP preservation is on:** client connections arrive from the clients' own addresses
+    and are refused as `untrusted`, but health checks still come from the NLB's private
+    addresses, which are trusted. The HTTP check passes while every client is cut off.
+
+  So prefer the HTTP check, and deploy `EdgeGuardProxyProtocolRefused` from the monitoring
+  bundle beside it in either case: it fires on both.
+- On a TLS listener, a health check that sends only the header (or nothing) and closes is not a
+  failed handshake. From 0.7.0 it is counted in `edgeguard_tls_no_client_hello_total`; up to
+  0.7.0-rc.1 it counted as `edgeguard_tls_handshake_failures_total{reason="other"}`, a steady rate
+  of about 0.6/s per target behind an NLB.
+
+**Rolling restarts behind an NLB: a longer `drain_delay`.** After a pod is told to stop, the NLB
+deregisters it, but for about 15 s it goes on opening new connections to the `draining` target.
+`server.drain_delay` is how long EdgeGuard keeps accepting after `SIGTERM` (with `/ready` already
+`503`), so it has to outlast that lag. In an EKS `rollout restart` under load with
+`drain_delay = 15s`, 1 of 7,963 requests got `connection refused`. Behind an NLB:
+
+```toml
+[server]
+drain_delay = "25s"      # 20–30 s: longer than the NLB's deregistration lag
+drain_timeout = "25s"    # then finish in-flight requests
+```
+
+```yaml
+# The pod must outlive both, or the kubelet kills it mid-drain.
+terminationGracePeriodSeconds: 60   # ≥ drain_delay + drain_timeout, plus a few seconds
+```
+
+`edgeguard doctor` warns when `drain_delay` + `drain_timeout` reaches 30 s, Kubernetes' default
+grace period. With `terminationGracePeriodSeconds` raised as above, that warning is expected.
+
+**What a client sees behind an NLB.** The NLB holds the client's TCP connection and its own to
+EdgeGuard separately:
+- A connection EdgeGuard closes at once (over `server.max_connections`) or later (idle past
+  `header_read_timeout`) still looks open to the client, until it writes: then it is reset.
+  `edgeguard_connections_rejected_total` counts the first, so watch it rather than client errors;
+  clients that reuse pooled connections should retry a request that fails with a reset before
+  any response.
+- The NLB sends the PROXY header with the client's first bytes, not when it connects. A client
+  that opens a connection and sends nothing (a pre-warmed pool, a port check) is closed after
+  `header_read_timeout` and counted `edgeguard_proxy_protocol_total{result="timeout"}`. A steady
+  `timeout` rate behind an NLB is such clients, not a broken balancer.
 
 ## Client certificates — where they can be verified
 
@@ -303,6 +453,16 @@ Any other balancer that writes the certificate as PEM or base64 DER works the sa
   per-hostname origin certificate. A provider's default origin certificate, shared by all its
   customers, proves no more than its shared ranges do. Listing addresses too
   (`trusted_proxies`) makes both required.
+
+  With `auth.mode = "mtls"`, `tls.client_auth.ca_path` also decides who may connect *directly*.
+  Any other certificate that CA issues passes the handshake, and with `[auth.mtls] allowed`
+  empty, a client holding one that reaches EdgeGuard without the balancer authenticates as
+  itself. To make the balancer the only way in, give its certificate a CA of its own that issues
+  nothing else (the balancer's own certificate is never a principal), or let only the balancer
+  reach the listener (a NetworkPolicy or security group). Listing the client names that may call
+  in `[auth.mtls] allowed` narrows *who* can connect directly, but not *how*: a holder of an
+  allowed certificate from that CA can still skip the balancer. `doctor` warns about the
+  combination with `allowed` empty, and notes it with `allowed` set.
 - `edgeguard_client_cert_header_total{result="untrusted_peer"}` counts headers dropped from
   elsewhere. A rise means a forgery attempt, or balancer addresses that are no longer listed.
 
@@ -339,6 +499,31 @@ proxy = "none"
 - The ACME client takes `[outbound]` too, so certificates are issued and renewed through the
   proxy. It verifies the ACME CA against the host's trust store plus `extra_ca_path`, not the
   binary's built-in roots, so an internal ACME CA installed on the host keeps working.
+
+**Locking down egress with a NetworkPolicy.** On Kubernetes, a NetworkPolicy can make the proxy
+the edge's only way out: allow egress to the proxy, to DNS, and to the upstreams, and nothing
+else.
+
+```yaml
+egress:
+  - to: [{podSelector: {matchLabels: {app: egress-proxy}}}]
+    ports: [{port: 3128, protocol: TCP}]
+  - to: [{podSelector: {matchLabels: {role: upstream}}}, {ipBlock: {cidr: 172.20.0.0/16}}]  # EKS: the service CIDR
+    ports: [{port: 8080, protocol: TCP}]
+  - to: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}},
+          podSelector: {matchLabels: {k8s-app: kube-dns}}}]
+    ports: [{port: 53, protocol: UDP}, {port: 53, protocol: TCP}]
+```
+
+- **EKS (VPC CNI network policy agent):** in our end-to-end run, a `podSelector` egress rule did
+  not let the edge reach a multi-port Service through its ClusterIP: connections timed out, while
+  the pods' own addresses worked. Adding an `ipBlock` for the cluster's service CIDR to the rule
+  fixed it. Find the CIDR with `aws eks describe-cluster --name <cluster> --query
+  cluster.kubernetesNetworkConfig.serviceIpv4Cidr` (`10.100.0.0/16` or `172.20.0.0/16` unless
+  set). Keep the rule's `ports`, so the block opens only those ports. Test the policy from a pod
+  with the edge's labels before relying on it: a blocked call to the proxy, the ACME CA or a
+  collector shows up only as a timeout.
+- On other CNIs the `ipBlock` does no harm beside the `podSelector`; test the same way.
 
 ## Failover between sites — an upstream pool
 

@@ -710,7 +710,18 @@ pub struct ServerCfg {
     /// EdgeGuard sits behind a trusted proxy/load balancer that sets it (e.g. a PaaS
     /// edge). When false (default) the peer socket address is used, so clients can't
     /// spoof their IP to defeat per-IP rate limiting or forge access-log entries.
+    ///
+    /// The client is the entry `forwarded_hops` from the RIGHT of `X-Forwarded-For` (several
+    /// header lines are one list, in order): each proxy appends the address it saw, so the
+    /// leftmost entries are whatever the client sent and only the trusted proxies' own are
+    /// believed. A header with fewer entries, or a chosen entry that is not an IP address, falls
+    /// back to the TCP peer.
     pub trust_forwarded_for: bool,
+    /// How many `X-Forwarded-For` entries the trusted proxies in front of EdgeGuard append: `1`
+    /// (default) for an ALB in `append` mode, Cloudflare, nginx or Traefik; `2` for a GCP external
+    /// Application Load Balancer (it appends the client and its own address) or CloudFront → ALB.
+    /// `1` to `10`. Only read with `trust_forwarded_for`.
+    pub forwarded_hops: usize,
     /// Private listener port for the internal `/__edgeguard/*` ops endpoints (health,
     /// readiness, metrics). `0` (default) keeps them on the public port. When non-zero,
     /// EdgeGuard binds a second, plain-HTTP listener on `admin_addr:admin_port` that serves
@@ -726,8 +737,10 @@ pub struct ServerCfg {
     /// connection that sends nothing, one that sends its headers a byte at a time, and a
     /// keep-alive connection idle between requests. It runs before auth and rate limiting, so
     /// without it a few clients can hold sockets open indefinitely. A request already being
-    /// answered is not affected, however long its response takes. `"0"` disables. Applies to every
-    /// listener; read at startup, not on reload.
+    /// answered is not affected, however long its response takes. With `proxy_protocol`, a new
+    /// connection's PROXY header and first request head share this one timeout; a TLS handshake
+    /// between them has its own 10 s bound. `"0"` disables. Applies to every listener; read at
+    /// startup, not on reload.
     pub header_read_timeout: String,
     /// Most connections the public listener holds open at once. One more is closed as soon as it
     /// is accepted and counted in `edgeguard_connections_rejected_total`. `0` (default) is
@@ -750,7 +763,9 @@ pub struct ServerCfg {
     /// a GCP TCP proxy, HAProxy, F5), which passes TCP through and so adds no `X-Forwarded-For`:
     /// without it, rate limits, IP access rules and the access log see the balancer's address.
     /// The header is believed only from `proxy_protocol_trusted`; from any other peer a connection
-    /// that starts with one is closed, and one that does not is served as it is. Off by default.
+    /// that starts with one is closed, and one that does not is served as it is. From 0.7.0
+    /// the admin listener reads it too, as optional, so a balancer's `LOCAL` health check there is
+    /// answered; 0.7.0-rc.1 and earlier read none on the admin port. Off by default.
     pub proxy_protocol: bool,
     /// The addresses a PROXY header is believed from: the load balancer's, as CIDRs or bare IPs.
     /// Required with `proxy_protocol`; a `/0` is refused, since it would let any client choose its
@@ -1196,6 +1211,7 @@ impl Default for ServerCfg {
             app_port: 3000,
             upstream: String::new(),
             trust_forwarded_for: false,
+            forwarded_hops: 1,
             admin_port: 0,
             admin_addr: "127.0.0.1".into(),
             header_read_timeout: "30s".into(),
@@ -1782,14 +1798,25 @@ impl Default for UpstreamRoute {
     }
 }
 
-/// One entry of a pool's `targets` or `backup`: a URL, or `{ url = "…", weight = 3 }`.
+/// One entry of a pool's `targets` or `backup`: a URL, or a table such as
+/// `{ url = "…", weight = 3, check_host = "10.0.9.5" }`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetCfg {
+    /// The target's base URL, `http://` or `https://`, where its requests go. A bare string in
+    /// the list is this alone.
     pub url: String,
     /// Its turns, with `balance = "round_robin"`, for each one the others with weight 1 get: a
     /// target with weight 3 takes three requests for every one theirs take. `None` for a bare
     /// URL, which counts as 1.
     pub weight: Option<u32>,
+    /// Where this target's health check goes instead of the URL's host: a host name or IP
+    /// address, e.g. the server's address on a management network. The pool's
+    /// `health_check.port` and `scheme` still apply, and the check still sends the target's own
+    /// name as `Host`. For an `https://` target, a check over https verifies the target's own name
+    /// and uses its TLS settings, since it is the same server. An `http://` target checked over
+    /// https has no TLS settings of its own: that check verifies the address dialled and takes
+    /// the settings for it. `None`: the URL's host.
+    pub check_host: Option<String>,
 }
 
 impl From<&str> for TargetCfg {
@@ -1797,13 +1824,18 @@ impl From<&str> for TargetCfg {
         TargetCfg {
             url: url.to_string(),
             weight: None,
+            check_host: None,
         }
     }
 }
 
 impl From<String> for TargetCfg {
     fn from(url: String) -> Self {
-        TargetCfg { url, weight: None }
+        TargetCfg {
+            url,
+            weight: None,
+            check_host: None,
+        }
     }
 }
 
@@ -1816,12 +1848,13 @@ impl<'de> Deserialize<'de> for TargetCfg {
         struct Table {
             url: String,
             weight: Option<u32>,
+            check_host: Option<String>,
         }
         struct Entry;
         impl<'de> serde::de::Visitor<'de> for Entry {
             type Value = TargetCfg;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a URL, or a table with url and weight")
+                f.write_str("a URL, or a table with url, weight and check_host")
             }
             fn visit_str<E: serde::de::Error>(
                 self,
@@ -1837,6 +1870,7 @@ impl<'de> Deserialize<'de> for TargetCfg {
                 Ok(TargetCfg {
                     url: t.url,
                     weight: t.weight,
+                    check_host: t.check_host,
                 })
             }
         }
@@ -1848,7 +1882,7 @@ impl<'de> Deserialize<'de> for TargetCfg {
 /// on each target every `interval`. A target answering `2xx` or `3xx` within `timeout` passes. It leaves
 /// rotation after `unhealthy_after` failures in a row and returns after `healthy_after` passes. A
 /// new target starts in rotation, and is checked at once.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct HealthCheckCfg {
     /// `"http"` (default): `GET path`, judged by `expect_status` and `expect_body`. `"tcp"`: a
@@ -1890,6 +1924,10 @@ pub struct HealthCheckCfg {
     /// is checked over TLS on this port too, with the TLS settings its requests use) and path
     /// prefix are kept. `0` (default): the target's own port.
     pub port: u16,
+    /// Check over `"http"` or `"https"` instead of the target's own scheme, for a management
+    /// port that does not speak what requests do: plain HTTP beside a TLS request port, or the
+    /// reverse. Usually with `port`. Empty (default): the target's scheme.
+    pub scheme: String,
 }
 
 impl Default for HealthCheckCfg {
@@ -1907,6 +1945,7 @@ impl Default for HealthCheckCfg {
             method: "GET".into(),
             headers: Vec::new(),
             port: 0,
+            scheme: String::new(),
         }
     }
 }

@@ -247,6 +247,13 @@ async fn an_acme_order_takes_outbound_and_its_extra_ca_beside_the_system_store()
 /// client did — not the roots built into the binary, which every other client uses. A private ACME
 /// CA installed on the host therefore keeps working. `SSL_CERT_FILE` stands in for the host's
 /// store here; nothing else in this file depends on it.
+///
+/// That second half runs only where the platform verifier reads the store through
+/// rustls-native-certs, which honours `SSL_CERT_FILE` (Linux and the other Unixes, as the
+/// verifier's own `cfg`s pick its backend). On Windows and Apple platforms it asks the OS to build the chain, and
+/// the OS store cannot be stood in for without installing a root in the real one, which on Windows
+/// opens a confirmation dialog. The first half, that a CA nobody installed is refused, runs
+/// everywhere.
 #[tokio::test]
 async fn with_nothing_set_the_acme_client_trusts_the_system_store() {
     let dir = Dir::new();
@@ -264,12 +271,15 @@ async fn with_nothing_set_the_acme_client_trusts_the_system_store() {
         "no request got past the handshake"
     );
 
-    let bundle = dir.write("system-bundle.pem", &ca.pem);
-    std::env::set_var("SSL_CERT_FILE", &bundle);
-    let (e, account) = order(&stub, OutboundCfg::default()).await;
-    std::env::remove_var("SSL_CERT_FILE");
-    assert!(e.contains("the stub refuses every order"), "{e}");
-    assert!(account, "trusted through the system store");
+    #[cfg(all(unix, not(target_os = "android"), not(target_vendor = "apple")))]
+    {
+        let bundle = dir.write("system-bundle.pem", &ca.pem);
+        std::env::set_var("SSL_CERT_FILE", &bundle);
+        let (e, account) = order(&stub, OutboundCfg::default()).await;
+        std::env::remove_var("SSL_CERT_FILE");
+        assert!(e.contains("the stub refuses every order"), "{e}");
+        assert!(account, "trusted through the system store");
+    }
 }
 
 /// RFC 8555 requires https of an ACME server, and instant-acme's own client enforced it on every

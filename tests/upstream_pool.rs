@@ -175,11 +175,13 @@ fn in_rotation(metrics: &Metrics, upstream: &str) -> Option<u64> {
     )
 }
 
-/// Wait up to 3s for `cond`.
+/// Wait up to 10s for `cond`. Generous because a refused connect to loopback takes about two
+/// seconds on Windows (the SYN is retried after the RST), and a health check that has to see two
+/// of them in a row takes twice that.
 async fn until(what: &str, mut cond: impl FnMut() -> bool) {
     let started = Instant::now();
     while !cond() {
-        assert!(started.elapsed() < Duration::from_secs(3), "never: {what}");
+        assert!(started.elapsed() < Duration::from_secs(10), "never: {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -1400,7 +1402,9 @@ async fn an_ejection_soon_after_the_last_lasts_longer() {
     let (a, gone) = (up("a").await, dead().await);
     let mut c = cfg(&[&gone, &a.url]);
     c.upstreams[0].eject_for = "200ms".into();
-    c.upstreams[0].eject_for_max = "1s".into();
+    // The streak is judged when the failure is seen, which on Windows is about two seconds after
+    // the connect (the SYN is retried after the RST): a cap under that would end it every time.
+    c.upstreams[0].eject_for_max = "5s".into();
     let edge = edge(c).await;
     let ejected = |j: &serde_json::Value| target_named(route_named(j, "app"), &gone).clone();
 
@@ -1416,7 +1420,7 @@ async fn an_ejection_soon_after_the_last_lasts_longer() {
     assert_eq!(t["ejections_in_a_row"], 2);
     assert_eq!(
         route_named(&status(&edge).await, "app")["eject_for_max_s"],
-        1.0
+        5.0
     );
 }
 
@@ -1816,7 +1820,8 @@ async fn a_tcp_check_only_connects() {
     c.upstreams[0].health_check = HealthCheckCfg {
         kind: "tcp".into(),
         interval: "50ms".into(),
-        timeout: "1s".into(),
+        // Past the two seconds a refused connect takes on Windows, so it is reported as refused.
+        timeout: "5s".into(),
         ..Default::default()
     };
     let edge = edge(c).await;
@@ -2134,7 +2139,8 @@ async fn a_tcp_check_can_go_to_another_port_of_the_target() {
         kind: "tcp".into(),
         port,
         interval: "50ms".into(),
-        timeout: "1s".into(),
+        // Past the two seconds a refused connect takes on Windows, so it is reported as refused.
+        timeout: "5s".into(),
         ..Default::default()
     };
     let edge = edge(c).await;

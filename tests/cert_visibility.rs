@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 mod common;
-use common::{Ca, Dir};
+use common::{label_value, Ca, Dir};
 
 use edgeguard::certstore::{CertInfo, CrlInfo};
 use edgeguard::config::Config;
@@ -60,11 +60,13 @@ async fn an_upstream_client_certificate_joins_the_expiry_series_and_the_tls_endp
     let state = build_state(Arc::new(cfg)).unwrap();
 
     // Process-wide certificates are only reported by the registry that opts in, as `main`'s does.
-    assert!(!state.metrics.render().contains(&format!("client:{cert}")));
+    // The path as a label value: escaped, so a Windows path's backslashes are doubled.
+    let label = label_value(&cert);
+    assert!(!state.metrics.render().contains(&format!("client:{label}")));
     state.metrics.report_client_certs();
     let text = state.metrics.render();
     let not_after = CertInfo::from_der(&leaf.der).unwrap().not_after;
-    let series = format!("cert=\"client:{cert}\"");
+    let series = format!("cert=\"client:{label}\"");
     assert!(
         text.contains(&format!(
             "edgeguard_tls_cert_not_after_seconds{{source=\"file\",{series}}} {not_after}\n"
@@ -149,7 +151,7 @@ async fn the_client_auth_cas_and_crls_join_the_series_and_the_endpoint() {
         .find(|l| l.starts_with("edgeguard_tls_crl_next_update_seconds{"))
         .unwrap_or_else(|| panic!("{text}"));
     assert!(
-        crl_line.contains(&format!("crl=\"{crl_path}\"")),
+        crl_line.contains(&format!("crl=\"{}\"", label_value(&crl_path))),
         "{crl_line}"
     );
     let next: i64 = crl_line.rsplit_once(' ').unwrap().1.parse().unwrap();

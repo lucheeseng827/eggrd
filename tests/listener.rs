@@ -454,13 +454,16 @@ async fn shutdown_finishes_the_in_flight_request_then_refuses_new_connections() 
 
     srv.shutdown.send(true).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        TcpStream::connect(srv.addr).await.is_err(),
-        "the listening socket must be closed once draining"
-    );
+    // Checked before the connect below: on Windows a refused connect to loopback takes about two
+    // seconds (the SYN is retried after the RST), by which time the 700 ms request has finished
+    // and serve has rightly returned.
     assert!(
         !srv.task.is_finished(),
         "serve must not return while a request is in flight"
+    );
+    assert!(
+        TcpStream::connect(srv.addr).await.is_err(),
+        "the listening socket must be closed once draining"
     );
     assert_eq!(in_flight.await.unwrap(), (200, "slow".into()));
     tokio::time::timeout(Duration::from_secs(2), srv.task)

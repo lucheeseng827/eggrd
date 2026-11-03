@@ -368,8 +368,7 @@ async fn a_certificate_header_is_trusted_by_the_hop_that_wrote_it_not_the_client
     let ca = Ca::new("partner CA");
     let pem = ca
         .client_with(vec![uri("spiffe://prod/ns/web")], "web", 7)
-        .cert
-        .replace('\n', " ");
+        .one_line_pem();
     let header = format!("X-Client-Cert: {pem}\r\n");
     let with_header_trusted_from = |trusted: &str| {
         let mut c = cfg(up, "127.0.0.1");
@@ -736,13 +735,16 @@ const SLOW_HEADER: &[u8] = b"PROXY TCP4 203.0.113.7 10.0.0.1 51234 443\r\n";
 /// A request head that never ends: dripped until the edge closes the connection.
 const SLOW_HEAD: &[u8] = b"GET /__edgeguard/health HTTP/1.1\r\nHost: edge\r\nX-Slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// `bytes` to `w`, one at a time, `gap` apart.
+/// `bytes` to `w`, one at a time, `gap` apart. Paced against a schedule from the start rather
+/// than a sleep after each byte: Windows rounds every sleep up to its timer tick (about 15.6 ms),
+/// so 45 sleeps of 16 ms took nearly twice as long as asked and ran the header past the timeout.
 async fn drip<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8], gap: Duration) {
-    for b in bytes {
+    let start = tokio::time::Instant::now();
+    for (i, b) in (1u32..).zip(bytes) {
         if w.write_all(std::slice::from_ref(b)).await.is_err() || w.flush().await.is_err() {
             return;
         }
-        tokio::time::sleep(gap).await;
+        tokio::time::sleep_until(start + gap * i).await;
     }
 }
 

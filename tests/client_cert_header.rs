@@ -145,7 +145,7 @@ async fn a_trusted_balancers_certificate_in_each_format_authenticates_and_is_for
     );
     for (format, value) in [
         ("pem", alb_escape(&leaf.cert)),
-        ("pem", leaf.cert.replace('\n', " ")),
+        ("pem", leaf.one_line_pem()),
         ("der", b64(&leaf.der)),
         ("der", traefik),
         ("xfcc", xfcc),

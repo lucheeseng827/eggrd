@@ -18,6 +18,17 @@ All notable changes to EdgeGuard are documented here. The format is based on
   tags for 45 minutes. A tag found overwritten is re-pointed to the index and the release fails,
   so the overwrite is fixed and reported instead of shipping silently. `0.5.0` and `0.7.0-rc.1`
   are still amd64-only on Docker Hub; pull `0.5` or `0.7.0` for both architectures.
+- **The Windows test leg is green again.** It had failed since 0.7.0-rc.1, on eleven tests that
+  assumed Unix and a twelfth that failed on Windows' timer only sometimes; eggrd itself behaved correctly on Windows in every case. The tests now hold on
+  both: a certificate or CRL path in a metrics label is compared as the exposition escapes it
+  (a Windows path's backslashes are doubled); a PEM folded onto one header line is split with
+  `lines()`, since the test PKI writes CRLF on Windows; the tests that refuse a connection
+  allow for the two seconds Windows takes to refuse one on loopback (it retries the SYN after
+  the RST), in their timeouts, poll deadlines and ejection cap, and the drain test checks that
+  serve is still running before it makes that connection; the dripped-header test paces its
+  bytes against a schedule, as Windows rounds each sleep up to its 15.6 ms tick; and the ACME
+  test's `SSL_CERT_FILE` half runs only where the platform verifier reads that variable, as on
+  Windows and macOS it asks the OS store instead.
 
 ## [0.7.0] — 2026-11-03
 

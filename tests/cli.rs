@@ -505,7 +505,8 @@ fn a_rotated_upstream_client_certificate_is_picked_up_without_a_restart() {
             .unwrap()
             .not_after;
         format!(
-            "edgeguard_tls_cert_not_after_seconds{{source=\"file\",cert=\"client:{cert}\"}} {not_after}\n"
+            "edgeguard_tls_cert_not_after_seconds{{source=\"file\",cert=\"client:{}\"}} {not_after}\n",
+            common::label_value(&cert)
         )
     };
     let reported = series(&first);

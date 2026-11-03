@@ -179,6 +179,10 @@ async fn each_way_an_upstream_can_fail_has_its_own_result() {
         (closed_port().await, broken(false).await, broken(true).await);
     let (tls, _stop_tls) = untrusted_tls(&dir).await;
     let mut cfg = base(up);
+    // Long enough for a refusal to arrive: on Windows a refused connect to loopback takes about
+    // two seconds (the SYN is retried after the RST), and past the timeout it would count as one.
+    // `/hang` (5 s) still times out.
+    cfg.validation.upstream_timeout = "4s".into();
     cfg.upstreams = vec![
         route("/refused/", format!("http://{refused}")),
         route("/reset/", format!("http://{reset}")),

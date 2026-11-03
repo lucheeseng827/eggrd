@@ -161,6 +161,22 @@ impl Leaf {
     pub fn identity_pem(&self) -> Vec<u8> {
         format!("{}{}", self.cert, self.key).into_bytes()
     }
+
+    /// The certificate's PEM on one line, its line breaks turned into spaces, as a balancer that
+    /// folds it into a header writes it. Split with `lines()`, not on `'\n'`: rcgen ends PEM lines
+    /// with `\r\n` on Windows, and a `\r` left in a header value makes it invalid.
+    pub fn one_line_pem(&self) -> String {
+        self.cert.lines().collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// `value` as the Prometheus exposition writes a label value: `\`, `"` and newline escaped. It
+/// matters for file paths on Windows, whose backslashes the exposition doubles.
+pub fn label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// A URI alternative name (a SPIFFE ID, say).

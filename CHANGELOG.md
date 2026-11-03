@@ -6,6 +6,19 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+### CI
+
+- **The release now guards its image tags after it finishes, and runs once per release.** On
+  0.5.0, 0.7.0-rc.1 and 0.7.0, about 22 minutes after the tag, `mancube/eggrd:X.Y.Z` (and on
+  0.7.0 `latest`) were overwritten by an amd64-only image built outside the release workflow,
+  after that workflow had pushed and verified the multi-arch index; `X.Y` stayed correct. The
+  release workflow now runs one pipeline per release (the tag-push run stands down when a
+  release exists for its tag), writes all tags only from the multi-arch index, asserts that
+  every tag it wrote is that index with `linux/amd64` and `linux/arm64`, and then watches the
+  tags for 45 minutes. A tag found overwritten is re-pointed to the index and the release fails,
+  so the overwrite is fixed and reported instead of shipping silently. `0.5.0` and `0.7.0-rc.1`
+  are still amd64-only on Docker Hub; pull `0.5` or `0.7.0` for both architectures.
+
 ## [0.7.0] — 2026-11-03
 
 eggrd 0.7.0: it stays up, shows who called what, and encrypts every hop. This section is written

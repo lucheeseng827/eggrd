@@ -28,9 +28,11 @@ name: release
 on:
   # The monorepo's sync job ends with `gh release create vX --repo lucheeseng827/eggrd`,
   # so `release: published` is the trigger that actually fires in normal operation. The
-  # tag-push trigger is kept for a tag pushed directly on the mirror; a release created
-  # through the API does not always raise a push event, and relying on that alone is how
-  # a release silently ships no image.
+  # tag-push trigger is kept as a safety net for a tag pushed directly on the mirror with no
+  # release; a release created through the API does not always raise a push event, so the
+  # push trigger alone is how a release silently ships no image. But `gh release create`
+  # usually raises BOTH, so the `gate` job below stands the push-event run down whenever a
+  # release exists for its tag: one pipeline per release.
   release:
     types: [published]
   push:
@@ -45,16 +47,34 @@ on:
         type: boolean
         default: true
 
-# Both triggers above can fire for one release: `gh release create` creates the tag, which
-# raises a push event alongside the release event. On 0.3.0 that ran two full pipelines
-# concurrently against the same tags, and they interleaved — `0.3` ended up correctly
-# multi-arch while `0.3.0` and `latest` were overwritten as amd64-only, so arm64 users
-# pulling `latest` silently got an amd64 image. The manifest assertion caught it and failed
-# the release, which is the only reason it did not pass as green.
+# ── What went wrong on 0.5.0, 0.7.0-rc.1 and 0.7.0, and what this file does about it
 #
-# Keyed on the ref so the duplicate queues behind the first run instead of racing it, and
-# NOT cancel-in-progress: cancelling mid-push is what leaves half-written tags. The second
-# run then redoes the same work against the same digests, which is idempotent and harmless.
+# The release runs were not at fault. Both runs (release event and tag push) queued on the
+# concurrency group below, as intended, each wrote all three tags as one multi-arch index, and
+# each passed its own assertion. About 22 minutes after the tag, after this workflow had
+# finished, `X.Y.Z` (and on 0.7.0 `latest`) were overwritten by an amd64-only image with
+# Docker media types and Docker-engine BuildKit history, built from this Dockerfile by some
+# OTHER publisher holding the repository's credentials. `X.Y` was never touched. Nothing in
+# this workflow pushes such an image, so nothing in this workflow could prevent it, and an
+# assertion that runs only before the overwrite cannot see it.
+#
+# So, in order:
+#   1. one pipeline per release (the `gate` job), so the only writes this workflow makes are
+#      one set, from one run;
+#   2. per-arch images are pushed by digest only, never with a tag;
+#   3. `imagetools create` in `manifest` is the only step that writes `X.Y.Z`, `X.Y`, `latest`;
+#   4. `manifest` asserts, for every tag it wrote, an index with linux/amd64 and linux/arm64,
+#      the two digests this run built, and one digest across all tags (scripts/release-tags.sh);
+#   5. `watch` re-asserts the tags for 45 minutes after the release. A tag found overwritten is
+#      re-pointed to this run's index and the job FAILS, so the release is red until whoever
+#      owns the other publisher turns it off.
+#
+# Earlier history: on 0.3.0 an assertion that grepped for `"architecture":"amd64"` (no space)
+# could never match pretty-printed JSON and failed a correct release; it now parses the index.
+#
+# Keyed on the ref so a duplicate run queues behind the first instead of racing it (both
+# events give `github.ref_name` = `vX`), and NOT cancel-in-progress: cancelling mid-push is
+# what leaves half-written tags.
 concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
@@ -66,8 +86,46 @@ env:
   IMAGE: mancube/eggrd
 
 jobs:
+  # One pipeline per release. `gh release create` raises a `release` event AND a tag `push`;
+  # the push-event run stands down when a release exists for its tag, because the release-event
+  # run publishes it. A tag pushed with no release (the case the push trigger is kept for) finds
+  # none and goes ahead. The lookup is retried for a minute so a release created a moment after
+  # its tag is still seen; if GitHub cannot be asked at all the run goes ahead, since a duplicate
+  # run queues on the concurrency group and is harmless, and a missing one ships no image.
+  gate:
+    runs-on: ubuntu-24.04
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - name: One pipeline per release
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = "push" ]; then
+            for i in 1 2 3 4 5; do
+              if gh release view "$TAG" --repo "$REPO" --json tagName >/dev/null 2>&1; then
+                run=false
+                echo "::notice::release $TAG exists; its release-event run publishes it, so this tag-push run stands down."
+                break
+              fi
+              if [ "$i" -lt 5 ]; then sleep 15; fi
+            done
+            if [ "$run" = true ]; then
+              echo "No release for $TAG: a bare tag push, so this run publishes it."
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
   build:
     name: build ${{ matrix.arch }}
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true'
     runs-on: ${{ matrix.runner }}
     environment: cicd
     strategy:
@@ -96,6 +154,7 @@ jobs:
           DISPATCH_PUSH: ${{ inputs.push }}
           REF_NAME: ${{ github.ref_name }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PLATFORM: ${{ matrix.platform }}
           HAS_CREDS: ${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != '' }}
         run: |
           set -euo pipefail
@@ -117,7 +176,7 @@ jobs:
           [ "$HAS_CREDS" != "true" ] && push=false
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "push=$push"       >> "$GITHUB_OUTPUT"
-          echo "Building $version for ${{ matrix.platform }} (push=$push)"
+          echo "Building $version for $PLATFORM (push=$push)"
 
       - name: Assert Cargo.toml agrees with the release version
         env:
@@ -144,8 +203,9 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # Push by digest only. Tags are applied once, on the merged manifest, so a
-      # half-finished release never leaves a tag pointing at a single architecture.
+      # Push by digest only: no `tags:` here, ever. Tags are applied once, on the merged
+      # manifest, so a half-finished release never leaves a tag pointing at a single
+      # architecture. OCI media types, so the index `imagetools create` makes is an OCI index.
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
@@ -158,18 +218,19 @@ jobs:
           # attestation manifest buildx adds by default.
           provenance: false
           sbom: false
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=${{ steps.cfg.outputs.push }},name-canonical=true,push=${{ steps.cfg.outputs.push }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,oci-mediatypes=true,push=${{ steps.cfg.outputs.push }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
       - name: Export the digest
         if: steps.cfg.outputs.push == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          test -n "$digest" || { echo "::error::build produced no digest"; exit 1; }
-          touch "/tmp/digests/${digest#sha256:}"
+          test -n "$DIGEST" || { echo "::error::build produced no digest"; exit 1; }
+          touch "/tmp/digests/${DIGEST#sha256:}"
 
       - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: steps.cfg.outputs.push == 'true'
@@ -189,7 +250,8 @@ jobs:
     # `push: false` is documented as a dry run, and a dry run must not publish a crate — a
     # crates.io release cannot be withdrawn, only yanked, so "oops" is permanent there in a way
     # it is not on Docker Hub. A real release event always publishes.
-    if: github.event_name != 'workflow_dispatch' || inputs.push
+    needs: [gate]
+    if: needs.gate.outputs.run == 'true' && (github.event_name != 'workflow_dispatch' || inputs.push)
     runs-on: ubuntu-24.04
     environment: cicd
     steps:
@@ -277,7 +339,17 @@ jobs:
     if: needs.build.outputs.push == 'true'
     runs-on: ubuntu-24.04
     environment: cicd
+    outputs:
+      digest: ${{ steps.create.outputs.digest }}
+      tags: ${{ steps.create.outputs.tags }}
+      children: ${{ steps.create.outputs.children }}
     steps:
+      # Only for scripts/release-tags.sh, the assertion this job and `watch` both run.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
       - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
           path: /tmp/digests
@@ -291,56 +363,107 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      # The ONLY step that writes `X.Y.Z`, `X.Y` and `latest`, all in one `imagetools create`
+      # from the two per-arch digests above.
       - name: Create and push the multi-arch manifest
+        id: create
         env:
           VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
           cd /tmp/digests
-          n=$(ls -1 | wc -l)
+          files=(*)
+          n=${#files[@]}
           # Two digests, or the manifest would silently ship one architecture.
           [ "$n" -eq 2 ] || { echo "::error::expected 2 digests, found $n"; exit 1; }
           # A prerelease (`0.6.0-beta.1`) gets its exact tag only. Moving `latest` or the `X.Y` tag to
           # it would hand a beta to everyone who pulls without pinning, and `${VERSION%.*}` of a
           # prerelease is not a minor version at all (`0.6.0-beta`).
-          tags=(-t "${IMAGE}:${VERSION}")
+          names=("$VERSION")
           case "$VERSION" in
             *-*) echo "Prerelease ${VERSION}: not moving latest or the minor tag." ;;
-            *) tags+=(-t "${IMAGE}:${VERSION%.*}" -t "${IMAGE}:latest") ;;
+            *) names+=("${VERSION%.*}" latest) ;;
           esac
-          docker buildx imagetools create "${tags[@]}" \
-            $(printf "${IMAGE}@sha256:%s " *)
+          tags=()
+          for t in "${names[@]}"; do tags+=(-t "${IMAGE}:${t}"); done
+          srcs=()
+          children=()
+          for d in *; do
+            srcs+=("${IMAGE}@sha256:${d}")
+            children+=("sha256:${d}")
+          done
+          docker buildx imagetools create "${tags[@]}" "${srcs[@]}"
+          digest=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r '.digest')
+          echo "Index ${digest} -> ${names[*]}"
+          {
+            echo "digest=${digest}"
+            echo "tags=${names[*]}"
+            echo "children=${children[*]}"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Verify both architectures are really in the manifest
+      # Hard gate, for EVERY tag written above: a multi-arch index with linux/amd64 and
+      # linux/arm64, containing the two digests this run built, and one digest across all tags.
+      # A wrong tag is re-pointed to the index once and re-asserted, and the step still fails.
+      - name: Assert every tag is this run's multi-arch index
         env:
-          VERSION: ${{ needs.build.outputs.version }}
+          TAGS: ${{ steps.create.outputs.tags }}
+          EXPECT_DIGEST: ${{ steps.create.outputs.digest }}
+          EXPECT_CHILDREN: ${{ steps.create.outputs.children }}
+          HEAL: "1"
         run: |
           set -euo pipefail
-          # Parse the index rather than grepping it. `--raw` returns pretty-printed JSON —
-          # `"architecture": "amd64"`, with a space — so the previous grep for
-          # '"architecture":"amd64"' could never match and failed 0.3.0 as "amd64 missing"
-          # while all three tags were in fact correctly multi-arch. An assertion that cannot
-          # pass is worse than none: it cost a release investigation and teaches people to
-          # re-run through red.
-          out=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --raw)
-          archs=$(echo "$out" | jq -r '[.manifests[]?.platform.architecture] | sort | join(",")')
-          echo "${IMAGE}:${VERSION} advertises: ${archs:-<none>}"
-          for want in amd64 arm64; do
-            echo "$out" | jq -e --arg a "$want" '[.manifests[]?.platform.architecture] | index($a)' >/dev/null               || { echo "::error::$want missing from ${IMAGE}:${VERSION} (found: ${archs:-none})"; exit 1; }
-          done
-          echo "amd64 and arm64 both present in ${IMAGE}:${VERSION}"
+          read -r -a tag_list <<<"$TAGS"
+          bash scripts/release-tags.sh assert "$IMAGE" "${tag_list[@]}"
 
       - name: Summary
         env:
-          VERSION: ${{ needs.build.outputs.version }}
+          TAGS: ${{ steps.create.outputs.tags }}
+          DIGEST: ${{ steps.create.outputs.digest }}
         run: |
+          # TAGS is a space-separated list, split on purpose; the backticks are Markdown.
+          # shellcheck disable=SC2086,SC2016
+          list=$(printf '`%s`, ' $TAGS)
           {
-            echo "### Pushed \`${IMAGE}:${VERSION}\`"
+            echo "### Pushed \`${IMAGE}@${DIGEST}\`"
             echo
             echo "- \`linux/amd64\` built natively on \`ubuntu-24.04\`"
             echo "- \`linux/arm64\` built natively on \`ubuntu-24.04-arm\` (no QEMU)"
-            case "$VERSION" in
-              *-*) echo "- tags: \`${VERSION}\` only (prerelease: \`latest\` and the minor tag stay put)" ;;
-              *) echo "- tags: \`${VERSION}\`, \`${VERSION%.*}\`, \`latest\`" ;;
-            esac
+            echo "- tags: ${list%, }"
+            echo "- the \`watch tags\` job keeps checking these tags for 45 minutes"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # A tag that is right when `manifest` finishes can still be overwritten afterwards by any other
+  # publisher with the repository's credentials. On 0.5.0, 0.7.0-rc.1 and 0.7.0 one did, about
+  # 22 minutes after the tag, with an amd64-only image; every release run had already passed.
+  # This job re-asserts the tags every two minutes for 45 minutes. A tag found overwritten is
+  # re-pointed to this run's index and the job fails: the tags are right again, and the release
+  # is red until the other publisher is switched off.
+  watch:
+    name: watch tags
+    needs: [manifest]
+    runs-on: ubuntu-24.04
+    environment: cicd
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Re-assert the tags for 45 minutes
+        env:
+          TAGS: ${{ needs.manifest.outputs.tags }}
+          EXPECT_DIGEST: ${{ needs.manifest.outputs.digest }}
+          EXPECT_CHILDREN: ${{ needs.manifest.outputs.children }}
+          HEAL: "1"
+        run: |
+          set -euo pipefail
+          read -r -a tag_list <<<"$TAGS"
+          bash scripts/release-tags.sh watch "$IMAGE" 45 120 "${tag_list[@]}"

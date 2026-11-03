@@ -1,11 +1,11 @@
 # EdgeGuard (`mancube/eggrd`)
 
-**A drop-in Rust edge proxy: authentication, rate limiting, hardened response headers, and TLS — with zero code changes to your app.**
+**A drop-in Rust edge proxy: authentication, rate limiting, hardened response headers, and TLS and mutual TLS on every hop — with zero code changes to your app.**
 
-EdgeGuard is the missing front door for any HTTP app (including the ones generated/vibe-coded without one). It owns the request path (auth, rate-limit, validation, WAF-lite) and the response path (CSP/HSTS/cookie hardening, leaky-header stripping) in a single static binary.
+EdgeGuard is the missing front door for any HTTP app (including the ones generated/vibe-coded without one). It owns the request path (auth, rate-limit, validation, WAF-lite) and the response path (CSP/HSTS/cookie hardening, leaky-header stripping) in a single static binary, and since 0.7 it can balance and fail over across a pool of upstreams and report API usage by route, consumer and upstream.
 
 - **Image:** `mancube/eggrd` — static musl binary on **distroless/static**, runs as **nonroot**, no shell, CA roots included.
-- **Size:** ~8 MB pulled, ~21 MB on disk · **Arch:** `linux/amd64`, `linux/arm64` (both built natively; measured on 0.3.0)
+- **Size:** ~7.6 MB compressed (`amd64`), ~7.3 MB (`arm64`), measured on 0.7.0 · **Arch:** `linux/amd64`, `linux/arm64` (both built natively)
 - **Binary inside:** `/usr/local/bin/edgeguard` (entrypoint) · **Exposes:** `8080`
 - **Default config (baked in):** `/etc/edgeguard/edgeguard.toml`
 - **Source / full docs:** [github.com/lucheeseng827/eggrd](https://github.com/lucheeseng827/eggrd) · Apache-2.0
@@ -15,8 +15,9 @@ EdgeGuard is the missing front door for any HTTP app (including the ones generat
 EdgeGuard is the **secure front door**: one hop that sits **between your clients and
 the app**, so traffic reaches the app only after it clears auth, rate limiting, and
 validation. Your app stops listening on the public port — EdgeGuard does — and is
-forwarded to *unchanged*. One upstream, one hop; it is not a CDN, an API gateway, or
-an identity provider.
+forwarded to *unchanged*. One hop, to one upstream or a pool of them (balanced, health-checked,
+failing over), over plain HTTP, TLS or mutual TLS; it is not a CDN, an API gateway, or an
+identity provider.
 
 ```
    CLIENTS                 EDGEGUARD                UPSTREAMS
@@ -41,14 +42,17 @@ an identity provider.
 
 - **Upstream** — every client hits EdgeGuard, never the app directly: browsers, API
   callers, streaming LLM/SSE apps, bots and scanners. It may sit behind a CDN /
-  platform LB that forwards to it; EdgeGuard terminates TLS, authenticates,
-  rate-limits, and screens (WAF / edge DLP) before anything is forwarded.
+  platform LB that forwards to it (the client's address comes from a PROXY protocol
+  header or the balancer's `X-Forwarded-For` entry); EdgeGuard terminates TLS, verifies
+  client certificates if asked, authenticates, rate-limits, and screens (WAF / edge DLP)
+  before anything is forwarded.
 - **EdgeGuard** — the request path (auth, limit, validation) in, the response path
   (CSP/HSTS, cookie hardening, leaky-header stripping) out — one static binary, no
   required external services.
-- **Downstream** — a wrapped child on `APP_PORT` or an external `UPSTREAM` URL: your
-  own app, a streaming LLM backend, or a static frontend + `/api` backend split via
-  `[[upstreams]]`. The app is forwarded to unchanged — zero code changes.
+- **Downstream** — a wrapped child on `APP_PORT`, an external `UPSTREAM` URL, or a pool
+  of targets per path: your own app, a streaming LLM backend, or a static frontend +
+  `/api` backend split via `[[upstreams]]`. `https://` upstreams are verified, with
+  mutual TLS if needed. The app is forwarded to unchanged — zero code changes.
 - **Side channels (optional)** — Redis for one global rate-limit across replicas, a
   control plane (managed mode) for policy pull + usage/quota, and Prometheus scraping
   `/__edgeguard/metrics`.
@@ -57,7 +61,10 @@ an identity provider.
 
 | Tag | Notes |
 |---|---|
-| `latest` | newest release (= `0.5.0`) |
+| `latest` | newest release (= `0.7.0`) |
+| `0.7` | newest `0.7.x` release (= `0.7.0`) |
+| `0.7.0` | Mutual TLS on every hop (client certificates with CRLs, TLS and mTLS to upstreams, a control plane on a private CA); upstream pools with failover, weighted round robin, least connections, hashing, sticky sessions and active health checks; PROXY protocol; connection hardening (header-read timeout, connection cap, graceful drain); API-usage monitoring by route, consumer and upstream; `[outbound]` defaults for an egress proxy and private CA; security fixes for repeated credential headers and `X-Forwarded-For` (**see the upgrade note**) |
+| `0.7.0-rc.1` | prerelease of 0.7.0, superseded by it |
 | `0.5.0` | Certificates rotate on their own: ACME and self-signed renewal, and a running proxy hot-swaps a new certificate with no restart; `GET /__edgeguard/tls` and cert-expiry metrics; managed-mode edges report the certificate they serve (**see the upgrade note**) |
 | `0.4.0` | Self-signed TLS + `:80`→HTTPS redirect + `edgeguard cert`; access-log query redaction, **now on by default** (**see the upgrade note**); `aws-lc-sys` dropped — image ~9 MiB smaller |
 | `0.3.1` | `--version` added; unknown arguments now rejected instead of silently ignored |
@@ -66,8 +73,32 @@ an identity provider.
 | `0.2.1` | cookie-hardening opt-out (`httponly_cookie_exempt`) for JS-readable / double-submit CSRF cookies |
 | `0.2.0` | per-path upstreams, request IDs, gzip, WebSocket passthrough, IP access lists |
 
+There is no `0.6.0` image (its hardening shipped in 0.7.0) and no `0.7.0-rc.2` image.
+
 Pin a version in production: `mancube/eggrd:0.7.0`.
 
+> **Upgrading to 0.7.0: check these before rolling out.** Every new feature is off by default and
+> a 0.5 configuration loads as before, except:
+>
+> - **`trust_forwarded_for` now takes the `X-Forwarded-For` entry `server.forwarded_hops` from
+>   the right**, not the first (which any client could write). Set `forwarded_hops` from what the
+>   proxies in front append: **`2` behind a GCP external Application Load Balancer** (it appends
+>   two entries) **or CloudFront → ALB** (and lock the ALB to CloudFront); `1`, the default, behind
+>   an AWS ALB in its default `append` mode, Cloudflare, Azure Application Gateway, nginx or
+>   Traefik. Too low makes every client the balancer: one rate-limit bucket for everyone. Anything
+>   else, check what reaches EdgeGuard first.
+> - **A client that sends its credential header twice now gets `401`** (`Authorization` for
+>   `basic`/`jwt`, the key header for `apikey`).
+> - **Connecting to an upstream times out after 5 s with `502`**, where it waited out the 30 s
+>   upstream timeout; `validation.upstream_connect_timeout = "0"` restores it.
+> - **Keep-alive connections idle for 30 s are closed** (`server.header_read_timeout`).
+> - **The app no longer receives the client's `X-Real-IP`, `True-Client-IP`, `Forwarded` or
+>   `X-Forwarded-Host`:** `X-Real-IP` and `Forwarded` carry the resolved client, `X-Forwarded-Host`
+>   the `Host` EdgeGuard received, and `True-Client-IP` is removed. A repeated header now reaches
+>   the app with every value, in order.
+> - **ACME requests time out** (10 s connect, 30 s per request), and a bad ACME client setting now
+>   fails at startup rather than at the next renewal.
+>
 > **Upgrading to 0.5.0 turns certificate rotation on.** `[tls] watch`, `[tls.acme] renew` and
 > `self_signed_renew` all default to on, so a running proxy now reloads a certificate replaced on
 > disk (cert-manager, Vault Agent, certbot) and renews its own ACME or self-signed certificate at
@@ -149,8 +180,11 @@ Auth, rate limits, TLS/ACME, CSP, WAF-lite, and size/method limits are set in th
 
 ## What it does
 
-- **Reverse proxy** to one upstream (wrapped child process or external URL).
-- **Per-path upstreams** (`[[upstreams]]`, single upstream by default): route `/api` to a backend and everything else to a static frontend (longest-prefix wins) — a static-frontend + API-backend split in one proxy.
+- **Reverse proxy** to an upstream (wrapped child process or external URL), over plain HTTP, verified TLS, or **mutual TLS** (`[upstream_tls]`).
+- **Per-path upstreams and pools** (`[[upstreams]]`, single upstream by default): route `/api` to a backend and everything else to a static frontend (longest-prefix wins), and give a path a pool of `targets` — priority, weighted round robin, least connections, consistent hashing or sticky cookies, a `backup` tier, active HTTP/TCP health checks, and failover when a target cannot be reached.
+- **Client certificates (mTLS)** (`[tls.client_auth]`, `auth.mode = "mtls"`): verify clients against your CA with CRLs, or read the certificate a TLS-terminating load balancer forwards.
+- **Behind a load balancer**: PROXY protocol v1/v2 from trusted addresses, or `X-Forwarded-For` with `forwarded_hops`; `[outbound]` sets one egress proxy and private CA for every call the edge makes (control plane, log/OTLP shipping, JWKS, ACME).
+- **Connection hardening**: a header-read timeout against slowloris clients, a connection cap, and a graceful drain on `SIGTERM`.
 - **Streaming / passthrough**: SSE (`text/event-stream`) forwarded unbuffered, frame-by-frame (fronts streaming LLM backends without collapsing time-to-first-byte); optional WebSocket / `Upgrade` tunneling.
 - **Request IDs** (`X-Request-Id`): reuse a well-formed inbound id or mint a UUID v4, forward it upstream, echo it on every response, tag the access log — one id correlates client, proxy, and app.
 - **IP access control** (`[access]`, allow-all by default): coarse CIDR allow/deny lists evaluated by client IP before auth and rate limiting.
@@ -161,7 +195,7 @@ Auth, rate limits, TLS/ACME, CSP, WAF-lite, and size/method limits are set in th
 - **Response hardening**: CSP (+ report-only + report sink), HSTS, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`; adds `Secure; HttpOnly; SameSite` to cookies — with a per-cookie `httponly_cookie_exempt` opt-out so a JS-readable double-submit CSRF cookie stays readable; strips `Server` / `X-Powered-By`.
 - **TLS** via rustls, optional **ACME / Let's Encrypt** (HTTP-01), with **automatic certificate rotation**: ACME and self-signed certificates renew at two-thirds of their lifetime, and a certificate replaced on disk is hot-swapped without a restart (`[tls] watch`).
 - **Limits**: body-size (`413`), header-size (`431`), method allowlist (`405`).
-- **Config hot-reload**, **structured JSON access logs**, **Prometheus metrics**.
+- **Config hot-reload**, **structured JSON access logs** (who called, which route and upstream, how long, how many bytes), **Prometheus metrics** per route, consumer and upstream, with a Grafana dashboard and alert rules in the monitoring bundle.
 
 ## Ops endpoints
 
@@ -170,10 +204,11 @@ The reserved `/__edgeguard/*` namespace is never forwarded upstream:
 | Endpoint | Purpose |
 |---|---|
 | `/__edgeguard/health` | liveness (always `200`) |
-| `/__edgeguard/ready` | readiness — `200` only when upstream accepts a connection, else `503` |
+| `/__edgeguard/ready` | readiness — `200` only when upstream accepts a connection (or, for a pool at `/`, while a target is in rotation), else `503`; `503` while draining |
 | `/__edgeguard/metrics` | Prometheus metrics |
 | `/__edgeguard/csp-report` | CSP violation report sink |
-| `/__edgeguard/tls` | served certificate: source, serial, validity, days left, last renewal attempt |
+| `/__edgeguard/tls` | served certificate: source, serial, validity, days left, last renewal attempt; client certificates presented, client-auth CAs and CRLs |
+| `/__edgeguard/upstreams` | each route's targets, which are in rotation, and why one is out |
 
 Use `ADMIN_PORT` to move these onto a private listener and keep them off the public port.
 

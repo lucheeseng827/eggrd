@@ -763,9 +763,9 @@ pub struct ServerCfg {
     /// a GCP TCP proxy, HAProxy, F5), which passes TCP through and so adds no `X-Forwarded-For`:
     /// without it, rate limits, IP access rules and the access log see the balancer's address.
     /// The header is believed only from `proxy_protocol_trusted`; from any other peer a connection
-    /// that starts with one is closed, and one that does not is served as it is. From 0.7.0
-    /// the admin listener reads it too, as optional, so a balancer's `LOCAL` health check there is
-    /// answered; 0.7.0-rc.1 and earlier read none on the admin port. Off by default.
+    /// that starts with one is closed, and one that does not is served as it is. The admin
+    /// listener reads it too, as optional, so a balancer's `LOCAL` health check there is answered.
+    /// Off by default.
     pub proxy_protocol: bool,
     /// The addresses a PROXY header is believed from: the load balancer's, as CIDRs or bare IPs.
     /// Required with `proxy_protocol`; a `/0` is refused, since it would let any client choose its

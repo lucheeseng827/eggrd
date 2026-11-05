@@ -1,0 +1,108 @@
+# Vector pipeline for eggrd logs: tested with Vector 0.46 against eggrd 0.7.0 and Loki 3.4
+# (see ../LOGGING-AND-EVIDENCE.md, "Shipping"). Two inputs, one shape out:
+#
+#   eggrd_ship    eggrd's own [log.ship]: schema-2 access records, NDJSON over HTTP(S).
+#                 Bound to loopback and authenticated: run Vector as a sidecar in the edge's pod
+#                 (or on the edge's host) and set, in eggrd,
+#                   [log.ship] url = "http://127.0.0.1:8687/"
+#                              headers = [["Authorization", "Basic <base64 user:password>"]]
+#                 Anything that can reach this port and knows the credentials can write "access"
+#                 records into your evidence, so never bind it to a public interface. Across hosts,
+#                 use the tls block below (mutual TLS: eggrd's [log.ship] client_cert_path /
+#                 client_key_path / ca_path) on a private interface.
+#   eggrd_stdout  eggrd's stdout (the container log: access records AND the WAF, TLS, reload and
+#                 ACME events, which [log.ship] does not carry). Here a file; on Kubernetes use the
+#                 kubernetes_logs source, on a Docker host docker_logs or the json-file path.
+#
+# Both are normalised to the schema-2 field names (`ts`, `target` for the request target), with
+# `kind` = "access" or "event". A stdout line that does not parse (a panic, a truncated line, an
+# unexpected prefix) is NOT dropped: it goes on as kind = "unparsed" with the raw text, so the
+# archive keeps every line. Two sinks: Loki for queries, and an object store for the copy you keep
+# (point it at a bucket with versioning and Object Lock, see the evidence section).
+# Labels stay low-cardinality on purpose: client_ip, path and request_id are fields, not labels.
+sources:
+  eggrd_ship:
+    type: http_server
+    address: 127.0.0.1:8687
+    auth:
+      username: "${VECTOR_SHIP_USER}"
+      password: "${VECTOR_SHIP_PASSWORD}"
+    # Across hosts, instead of loopback: a private address and mutual TLS.
+    # address: 10.0.5.10:8687
+    # tls:
+    #   enabled: true
+    #   crt_file: /etc/vector/tls/server.pem
+    #   key_file: /etc/vector/tls/server.key
+    #   ca_file: /etc/vector/tls/eggrd-clients-ca.pem
+    #   verify_certificate: true
+    decoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    path_key: _vector_path
+  eggrd_stdout:
+    type: file
+    include: ["/var/log/eggrd/*.log"]
+    read_from: beginning
+
+transforms:
+  eggrd_ship_norm:
+    type: remap
+    inputs: [eggrd_ship]
+    source: |
+      del(._vector_path)
+      del(.source_type)
+      del(.timestamp)
+      .kind = "access"
+      .level = "INFO"
+      .message = "request"
+  eggrd_stdout_norm:
+    type: remap
+    inputs: [eggrd_stdout]
+    drop_on_error: true
+    reroute_dropped: true
+    source: |
+      raw = parse_json!(string!(.message))
+      f = object!(raw.fields)
+      f.ts = raw.timestamp
+      f.level = raw.level
+      f.module = raw.target
+      if f.message == "request" {
+        f.kind = "access"
+        f.target = del(f.path)
+      } else {
+        f.kind = "event"
+      }
+      . = f
+  # The dead letter: every line eggrd_stdout_norm could not parse, kept whole.
+  eggrd_unparsed:
+    type: remap
+    inputs: [eggrd_stdout_norm.dropped]
+    source: |
+      . = {"kind": "unparsed", "level": "WARN", "raw": .message, "file": .file, "ts": .timestamp}
+
+sinks:
+  loki:
+    type: loki
+    inputs: [eggrd_ship_norm, eggrd_stdout_norm, eggrd_unparsed]
+    endpoint: http://loki:3100
+    encoding:
+      codec: json
+    labels:
+      job: eggrd
+      kind: "{{ kind }}"
+      level: "{{ level }}"
+    remove_label_fields: false
+  archive:
+    type: aws_s3
+    inputs: [eggrd_ship_norm, eggrd_stdout_norm, eggrd_unparsed]
+    bucket: eggrd-logs-archive
+    region: us-east-1
+    key_prefix: "eggrd/{{ kind }}/date=%F/"
+    compression: gzip
+    encoding:
+      codec: json
+    framing:
+      method: newline_delimited
+    batch:
+      timeout_secs: 60

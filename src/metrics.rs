@@ -37,6 +37,7 @@ const OUTCOMES: &[&str] = &[
     "upstream_body_too_large",
     "upstream_body_error",
     "no_policy",
+    "bad_request",
     "other",
 ];
 
@@ -331,7 +332,7 @@ pub struct Metrics {
     client_cert_header: [AtomicU64; 4],
     /// `edgeguard_forwarded_for_total`, by [`ForwardedFor::ALL`](crate::proxy::ForwardedFor::ALL)
     /// order; counted, and rendered, only with `server.trust_forwarded_for`.
-    forwarded_for: [AtomicU64; 4],
+    forwarded_for: [AtomicU64; 5],
     /// The header's settings, when it is on: its `ca_path` CAs and CRLs join the certificate series.
     trusted_header: std::sync::OnceLock<std::sync::Arc<crate::client_cert_header::TrustedHeader>>,
     /// The hot-swapped runtime, for the upstream pool series ([`Metrics::watch_runtime`]).
@@ -1563,14 +1564,15 @@ impl Metrics {
             .runtime
             .get()
             .is_some_and(|rt| rt.load().cfg.server.trust_forwarded_for);
-        let counts: [u64; 4] =
+        let counts: [u64; 5] =
             std::array::from_fn(|i| self.forwarded_for[i].load(Ordering::Relaxed));
         if trusts_xff || counts.iter().any(|c| *c > 0) {
             out.push_str(
                 "# HELP edgeguard_forwarded_for_total Requests by how X-Forwarded-For named the \
                  client, with server.trust_forwarded_for: used (the entry server.forwarded_hops \
                  from the right), or the TCP peer instead: absent, short (fewer entries than \
-                 forwarded_hops), invalid (the entry is not an address).\n\
+                 forwarded_hops), invalid (the entry is not an address), untrusted_peer (from a \
+                 peer outside server.trusted_forwarders: ignored).\n\
                  # TYPE edgeguard_forwarded_for_total counter\n",
             );
             for (result, v) in crate::proxy::ForwardedFor::ALL.iter().zip(counts) {

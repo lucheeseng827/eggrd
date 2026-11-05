@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespaces.yaml
+  - app.yaml
+  - edge.yaml
+  - networkpolicies.yaml
+# The config as a ConfigMap whose name carries a hash of its content. kustomize rewrites the
+# Deployment's reference to match, so changing edgeguard.toml rolls the edge pods. (With plain
+# manifests or Helm, put a checksum of the file in a pod-template annotation instead; see README.)
+configMapGenerator:
+  - name: eggrd-config
+    namespace: eggrd-edge
+    files:
+      - edgeguard.toml=config/edgeguard.toml

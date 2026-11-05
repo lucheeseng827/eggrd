@@ -1,0 +1,71 @@
+# promtool test rules rules-0.7.test.yml
+rule_files:
+  - rules-0.7.yml
+evaluation_interval: 1m
+tests:
+  # Half the requests fall back to the TCP peer: fires.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_forwarded_for_total{instance="e1",result="used"}'
+        values: '0+60x30'
+      - series: 'edgeguard_forwarded_for_total{instance="e1",result="absent"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EdgeGuardForwardedForFallback
+        exp_alerts:
+          - exp_labels: { instance: e1, severity: warning }
+            exp_annotations:
+              summary: "e1: 50% of requests did not get their client from X-Forwarded-For"
+              description: >-
+                More than 10% of requests fell back to the TCP peer for 10m (result absent, short or
+                invalid in edgeguard_forwarded_for_total). absent: clients reach eggrd without the
+                balancer, so let only the balancer connect. short: forwarded_hops is higher than the
+                number of entries the proxies append. Note "used" does not prove forwarded_hops is
+                right: compare the access log's client_ip with a known client.
+  # All used: quiet. A trickle below the traffic floor, all short: quiet.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_forwarded_for_total{instance="e1",result="used"}'
+        values: '0+60x30'
+      - series: 'edgeguard_forwarded_for_total{instance="e2",result="short"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EdgeGuardForwardedForFallback
+        exp_alerts: []
+  # 40% of handshakes fail: fires. A steady stream of connections closed before a ClientHello
+  # is in neither series and changes nothing.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_tls_handshakes_total{instance="e1",listener="public"}'
+        values: '0+100x30'
+      - series: 'edgeguard_tls_handshake_failures_total{instance="e1",listener="public",reason="other"}'
+        values: '0+40x30'
+      - series: 'edgeguard_tls_no_client_hello_total{instance="e1",listener="public"}'
+        values: '0+500x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EdgeGuardTlsHandshakeFailureRatio
+        exp_alerts:
+          - exp_labels: { instance: e1, listener: public, severity: warning }
+            exp_annotations:
+              summary: "e1 public: 40% of TLS handshakes fail"
+              description: >-
+                More than 20% of TLS handshakes failed for 10m. By reason
+                (edgeguard_tls_handshake_failures_total): client_cert is clients without an accepted
+                certificate (a CA or CRL change?), timeout is slow or stalled clients, other is
+                protocol or cipher mismatches (an old client, or plaintext sent to the TLS port).
+  # Health checks only (no ClientHello), and 1% failures: quiet.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_tls_handshakes_total{instance="e1",listener="public"}'
+        values: '0+100x30'
+      - series: 'edgeguard_tls_handshake_failures_total{instance="e1",listener="public",reason="other"}'
+        values: '0+1x30'
+      - series: 'edgeguard_tls_no_client_hello_total{instance="e1",listener="public"}'
+        values: '0+500x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EdgeGuardTlsHandshakeFailureRatio
+        exp_alerts: []

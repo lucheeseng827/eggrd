@@ -205,7 +205,7 @@ async fn check_budget(
                 // Logged at warn, not error: issuance still proceeds under the local budget. It is
                 // worth seeing because while this is happening the fleet-wide limit is unguarded.
                 warn!(
-                    error = %e,
+                    error = %crate::redact::display(&e),
                     "could not obtain a fleet ACME lease; falling back to this edge's local budget. \
                      The CA's per-registered-domain limit is uncoordinated until the control plane \
                      is reachable again."
@@ -245,7 +245,7 @@ async fn check_budget(
             // A ledger we cannot persist is a budget that resets on restart, which is no budget.
             // Loud, and not fatal: refusing to serve because a bookkeeping file is unwritable would
             // be a worse outage than the one being guarded against.
-            warn!(error = %e, "could not persist the ACME issuance ledger; the budget will not survive a restart");
+            warn!(error = %crate::redact::display(&e), "could not persist the ACME issuance ledger; the budget will not survive a restart");
         }
     }
     Ok((budget, None))
@@ -366,7 +366,7 @@ async fn run_order(
     dns: Option<&crate::acme_dns::DnsProvider>,
     replaces: Option<&crate::certstore::AriId>,
 ) -> Result<()> {
-    info!(domains = ?acme.domains, directory = %acme.directory_url, "starting ACME order");
+    info!(domains = ?acme.domains, directory = %crate::redact::userinfo(&acme.directory_url), "starting ACME order");
 
     let account = account(acme).await?;
 
@@ -386,7 +386,7 @@ async fn run_order(
                 // no longer names these identifiers). That must not cost the renewal: ask again
                 // without it, as a pre-ARI client would.
                 Err(e) => {
-                    warn!(error = %e, "ACME order naming the replaced certificate was refused; ordering without it");
+                    warn!(error = %crate::redact::display(&e), "ACME order naming the replaced certificate was refused; ordering without it");
                     account.new_order(&plain).await
                 }
             }
@@ -515,7 +515,7 @@ async fn run_order(
     if let Some(provider) = dns {
         for record in &dns_records {
             if let Err(e) = provider.remove(record).await {
-                warn!(record = %record.name, error = format!("{e:#}"), "could not remove the DNS-01 record");
+                warn!(record = %record.name, error = crate::redact::display(&e), "could not remove the DNS-01 record");
             }
         }
     }
@@ -679,7 +679,7 @@ async fn account(acme: &AcmeCfg) -> Result<Account> {
         .and_then(|_| serde_json::to_string_pretty(&credentials).map_err(std::io::Error::other))
         .and_then(|json| std::fs::write(&creds_path, json))
     {
-        warn!(error = %e, path = %creds_path.display(), "could not cache ACME account credentials");
+        warn!(error = %crate::redact::display(&e), path = %creds_path.display(), "could not cache ACME account credentials");
     }
     Ok(account)
 }
@@ -694,7 +694,7 @@ async fn spawn_challenge_server(responses: ChallengeMap) -> Result<tokio::task::
         .with_context(|| format!("binding ACME HTTP-01 listener on :{HTTP01_PORT}"))?;
     Ok(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            warn!(error = %e, "ACME challenge server stopped");
+            warn!(error = %crate::redact::display(&e), "ACME challenge server stopped");
         }
     }))
 }

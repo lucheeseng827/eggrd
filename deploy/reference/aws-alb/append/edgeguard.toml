@@ -1,0 +1,45 @@
+# eggrd behind an AWS ALB in its default X-Forwarded-For mode (`append`). The ALB terminates the
+# client's TLS and re-encrypts to eggrd (backend-protocol HTTPS), appending the address it saw
+# to X-Forwarded-For. eggrd takes the entry forwarded_hops (1) from the right: the ALB's. Entries
+# further left are the client's own writing and are ignored.
+#
+# This is the config append/kustomization.yaml deploys. Only the [server] block differs from the base
+# Kubernetes policy in substance; the policy sections are kept short here, use the base's.
+
+[server]
+port = 443
+upstream = "http://whoami.eggrd-app.svc.cluster.local:8000"
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = true
+forwarded_hops = 1             # ALB append mode, Cloudflare, nginx $proxy_add_x_forwarded_for, Traefik
+# eggrd 0.7 believes the header from ANY peer: only the ALB may reach the pod (the NetworkPolicy
+# in the kustomization, or the target security group). 0.8 adds server.trusted_forwarders.
+header_read_timeout = "30s"
+max_connections = 2048
+drain_delay = "10s"            # ALB deregistration: endpoints update, then the ALB stops sending
+drain_timeout = "15s"
+
+[tls]
+enabled = true                 # ALB -> eggrd stays encrypted; the ALB does not verify this cert
+cert_path = "/etc/eggrd-tls/tls.crt"
+key_path = "/etc/eggrd-tls/tls.key"
+
+[headers]
+hsts = true
+csp = "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+
+[waf]
+mode = "block"
+inspect_path = true
+
+[ratelimit]
+enabled = true
+rate = "120/min"               # per client: the address the ALB appended, not the ALB's
+burst = 30
+
+[validation]
+allow_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+[log]
+principal = "hash"

@@ -1,0 +1,14 @@
+# The public entry point. The ClusterIP Service `eggrd` from the base stays for in-cluster callers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: eggrd-public
+  namespace: eggrd-edge
+  labels: { app: eggrd }
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector: { app: eggrd }
+  ports:
+    - { name: https, port: 443, targetPort: https }
+    - { name: http, port: 80, targetPort: http }     # :80 -> the 308 redirect listener

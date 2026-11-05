@@ -1,0 +1,12 @@
+# Test fixture for smoke.sh: overlays/hostport exactly, but with a self-signed certificate written
+# to the same PVC instead of an ACME order, so it runs on a cluster no CA can reach. Not for use.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../overlays/hostport
+configMapGenerator:
+  - name: eggrd-config
+    namespace: eggrd-edge
+    behavior: replace
+    files:
+      - edgeguard.toml=edgeguard.toml

@@ -65,7 +65,7 @@ pub async fn watch(path: PathBuf, policy: Arc<Policy>) -> Result<()> {
             Ok(()) => info!(path = %path.display(), "config reloaded"),
             Err(e) => {
                 error!(
-                    error = format!("{e:#}"),
+                    error = crate::redact::display(&e),
                     "config reload failed; keeping previous config"
                 )
             }
@@ -78,7 +78,18 @@ pub async fn watch(path: PathBuf, policy: Arc<Policy>) -> Result<()> {
 /// the same `ArcSwap` the request path reads from.
 fn reload(path: &Path, policy: &Policy) -> Result<()> {
     let cfg = Config::load(path.to_str()).context("reloading config")?;
-    policy.set_local(cfg).context("rebuilding runtime")
+    for key in &cfg.unknown_keys {
+        warn!("{key}: it is ignored, so its setting keeps the default");
+    }
+    // Only the file sets `[server]` (a pushed policy keeps the local one), so a reload is the one
+    // way a running edge comes to believe every peer.
+    let trusts_any_peer =
+        crate::proxy::Forwarders::from_cfg(&cfg.server).is_ok_and(|f| f.trusts_any_peer());
+    policy.set_local(cfg).context("rebuilding runtime")?;
+    if trusts_any_peer {
+        warn!("{}", crate::proxy::Forwarders::TRUSTS_ANY_PEER);
+    }
+    Ok(())
 }
 
 fn is_modifying(event: &Event) -> bool {

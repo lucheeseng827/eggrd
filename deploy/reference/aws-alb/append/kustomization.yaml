@@ -1,0 +1,36 @@
+# eggrd behind an AWS ALB (append mode, forwarded_hops = 1) on EKS, from ../../kubernetes/base.
+#
+#   kubectl apply -k deploy/reference/aws-alb/append              # this
+#   kubectl apply -k deploy/reference/aws-alb/mtls-passthrough    # + ALB mTLS passthrough
+#
+# Set: the certificate ARN in ingress.yaml, the ALB's subnets' CIDRs in the NetworkPolicy patch
+# below, the service CIDR in ../../kubernetes/base, the eggrd-tls Secret (any certificate: the ALB
+# does not verify it). For CloudFront -> ALB use ../configs/cloudfront-alb.toml and ../cloudfront-lock.
+# Validated with kubeconform; not run end to end here (see README.md).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../kubernetes/base
+  - ingress.yaml
+configMapGenerator:
+  - name: eggrd-config
+    namespace: eggrd-edge
+    behavior: replace
+    files:
+      - edgeguard.toml=edgeguard.toml
+patches:
+  # trust_forwarded_for believes the header from any peer, so only the ALB may reach the pod: its
+  # subnets on 443, and on 9090 for its health checks (IP targets). Prometheus keeps its rule.
+  # Those subnets must hold only the ALB: no nodes or other workloads (the VPC CNI numbers pods
+  # from the nodes' subnets, so keep the ALB's pair dedicated).
+  - target: { kind: NetworkPolicy, name: eggrd, namespace: eggrd-edge }
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0
+        value:
+          from:
+            - ipBlock: { cidr: 10.0.0.0/24 }
+            - ipBlock: { cidr: 10.0.1.0/24 }
+          ports:
+            - { port: 443, protocol: TCP }
+            - { port: 9090, protocol: TCP }

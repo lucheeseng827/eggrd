@@ -1,0 +1,33 @@
+# The ALB overlay plus mutual TLS in the ALB's PASSTHROUGH mode: the ALB asks for a client
+# certificate and forwards it unverified in X-Amzn-Mtls-Clientcert; eggrd verifies it against the
+# client CA and CRL from the eggrd-pki Secret (ca.pem, crl.pem) and authenticates by it.
+#
+#   kubectl -n eggrd-edge create secret generic eggrd-pki --from-file=ca.pem --from-file=crl.pem
+#   kubectl apply -k deploy/reference/aws-alb/mtls-passthrough
+#
+# A CRL is a file eggrd re-reads on change: publish a new one into the Secret before the old one's
+# nextUpdate, or EdgeGuardCrlStale fires (revocations since then are not applied).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../append
+configMapGenerator:
+  - name: eggrd-config
+    namespace: eggrd-edge
+    behavior: replace
+    files:
+      - edgeguard.toml=edgeguard.toml
+patches:
+  - target: { kind: Ingress, name: eggrd-alb }
+    patch: |-
+      - op: add
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1mutual-authentication
+        value: '[{"port": 443, "mode": "passthrough"}]'
+  - target: { kind: Deployment, name: eggrd }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value: { name: pki, secret: { secretName: eggrd-pki } }
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value: { name: pki, mountPath: /etc/eggrd/pki, readOnly: true }

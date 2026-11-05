@@ -1,0 +1,47 @@
+# eggrd behind CloudFront -> ALB. CloudFront appends the viewer's address, the ALB appends
+# CloudFront's edge: the client is 2 entries from the right.
+#
+# The ALB MUST accept only CloudFront: a client that reaches the ALB directly gets an entry the
+# ALB appends in CloudFront's position, and its own X-Forwarded-For entry becomes "the client".
+# Allow only the managed prefix list com.amazonaws.global.cloudfront.origin-facing in the ALB's
+# security group, and require a secret origin header that CloudFront adds (the prefix list admits
+# every CloudFront distribution, not only yours). ../cloudfront-lock/ has both in Terraform.
+# doctor says so whenever forwarded_hops > 1.
+
+[server]
+port = 443
+upstream = "http://whoami.eggrd-app.svc.cluster.local:8000"
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = true
+forwarded_hops = 2             # CloudFront appends the viewer, the ALB appends CloudFront
+# eggrd 0.7 believes the header from ANY peer: only the ALB may reach the pod (the NetworkPolicy
+# in the kustomization, or the target security group). 0.8 adds server.trusted_forwarders.
+header_read_timeout = "30s"
+max_connections = 2048
+drain_delay = "10s"            # ALB deregistration: endpoints update, then the ALB stops sending
+drain_timeout = "15s"
+
+[tls]
+enabled = true                 # ALB -> eggrd stays encrypted; the ALB does not verify this cert
+cert_path = "/etc/eggrd-tls/tls.crt"
+key_path = "/etc/eggrd-tls/tls.key"
+
+[headers]
+hsts = true
+csp = "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+
+[waf]
+mode = "block"
+inspect_path = true
+
+[ratelimit]
+enabled = true
+rate = "120/min"               # per client: the address the ALB appended, not the ALB's
+burst = 30
+
+[validation]
+allow_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+[log]
+principal = "hash"

@@ -138,6 +138,9 @@ pub struct Runtime {
     pub websocket_passthrough: bool,
     /// What happens to `X-Forwarded-Client-Cert` on the way upstream (`[tls.client_auth]`).
     pub client_cert_header: crate::client_auth::ForwardPolicy,
+    /// Whom `X-Forwarded-For` and `X-Forwarded-Proto` are believed from, and which entry is the
+    /// client (`server.trust_forwarded_for`, `forwarded_hops`, `trusted_forwarders`).
+    pub forwarders: Forwarders,
     /// Compiled LLM token-metering runtime (price book + on/off). Inert when `[llm]` is disabled.
     pub llm: Arc<crate::llm::LlmRuntime>,
     /// Compiled LLM hard-budget engine (gateway L1). `None` when no `[[llm.budgets]]` are configured.
@@ -255,20 +258,32 @@ pub async fn handle(
     let mut req = req;
     // The client, resolved once: the span, rate limits, `[access]`, routing, the log and the
     // upstream's forwarding headers all use this one address.
-    let (ip, forwarded_for) = client_ip(
-        req.headers(),
-        peer,
-        rt.cfg.server.trust_forwarded_for,
-        rt.cfg.server.forwarded_hops,
-    );
+    // `trusted_forwarders` is matched against the TCP peer: the hop that wrote the headers, not a
+    // client a PROXY protocol header named. Every listener of ours attaches `TcpPeer` where a PROXY
+    // header becomes `ConnectInfo` (`serve::serve_connection`), so the fallback only serves a
+    // router run some other way (tests, an embedder's `axum::serve`), whose `ConnectInfo` is the
+    // TCP peer.
+    let hop = req
+        .extensions()
+        .get::<crate::serve::TcpPeer>()
+        .map_or(peer, |p| p.0)
+        .ip();
+    let (ip, forwarded_for) = rt.forwarders.resolve(req.headers(), peer, hop);
     if let Some(result) = forwarded_for {
         state.metrics.record_forwarded_for(result);
     }
+    if rt.forwarders.believes(hop) {
+        req.extensions_mut().insert(ForwardingTrusted);
+    }
+    // The request's host, decided once ([`request_host`]): the span names it, `handle_inner`
+    // refuses the request when it is ambiguous or missing, and the forward path sends it as
+    // `X-Forwarded-Host`.
+    let host_check = request_host(req.headers(), req.uri(), req.version());
     let span_pre = state
         .metrics
         .span_shipper()
         .is_some()
-        .then(|| ServerSpanPre::capture(&req, &rt, ip));
+        .then(|| ServerSpanPre::capture(&req, &rt, ip, host_check.clone().ok().flatten()));
     // Hand the context to the forward path so it can rewrite `traceparent` for the upstream. Only
     // when recording: an unsampled request forwards the client's headers untouched.
     if let Some(pre) = &span_pre {
@@ -310,7 +325,7 @@ pub async fn handle(
         .cloned();
     let ctx = Arc::new(RequestCtx::default());
 
-    let mut resp = handle_inner(&state, &rt, policy_pending, ip, req, &ctx).await;
+    let mut resp = handle_inner(&state, &rt, policy_pending, ip, host_check, req, &ctx).await;
     if let Some(origin) = &origin {
         if let Some(cors) = &rt.cors {
             cors.decorate_origin(origin, &mut resp);
@@ -419,7 +434,12 @@ struct ServerSpanPre {
 }
 
 impl ServerSpanPre {
-    fn capture(req: &Request<Body>, rt: &Runtime, client: IpAddr) -> ServerSpanPre {
+    fn capture(
+        req: &Request<Body>,
+        rt: &Runtime,
+        client: IpAddr,
+        host: Option<String>,
+    ) -> ServerSpanPre {
         let inbound = req
             .headers()
             .get("traceparent")
@@ -459,11 +479,8 @@ impl ServerSpanPre {
             url_scheme: if rt.cfg.tls.enabled { "https" } else { "http" }.to_string(),
             // The same client the request is limited, logged and routed as.
             client_address: Some(client.to_string()),
-            server_address: req
-                .headers()
-                .get(header::HOST)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
+            // The host the WAF checks: `:authority` over HTTP/2, which sends no `Host`.
+            server_address: host,
             user_agent: req
                 .headers()
                 .get(header::USER_AGENT)
@@ -516,7 +533,9 @@ async fn handle_inner(
     policy_pending: bool,
     // The client, resolved once in `handle` ([`client_ip`]).
     ip: IpAddr,
-    req: Request<Body>,
+    // The request's host, decided once in `handle` ([`request_host`]).
+    host_check: Result<Option<String>, &'static str>,
+    mut req: Request<Body>,
     ctx: &Arc<RequestCtx>,
 ) -> Response<Body> {
     let started = Instant::now();
@@ -561,6 +580,33 @@ async fn handle_inner(
             text(StatusCode::NOT_FOUND, "Not Found"),
         );
     }
+
+    // The host the request is for, one answer for every protocol: an HTTP/2 request's
+    // `:authority` or an HTTP/1.1 absolute-form target, else the `Host` header. The WAF, the
+    // upstream's `X-Forwarded-Host` and the span all use it. Two that disagree, or two `Host`
+    // headers, are refused: the edge would check one host and the app might use the other.
+    // No host at all: HTTP/1.1 and HTTP/2 require one (RFC 9112 §3.2, RFC 9113 §8.3.1), so the
+    // request is refused like an ambiguous one, and the WAF never sees a hostless request. An
+    // HTTP/1.0 request may lawfully omit it (old health checkers do): it goes on hostless, and a
+    // Host allow-list rule sees an empty `host:` line and refuses it.
+    let host = match host_check {
+        Ok(host) => host,
+        Err(why) => {
+            debug!(client_ip = %ip, why, "request refused: bad host");
+            return finish(
+                m,
+                &rid,
+                &method,
+                &path,
+                ip,
+                started,
+                "bad_request",
+                text(StatusCode::BAD_REQUEST, "Bad Request"),
+            );
+        }
+    };
+    // For the forward paths' `X-Forwarded-Host`.
+    req.extensions_mut().insert(EffectiveHost(host.clone()));
 
     // Managed mode with `boot_without_policy = "refuse"`, before any policy has arrived: the
     // runtime is the local config file alone, which this edge was told not to serve on. Before
@@ -803,6 +849,29 @@ async fn handle_inner(
     //      authenticated and rate-limited at this point. When disabled (default), fall through and
     //      the upgrade headers are stripped like any other hop-by-hop header.
     if rt.websocket_passthrough && is_upgrade_request(req.headers()) {
+        // The WAF on the handshake's path and headers (a tunnel has no body to read): an upgrade
+        // must not be a way around a path or Host rule.
+        if let WafVerdict::Block = screen(
+            &rt.waf,
+            m,
+            &raw_path,
+            req.headers(),
+            host.as_deref(),
+            b"",
+            ip,
+            &path,
+        ) {
+            return finish(
+                m,
+                &rid,
+                &method,
+                &path,
+                ip,
+                started,
+                "forbidden",
+                text(StatusCode::FORBIDDEN, "Forbidden"),
+            );
+        }
         // Vault check for upgrade connections: validate the virtual key and swap it for the
         // provider key before tunnelling. WebSocket frames don't carry a parseable JSON body, so
         // model egress can't be enforced; any key with a non-empty allowlist is denied
@@ -1014,46 +1083,31 @@ async fn handle_inner(
     //    already buffered above, so inspecting it adds no extra read. On a match: `block` mode
     //    returns 403; `report` mode logs + counts and forwards. Both record the hit so a
     //    report-only rollout shows up in `edgeguard_waf_hits_total`.
-    let mut waf_reported = false;
-    if let Some(hit) = rt.waf.evaluate(&raw_path, &parts.headers, &body_bytes) {
-        m.record_waf_hit(hit.class);
-        match rt.waf.mode() {
-            WafMode::Block => {
-                warn!(
-                    rule = %hit.rule_id,
-                    class = hit.class,
-                    location = hit.location,
-                    client_ip = %ip,
-                    path = %path,
-                    "WAF blocked request"
-                );
-                return finish(
-                    m,
-                    &rid,
-                    &method,
-                    &path,
-                    ip,
-                    started,
-                    "forbidden",
-                    text(StatusCode::FORBIDDEN, "Forbidden"),
-                );
-            }
-            WafMode::Report => {
-                waf_reported = true;
-                warn!(
-                    rule = %hit.rule_id,
-                    class = hit.class,
-                    location = hit.location,
-                    client_ip = %ip,
-                    path = %path,
-                    "WAF rule matched (report-only)"
-                )
-            }
-            // `evaluate` returns `None` when off, so this arm is unreachable; kept for
-            // exhaustiveness.
-            WafMode::Off => {}
+    let waf_reported = match screen(
+        &rt.waf,
+        m,
+        &raw_path,
+        &parts.headers,
+        host.as_deref(),
+        &body_bytes,
+        ip,
+        &path,
+    ) {
+        WafVerdict::Block => {
+            return finish(
+                m,
+                &rid,
+                &method,
+                &path,
+                ip,
+                started,
+                "forbidden",
+                text(StatusCode::FORBIDDEN, "Forbidden"),
+            );
         }
-    }
+        WafVerdict::Reported => true,
+        WafVerdict::Pass => false,
+    };
 
     // Reversible mask map (gateway L3): populated when inbound redaction runs in reversible mode, so
     // the response can be unmasked back to the caller's own values (see the response paths below).
@@ -1368,9 +1422,15 @@ async fn handle_inner(
         set_forwarding_headers(
             headers,
             ip,
-            forwarded_proto(&rt.cfg, &parts.headers),
-            &parts.headers,
-            &parts.uri,
+            forwarded_proto(
+                &rt.cfg,
+                parts.extensions.get::<ForwardingTrusted>().is_some(),
+                &parts.headers,
+            ),
+            parts
+                .extensions
+                .get::<EffectiveHost>()
+                .and_then(|h| h.0.as_deref()),
         );
         // Forward the (resolved/generated) request id so the upstream logs the same correlation id.
         if let Ok(v) = HeaderValue::from_str(&rid) {
@@ -1475,7 +1535,10 @@ async fn handle_inner(
     }
     let up_stats = m.upstream_stats(&target.label);
     let _ = ctx.upstream.set(target.label.clone());
-    let log_uri = format!("{}{path}", target.base);
+    // Credentials in a configured upstream URL never reach a log line: `target.base` is built
+    // without them (`pool::target`), and only it is redacted again, never the client's path,
+    // whose `@` (an email address) would otherwise hide the upstream host.
+    let log_uri = format!("{}{path}", crate::redact::userinfo(&target.base));
     let timed_out = || {
         warn!(upstream = %log_uri, "upstream timed out");
         text(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout")
@@ -1617,7 +1680,7 @@ async fn handle_inner(
             LlmStreamMeter {
                 model: model.clone(),
                 llm: Arc::clone(&rt.llm),
-                tail: Vec::new(),
+                usage: crate::llm::StreamUsage::default(),
                 engine,
                 reservation,
                 started,
@@ -2346,15 +2409,18 @@ pub enum ForwardedFor {
     Short,
     /// The chosen entry is not an IP address (or not text): the TCP peer.
     Invalid,
+    /// A header from a TCP peer outside `server.trusted_forwarders`: ignored, the peer.
+    UntrustedPeer,
 }
 
 impl ForwardedFor {
     /// Every result, in the order the metric renders them.
-    pub const ALL: [ForwardedFor; 4] = [
+    pub const ALL: [ForwardedFor; 5] = [
         ForwardedFor::Used,
         ForwardedFor::Absent,
         ForwardedFor::Short,
         ForwardedFor::Invalid,
+        ForwardedFor::UntrustedPeer,
     ];
 
     /// The `result` label value.
@@ -2364,6 +2430,153 @@ impl ForwardedFor {
             ForwardedFor::Absent => "absent",
             ForwardedFor::Short => "short",
             ForwardedFor::Invalid => "invalid",
+            ForwardedFor::UntrustedPeer => "untrusted_peer",
+        }
+    }
+}
+
+/// How far `forwarded_hops = "auto"` walks from the right before giving up: no real chain of
+/// trusted proxies is this long, and a client must not make the edge walk thousands.
+pub const MAX_FORWARDED_WALK: usize = 32;
+
+/// Set on a request whose forwarding headers come from a trusted hop, so its
+/// `X-Forwarded-Proto` may be believed too.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ForwardingTrusted;
+
+/// `server.trust_forwarded_for`, `server.forwarded_hops` and `server.trusted_forwarders`,
+/// compiled: whom the forwarding headers are believed from, and which entry is the client.
+#[derive(Debug, Clone, Default)]
+pub struct Forwarders {
+    trust: bool,
+    hops: crate::config::ForwardedHops,
+    list: Vec<crate::access::Cidr>,
+}
+
+impl Forwarders {
+    /// Compile the settings. A hop count out of range, a list entry that is not an IP or CIDR, a
+    /// `/0` (any peer, the 0.7 behaviour in disguise), a list without `trust_forwarded_for`
+    /// (which would do nothing), and `"auto"` without a list fail.
+    pub fn from_cfg(cfg: &crate::config::ServerCfg) -> anyhow::Result<Forwarders> {
+        use crate::config::ForwardedHops;
+        use anyhow::Context as _;
+        if let ForwardedHops::Count(n) = cfg.forwarded_hops {
+            anyhow::ensure!(
+                (1..=MAX_FORWARDED_HOPS).contains(&n),
+                "server.forwarded_hops = {n}: it counts the trusted proxies in front of EdgeGuard \
+                 that each append an X-Forwarded-For entry, from 1 to {MAX_FORWARDED_HOPS}, or \
+                 \"auto\" with server.trusted_forwarders"
+            );
+        }
+        let list = cfg
+            .trusted_forwarders
+            .iter()
+            .map(|t| crate::access::Cidr::parse(t).context("server.trusted_forwarders"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if let Some((text, _)) = cfg
+            .trusted_forwarders
+            .iter()
+            .zip(&list)
+            .find(|(_, c)| c.is_everything())
+        {
+            anyhow::bail!(
+                "server.trusted_forwarders contains {text:?}, every address: any peer could write \
+                 X-Forwarded-For and choose its client address. List the proxies' addresses"
+            );
+        }
+        anyhow::ensure!(
+            list.is_empty() || cfg.trust_forwarded_for,
+            "server.trusted_forwarders is set but server.trust_forwarded_for is off, so \
+             X-Forwarded-For is never read: set trust_forwarded_for = true, or remove the list"
+        );
+        anyhow::ensure!(
+            cfg.forwarded_hops != ForwardedHops::Auto || !list.is_empty(),
+            "server.forwarded_hops = \"auto\" walks past the entries of server.trusted_forwarders, \
+             which is empty: list the proxies, or give forwarded_hops a count"
+        );
+        Ok(Forwarders {
+            trust: cfg.trust_forwarded_for,
+            hops: cfg.forwarded_hops,
+            list,
+        })
+    }
+
+    /// Whether the forwarding headers are believed from any peer: `trust_forwarded_for` with no
+    /// `trusted_forwarders`, the 0.7 behaviour.
+    /// Logged at startup and after a reload while [`Forwarders::trusts_any_peer`].
+    pub const TRUSTS_ANY_PEER: &'static str = "server.trust_forwarded_for is on without server.trusted_forwarders: X-Forwarded-For is believed on every connection, so anything that reaches this port directly chooses its client address; list the proxies (this fails startup from 0.9)";
+
+    pub fn trusts_any_peer(&self) -> bool {
+        self.trust && self.list.is_empty()
+    }
+
+    fn listed(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.list.iter().any(|c| c.contains(ip))
+    }
+
+    /// Whether a connection whose TCP peer is `hop` may set the forwarding headers.
+    pub(crate) fn believes(&self, hop: IpAddr) -> bool {
+        self.trust && (self.list.is_empty() || self.listed(hop))
+    }
+
+    /// The client a request is served as. `peer` is the connection's client (its TCP peer, or the
+    /// client a trusted PROXY header named); `hop` its TCP peer, which the list is matched against.
+    pub(crate) fn resolve(
+        &self,
+        headers: &HeaderMap,
+        peer: SocketAddr,
+        hop: IpAddr,
+    ) -> (IpAddr, Option<ForwardedFor>) {
+        if !self.trust {
+            return client_ip(headers, peer, false, 1);
+        }
+        if !self.believes(hop) {
+            let result = if headers.contains_key("x-forwarded-for") {
+                ForwardedFor::UntrustedPeer
+            } else {
+                ForwardedFor::Absent
+            };
+            return (peer.ip().to_canonical(), Some(result));
+        }
+        match self.hops {
+            crate::config::ForwardedHops::Count(n) => client_ip(headers, peer, true, n),
+            crate::config::ForwardedHops::Auto => self.walk(headers, peer),
+        }
+    }
+
+    /// `forwarded_hops = "auto"`: from the right, past the entries inside the list, to the first
+    /// that is not. Only the entries walked over and the chosen one are parsed: those further left
+    /// are the client's and never matter, so client-written garbage there cannot force the
+    /// fallback. Every entry trusted: the leftmost. More than [`MAX_FORWARDED_WALK`] trusted
+    /// entries: `invalid`.
+    fn walk(&self, headers: &HeaderMap, peer: SocketAddr) -> (IpAddr, Option<ForwardedFor>) {
+        let peer_ip = peer.ip().to_canonical();
+        let mut lines = headers.get_all("x-forwarded-for").iter().rev().peekable();
+        if lines.peek().is_none() {
+            return (peer_ip, Some(ForwardedFor::Absent));
+        }
+        let mut leftmost = None;
+        for (walked, entry) in lines
+            .flat_map(|line| line.as_bytes().rsplit(|b| *b == b','))
+            .map(<[u8]>::trim_ascii)
+            .filter(|e| !e.is_empty())
+            .enumerate()
+        {
+            if walked == MAX_FORWARDED_WALK {
+                return (peer_ip, Some(ForwardedFor::Invalid));
+            }
+            let Some(ip) = std::str::from_utf8(entry).ok().and_then(parse_forwarded_ip) else {
+                return (peer_ip, Some(ForwardedFor::Invalid));
+            };
+            if !self.listed(ip) {
+                return (ip, Some(ForwardedFor::Used));
+            }
+            leftmost = Some(ip);
+        }
+        match leftmost {
+            Some(ip) => (ip, Some(ForwardedFor::Used)),
+            None => (peer_ip, Some(ForwardedFor::Short)),
         }
     }
 }
@@ -2530,9 +2743,14 @@ async fn proxy_upgrade(
         set_forwarding_headers(
             headers,
             ip,
-            forwarded_proto(&rt.cfg, req.headers()),
-            req.headers(),
-            req.uri(),
+            forwarded_proto(
+                &rt.cfg,
+                req.extensions().get::<ForwardingTrusted>().is_some(),
+                req.headers(),
+            ),
+            req.extensions()
+                .get::<EffectiveHost>()
+                .and_then(|h| h.0.as_deref()),
         );
         if let Ok(v) = HeaderValue::from_str(request_id) {
             headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), v);
@@ -2585,8 +2803,9 @@ async fn proxy_upgrade(
     let in_flight = attempt.in_flight;
     let up_stats = m.upstream_stats(&target.label);
     let _ = ctx.upstream.set(target.label.clone());
-    // The redacted form, for the failure logs below. See the note in `handle_inner`.
-    let log_uri = format!("{}{path}", target.base);
+    // The redacted form, for the failure logs below: the path's query redacted, and (as defence in
+    // depth: `target.base` has none) any URL credentials. See the note in `handle_inner`.
+    let log_uri = format!("{}{path}", crate::redact::userinfo(&target.base));
     let timed_out = || {
         warn!(upstream = %log_uri, "upstream timed out (upgrade)");
         finish(
@@ -2841,17 +3060,13 @@ impl DlpStreamScanner {
     }
 }
 
-/// Cap on the rolling tail buffer kept for SSE token metering. The OpenAI terminal `usage` frame is
-/// small and arrives just before `[DONE]`, so the last 16 KiB always contains it; bounding the
-/// buffer keeps streaming memory flat regardless of stream length.
-const LLM_SSE_TAIL_CAP: usize = 16 * 1024;
-
-/// Accumulates the tail of an SSE stream so the terminal `usage` frame can be parsed when the body
-/// finishes. Holds the model + price book; records to metrics and reconciles the L1 budget on drop.
+/// Reads the usage an SSE stream reports as it passes ([`crate::llm::StreamUsage`]), so it is known
+/// when the body finishes. Holds the model + price book; records to metrics and reconciles the L1
+/// budget on drop.
 struct LlmStreamMeter {
     model: String,
     llm: Arc<crate::llm::LlmRuntime>,
-    tail: Vec<u8>,
+    usage: crate::llm::StreamUsage,
     /// L1 budget engine + the held reservation, when budgets are configured. Reconciled to the
     /// streamed usage on drop (or released on no usage).
     engine: Option<Arc<crate::budget::BudgetEngine>>,
@@ -2944,9 +3159,9 @@ impl<B> CountingBody<B> {
         self
     }
 
-    /// Append the bytes the client will actually receive to the bounded LLM tail buffer (keeping only
-    /// the last [`LLM_SSE_TAIL_CAP`] bytes), so the terminal `usage` frame is available to parse on drop.
-    fn push_meter_tail(&mut self, data: &[u8]) {
+    /// Feed the bytes the client will actually receive to the stream's usage reader, so the usage
+    /// it reports (in its first frames, its last, or both) is known on drop.
+    fn push_meter(&mut self, data: &[u8]) {
         if let Some(meter) = self.llm.as_mut() {
             // Stamp first/last emitted-frame time for TTFT/TPOT (this runs on the bytes the client
             // actually receives, so it measures server-side time-to-first-token with no client clock).
@@ -2955,11 +3170,7 @@ impl<B> CountingBody<B> {
                 meter.first_at.get_or_insert(now);
                 meter.last_at = Some(now);
             }
-            meter.tail.extend_from_slice(data);
-            if meter.tail.len() > LLM_SSE_TAIL_CAP {
-                let drop_n = meter.tail.len() - LLM_SSE_TAIL_CAP;
-                meter.tail.drain(..drop_n);
-            }
+            meter.usage.feed(data);
         }
     }
 }
@@ -2993,7 +3204,7 @@ where
                                 if !out.is_empty() {
                                     let out = Bytes::from(out);
                                     this.egress = this.egress.saturating_add(out.len());
-                                    this.push_meter_tail(&out);
+                                    this.push_meter(&out);
                                     this.pending = Some(non_data); // emit trailers on the next poll
                                     return Poll::Ready(Some(Ok(Frame::data(out))));
                                 }
@@ -3005,7 +3216,7 @@ where
                             if !out.is_empty() {
                                 let out = Bytes::from(out);
                                 this.egress = this.egress.saturating_add(out.len());
-                                this.push_meter_tail(&out);
+                                this.push_meter(&out);
                                 this.pending = Some(non_data);
                                 return Poll::Ready(Some(Ok(Frame::data(out))));
                             }
@@ -3018,7 +3229,7 @@ where
                 if let Some(u) = this.unmask.as_mut() {
                     let out = Bytes::from(u.map.unmask_stream(&mut u.carry, &data));
                     this.egress = this.egress.saturating_add(out.len());
-                    this.push_meter_tail(&out);
+                    this.push_meter(&out);
                     return Poll::Ready(Some(Ok(Frame::data(out))));
                 }
                 if this.dlp.as_ref().is_some_and(|s| s.redact) {
@@ -3026,11 +3237,11 @@ where
                     // length may differ from the input frame; account for the bytes the client gets.
                     let out = Bytes::from(this.dlp.as_mut().unwrap().redact_frame(&data));
                     this.egress = this.egress.saturating_add(out.len());
-                    this.push_meter_tail(&out);
+                    this.push_meter(&out);
                     Poll::Ready(Some(Ok(Frame::data(out))))
                 } else {
                     this.egress = this.egress.saturating_add(data.len());
-                    this.push_meter_tail(&data);
+                    this.push_meter(&data);
                     // Report mode (or no redaction): count findings, pass the frame through unchanged.
                     if let Some(scanner) = this.dlp.as_mut() {
                         scanner.record_only(&data);
@@ -3047,7 +3258,7 @@ where
                         if !out.is_empty() {
                             let out = Bytes::from(out);
                             this.egress = this.egress.saturating_add(out.len());
-                            this.push_meter_tail(&out);
+                            this.push_meter(&out);
                             return Poll::Ready(Some(Ok(Frame::data(out))));
                         }
                     }
@@ -3058,7 +3269,7 @@ where
                     if !out.is_empty() {
                         let out = Bytes::from(out);
                         this.egress = this.egress.saturating_add(out.len());
-                        this.push_meter_tail(&out);
+                        this.push_meter(&out);
                         return Poll::Ready(Some(Ok(Frame::data(out))));
                     }
                 }
@@ -3111,10 +3322,10 @@ impl<B> Drop for CountingBody<B> {
                 write_access_line(&self.metrics, line);
             }
         }
-        // LLM metering for the streamed body: parse the terminal `usage` frame from the tail. The
-        // client gets usage only if it sent `stream_options.include_usage`; otherwise `no_usage`.
+        // LLM metering for the streamed body: the usage the stream reported. An OpenAI Chat client
+        // gets usage only if it sent `stream_options.include_usage`; otherwise `no_usage`.
         if let Some(meter) = self.llm.as_mut() {
-            let actual = match crate::llm::parse_sse_usage(&meter.tail) {
+            let actual = match std::mem::take(&mut meter.usage).finish() {
                 Some(usage) => {
                     let cost = meter.llm.cost_micros(&meter.model, &usage);
                     let sample = crate::metrics::LlmSample {
@@ -3274,8 +3485,9 @@ fn forward_headers(from: &HeaderMap, to: &mut HeaderMap) {
 ///   bracketed). The client's, and any proxy's before the edge, are dropped: the edge has already
 ///   decided which of them to believe.
 /// * `True-Client-IP`: removed (a CDN's header, which only the CDN should write).
-/// * `X-Forwarded-Host`: the `Host` the edge received (the URI's authority for HTTP/2), since the
-///   upstream request carries the upstream's own; removed when there is none. A client's separate
+/// * `X-Forwarded-Host`: `host`, the request's effective host ([`effective_host`], the one the
+///   WAF checked), since the upstream request carries the upstream's own; removed when there is
+///   none. A client's separate
 ///   `X-Forwarded-Host` never passes. `Host` itself is still the client's choice (the edge checks
 ///   no allowed-hosts list), so an app building links from it must validate the host. A CDN that
 ///   rewrites `Host` should forward the viewer's `Host` to the edge instead.
@@ -3283,8 +3495,7 @@ fn set_forwarding_headers(
     headers: &mut HeaderMap,
     ip: IpAddr,
     proto: &'static str,
-    inbound: &HeaderMap,
-    uri: &axum::http::Uri,
+    host: Option<&str>,
 ) {
     let ip_text = ip.to_string();
     if let Ok(v) = HeaderValue::from_str(&ip_text) {
@@ -3308,10 +3519,7 @@ fn set_forwarding_headers(
             headers.remove(header::FORWARDED);
         }
     }
-    let host = inbound.get(header::HOST).cloned().or_else(|| {
-        uri.authority()
-            .and_then(|a| HeaderValue::from_str(a.as_str()).ok())
-    });
+    let host = host.and_then(|h| HeaderValue::from_str(h).ok());
     match host {
         Some(host) => {
             headers.insert(HeaderName::from_static("x-forwarded-host"), host);
@@ -3319,6 +3527,138 @@ fn set_forwarding_headers(
         None => {
             headers.remove(HeaderName::from_static("x-forwarded-host"));
         }
+    }
+}
+
+/// The host a request is for, one rule for every protocol: the `Host` header as sent when there
+/// is one (what 0.7.0's WAF saw), else the target's authority (an HTTP/2 `:authority` without a
+/// `host` header) without the scheme's default port; `host[:port]`, never userinfo. An empty
+/// `Host` or authority counts as none, and `None` comes back when there is neither. An error when
+/// the target has an authority (an HTTP/2 `:authority`, an HTTP/1.1 absolute-form target, RFC
+/// 9112 §3.2.2) that differs from `Host` (RFC 9113 §8.3.1 requires them to match), or `Host` is
+/// sent twice or is not text.
+pub(crate) fn effective_host(
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<Option<String>, &'static str> {
+    let mut lines = headers.get_all(header::HOST).iter();
+    let header = match (lines.next(), lines.next()) {
+        (None, _) => None,
+        (Some(_), Some(_)) => return Err("Host sent more than once"),
+        // `Host:` with nothing in it names no host (RFC 9112 §3.2 allows it only for a target
+        // without an authority, which no request this proxy serves has).
+        (Some(v), None) => {
+            Some(v.to_str().map_err(|_| "Host is not text")?.trim()).filter(|h| !h.is_empty())
+        }
+    };
+    let authority = uri
+        .host()
+        .filter(|h| !h.is_empty())
+        .map(|h| match uri.port_u16() {
+            Some(port) => format!("{h}:{port}"),
+            None => h.to_string(),
+        });
+    // The scheme's default port written on one side and not the other is the same origin.
+    let default_port = if uri.scheme_str() == Some("https") {
+        ":443"
+    } else {
+        ":80"
+    };
+    let same = |a: &str, h: &str| {
+        let bare = |s: &'_ str| {
+            s.strip_suffix(default_port)
+                .unwrap_or(s)
+                .to_ascii_lowercase()
+        };
+        a.eq_ignore_ascii_case(h) || bare(a) == bare(h)
+    };
+    match (authority, header) {
+        (Some(a), Some(h)) if !same(&a, h) => Err("the request target's authority and Host differ"),
+        // Agreeing, or Host alone: Host as sent, the string 0.7.0's WAF and `X-Forwarded-Host`
+        // had (`http://app.test:80/` with `Host: app.test` is `app.test`; with `Host:
+        // app.test:80`, `app.test:80`).
+        (_, Some(h)) => Ok(Some(h.to_string())),
+        // An authority alone (HTTP/2 without a `host` header): without the scheme's default port.
+        (Some(a), None) => Ok(Some(match a.strip_suffix(default_port) {
+            Some(bare) => bare.to_string(),
+            None => a,
+        })),
+        (None, None) => Ok(None),
+    }
+}
+
+/// [`effective_host`], and an error for an HTTP/1.1 or HTTP/2 request with no host at all (they
+/// require one). An HTTP/1.0 request may omit it, and comes back `None`.
+fn request_host(
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    version: axum::http::Version,
+) -> Result<Option<String>, &'static str> {
+    match effective_host(headers, uri)? {
+        None if version >= axum::http::Version::HTTP_11 => {
+            Err("no host: no Host header and no authority in the target")
+        }
+        host => Ok(host),
+    }
+}
+
+/// The request's effective host ([`request_host`]), decided once in `handle` and carried to the
+/// forward paths.
+#[derive(Clone)]
+struct EffectiveHost(Option<String>);
+
+/// What the WAF made of a request.
+enum WafVerdict {
+    Pass,
+    Reported,
+    Block,
+}
+
+/// The WAF on a request, counted and logged the same way on every path (the buffered request and
+/// a WebSocket handshake): a hit is counted, logged, and in `block` mode answered by the caller
+/// with `403` and the `forbidden` outcome. The WAF reads the request's effective host as its
+/// `host:` line, in place of the raw `Host` header (an empty one when there is no host at all), so
+/// a Host rule checks the very string `X-Forwarded-Host` carries, whatever the protocol.
+#[allow(clippy::too_many_arguments)]
+fn screen(
+    waf: &WafEngine,
+    m: &Metrics,
+    raw_path: &str,
+    headers: &HeaderMap,
+    host: Option<&str>,
+    body: &[u8],
+    ip: IpAddr,
+    path: &str,
+) -> WafVerdict {
+    let Some(hit) = waf.evaluate(raw_path, headers, Some(host.unwrap_or("")), body) else {
+        return WafVerdict::Pass;
+    };
+    m.record_waf_hit(hit.class);
+    match waf.mode() {
+        WafMode::Block => {
+            warn!(
+                rule = %hit.rule_id,
+                class = hit.class,
+                location = hit.location,
+                client_ip = %ip,
+                path = %path,
+                "WAF blocked request"
+            );
+            WafVerdict::Block
+        }
+        WafMode::Report => {
+            warn!(
+                rule = %hit.rule_id,
+                class = hit.class,
+                location = hit.location,
+                client_ip = %ip,
+                path = %path,
+                "WAF rule matched (report-only)"
+            );
+            WafVerdict::Reported
+        }
+        // `evaluate` returns `None` when off.
+        WafMode::Off => WafVerdict::Pass,
     }
 }
 
@@ -3341,15 +3681,16 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 /// Decide the `X-Forwarded-Proto` to send upstream. If EdgeGuard terminates TLS, the client
-/// hop is HTTPS. Otherwise, behind a trusted edge (`trust_forwarded_for`) we preserve the
-/// proto the edge reported (falling back to `http`); an untrusted client's `X-Forwarded-Proto`
-/// is never honored, mirroring the client-IP trust model. Returns a `'static` token so the
-/// caller can build a `HeaderValue` without fallible parsing.
-fn forwarded_proto(cfg: &Config, headers: &HeaderMap) -> &'static str {
+/// hop is HTTPS. Otherwise, from a trusted hop (`trusted`: `trust_forwarded_for`, and the TCP peer
+/// in `trusted_forwarders` when that is set) we preserve the proto the edge reported (falling back
+/// to `http`); an untrusted client's `X-Forwarded-Proto` is never honored, mirroring the client-IP
+/// trust model. Returns a `'static` token so the caller can build a `HeaderValue` without fallible
+/// parsing.
+fn forwarded_proto(cfg: &Config, trusted: bool, headers: &HeaderMap) -> &'static str {
     if cfg.tls.enabled {
         return "https";
     }
-    if cfg.server.trust_forwarded_for {
+    if trusted {
         if let Some(value) = headers
             .get_all("x-forwarded-proto")
             .iter()
@@ -3571,7 +3912,10 @@ async fn send_to_pool<'p>(
                                 state.metrics.upstream_stats(&target.label).record(class);
                                 warn!(
                                     error,
-                                    upstream = %format!("{}{path}", target.base),
+                                    upstream = %format!(
+                                        "{}{path}",
+                                        crate::redact::userinfo(&target.base)
+                                    ),
                                     next = %next.label,
                                     "upstream unreachable; trying the next target"
                                 );
@@ -4005,6 +4349,98 @@ mod tests {
     }
 
     #[test]
+    fn one_effective_host_per_request() {
+        use axum::http::{Uri, Version};
+        let host = |h: &[&str], uri: &str, v: Version| {
+            let mut headers = HeaderMap::new();
+            for v in h {
+                headers.append(header::HOST, HeaderValue::from_str(v).unwrap());
+            }
+            request_host(&headers, &uri.parse::<Uri>().unwrap(), v)
+        };
+        let ok = |s: &str| Ok(Some(s.to_string()));
+        // HTTP/2: `:authority` is the URI's, with no Host header.
+        assert_eq!(
+            host(&[], "http://app.test/", Version::HTTP_2),
+            ok("app.test")
+        );
+        assert_eq!(
+            host(&[], "http://app.test:8080/x", Version::HTTP_2),
+            ok("app.test:8080")
+        );
+        // Both, agreeing: Host as sent, the string 0.7.0 saw.
+        assert_eq!(
+            host(&["APP.test"], "http://app.test/", Version::HTTP_2),
+            ok("APP.test")
+        );
+        assert!(host(&["evil.test"], "http://app.test/", Version::HTTP_2).is_err());
+        // The scheme's default port on one side only: the same origin, named as Host names it.
+        assert_eq!(
+            host(&["app.test"], "http://app.test:80/", Version::HTTP_11),
+            ok("app.test")
+        );
+        assert_eq!(
+            host(&["app.test:80"], "http://app.test/", Version::HTTP_11),
+            ok("app.test:80")
+        );
+        assert_eq!(
+            host(&["app.test:443"], "https://app.test/", Version::HTTP_2),
+            ok("app.test:443")
+        );
+        assert_eq!(
+            host(&["[::1]"], "http://[::1]:80/", Version::HTTP_11),
+            ok("[::1]")
+        );
+        // An authority alone: without the scheme's default port.
+        assert_eq!(
+            host(&[], "https://app.test:443/", Version::HTTP_2),
+            ok("app.test")
+        );
+        assert_eq!(host(&[], "http://[::1]:80/", Version::HTTP_2), ok("[::1]"));
+        // Another scheme's default port is a port.
+        assert_eq!(
+            host(&[], "https://app.test:80/", Version::HTTP_2),
+            ok("app.test:80")
+        );
+        // An empty or blank Host names no host: refused over HTTP/1.1 and HTTP/2, none over
+        // HTTP/1.0; with an authority, the authority.
+        for blank in ["", "   "] {
+            assert!(host(&[blank], "/", Version::HTTP_11).is_err(), "{blank:?}");
+            assert!(host(&[blank], "/", Version::HTTP_2).is_err(), "{blank:?}");
+            assert_eq!(host(&[blank], "/", Version::HTTP_10), Ok(None), "{blank:?}");
+            assert_eq!(
+                host(&[blank], "http://app.test/", Version::HTTP_2),
+                ok("app.test")
+            );
+        }
+        assert!(host(&["app.test:8080"], "http://app.test/", Version::HTTP_2).is_err());
+        assert!(host(&[], "/", Version::HTTP_2).is_err(), "no :authority");
+        // HTTP/1.1 origin-form and absolute-form (userinfo never part of the host).
+        assert_eq!(host(&["app.test"], "/", Version::HTTP_11), ok("app.test"));
+        assert_eq!(
+            host(&[], "http://u:p@app.test/", Version::HTTP_11),
+            ok("app.test")
+        );
+        assert!(host(&["app.test"], "http://evil.test/", Version::HTTP_11).is_err());
+        assert!(
+            host(&["a.test", "a.test"], "/", Version::HTTP_11).is_err(),
+            "twice"
+        );
+        assert!(host(&[], "/", Version::HTTP_11).is_err(), "required");
+        // HTTP/1.0 may omit it.
+        assert_eq!(host(&[], "/", Version::HTTP_10), Ok(None));
+        // IPv6.
+        assert_eq!(
+            host(&["[::1]:8080"], "/", Version::HTTP_11),
+            ok("[::1]:8080")
+        );
+        assert_eq!(
+            host(&[], "http://[::1]:8080/", Version::HTTP_2),
+            ok("[::1]:8080")
+        );
+    }
+
+    #[test]
     fn the_upstream_gets_the_edges_client_headers_not_the_clients() {
         let mut inbound = HeaderMap::new();
         for (k, v) in [
@@ -4023,8 +4459,7 @@ mod tests {
             &mut out,
             "198.51.100.7".parse().unwrap(),
             "https",
-            &inbound,
-            &uri,
+            effective_host(&inbound, &uri).unwrap().as_deref(),
         );
         let one = |name: &str| {
             let all: Vec<_> = out.get_all(name).iter().collect();
@@ -4048,21 +4483,14 @@ mod tests {
             &mut out,
             "2001:db8::7".parse().unwrap(),
             "http",
-            &HeaderMap::new(),
-            &uri,
+            effective_host(&HeaderMap::new(), &uri).unwrap().as_deref(),
         );
         assert_eq!(out["forwarded"], "for=\"[2001:db8::7]\";proto=http");
         assert_eq!(out["x-forwarded-host"], "shop.example:8443");
         // No host at all: the client's X-Forwarded-Host is not left behind.
         let mut out = HeaderMap::new();
         out.insert("x-forwarded-host", HeaderValue::from_static("evil.example"));
-        set_forwarding_headers(
-            &mut out,
-            "198.51.100.7".parse().unwrap(),
-            "http",
-            &HeaderMap::new(),
-            &"/".parse().unwrap(),
-        );
+        set_forwarding_headers(&mut out, "198.51.100.7".parse().unwrap(), "http", None);
         assert!(!out.contains_key("x-forwarded-host"));
     }
 
@@ -4241,6 +4669,148 @@ mod tests {
         assert!(h.contains_key("content-type"));
     }
 
+    fn forwarders(trust: bool, hops: crate::config::ForwardedHops, list: &[&str]) -> Forwarders {
+        Forwarders::from_cfg(&crate::config::ServerCfg {
+            trust_forwarded_for: trust,
+            forwarded_hops: hops,
+            trusted_forwarders: list.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn forwarders_err(trust: bool, hops: crate::config::ForwardedHops, list: &[&str]) -> String {
+        let e = Forwarders::from_cfg(&crate::config::ServerCfg {
+            trust_forwarded_for: trust,
+            forwarded_hops: hops,
+            trusted_forwarders: list.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        })
+        .unwrap_err();
+        format!("{e:#}")
+    }
+
+    #[test]
+    fn trusted_forwarders_parse_and_refuse_what_would_trust_anyone_or_do_nothing() {
+        use crate::config::ForwardedHops::{Auto, Count};
+        let f = forwarders(
+            true,
+            Count(1),
+            &["10.0.0.0/20", "192.0.2.7", "2001:db8::/32"],
+        );
+        assert!(f.listed("10.0.15.255".parse().unwrap()));
+        assert!(!f.listed("10.0.16.0".parse().unwrap()));
+        assert!(f.listed("192.0.2.7".parse().unwrap()));
+        assert!(f.listed("2001:db8::1".parse().unwrap()));
+        // An IPv4 peer on a dual-stack socket matches its IPv4 entry.
+        assert!(f.listed("::ffff:10.0.1.5".parse().unwrap()));
+        for everything in ["0.0.0.0/0", "::/0"] {
+            let e = forwarders_err(true, Count(1), &["10.0.0.0/8", everything]);
+            assert!(e.contains("every address"), "{e}");
+        }
+        assert!(forwarders_err(true, Count(1), &["10.0.0.300"]).contains("trusted_forwarders"));
+        assert!(
+            forwarders_err(false, Count(1), &["10.0.0.0/8"]).contains("trust_forwarded_for is off")
+        );
+        assert!(forwarders_err(true, Auto, &[]).contains("\"auto\""));
+        assert!(forwarders_err(true, Count(0), &[]).contains("server.forwarded_hops = 0"));
+        assert!(forwarders(true, Count(1), &[]).trusts_any_peer());
+        assert!(!forwarders(true, Count(1), &["10.0.0.0/8"]).trusts_any_peer());
+        assert!(!forwarders(false, Count(1), &[]).trusts_any_peer());
+    }
+
+    #[test]
+    fn from_an_unlisted_peer_the_headers_are_ignored_and_counted() {
+        use crate::config::ForwardedHops::Count;
+        let f = forwarders(true, Count(1), &["10.0.0.0/20"]);
+        let peer: SocketAddr = "10.9.0.7:5000".parse().unwrap();
+        let xff = headers_with("x-forwarded-for", "1.2.3.4");
+        assert!(!f.believes(peer.ip()));
+        assert_eq!(
+            f.resolve(&xff, peer, peer.ip()),
+            (peer.ip(), Some(ForwardedFor::UntrustedPeer))
+        );
+        assert_eq!(
+            f.resolve(&HeaderMap::new(), peer, peer.ip()),
+            (peer.ip(), Some(ForwardedFor::Absent))
+        );
+        // The list is matched against the TCP peer, never the client a PROXY header named.
+        let named: SocketAddr = "10.0.1.5:5000".parse().unwrap();
+        assert_eq!(
+            f.resolve(&xff, named, peer.ip()),
+            (named.ip(), Some(ForwardedFor::UntrustedPeer))
+        );
+        // A listed peer: main's hop counting, unchanged.
+        let alb: IpAddr = "10.0.1.5".parse().unwrap();
+        assert!(f.believes(alb));
+        assert_eq!(
+            f.resolve(
+                &headers_with("x-forwarded-for", "6.6.6.6, 1.2.3.4"),
+                peer,
+                alb
+            ),
+            ("1.2.3.4".parse().unwrap(), Some(ForwardedFor::Used))
+        );
+        // Off: nothing is read or counted.
+        let off = forwarders(false, Count(1), &[]);
+        assert_eq!(off.resolve(&xff, peer, alb), (peer.ip(), None));
+        assert!(!off.believes(alb));
+        // An empty list believes everyone, as 0.7 did.
+        assert!(forwarders(true, Count(1), &[]).believes(peer.ip()));
+    }
+
+    #[test]
+    fn auto_walks_past_the_listed_proxies_to_the_first_entry_that_is_not() {
+        use crate::config::ForwardedHops::Auto;
+        let f = forwarders(true, Auto, &["10.0.0.0/20", "198.51.100.0/24"]);
+        let alb: IpAddr = "10.0.1.5".parse().unwrap();
+        let peer = SocketAddr::new(alb, 5000);
+        let walk = |lines: &[&str]| {
+            let mut h = HeaderMap::new();
+            for l in lines {
+                h.append("x-forwarded-for", HeaderValue::from_str(l).unwrap());
+            }
+            f.resolve(&h, peer, alb)
+        };
+        let used = |ip: &str| (ip.parse::<IpAddr>().unwrap(), Some(ForwardedFor::Used));
+        // One trusted hop (the CDN's entry), then the client.
+        assert_eq!(walk(&["203.0.113.9, 198.51.100.4"]), used("203.0.113.9"));
+        // No CDN in front: the client directly.
+        assert_eq!(walk(&["203.0.113.9"]), used("203.0.113.9"));
+        // Two trusted, over two lines; a client-prepended entry further left is not believed.
+        assert_eq!(
+            walk(&["6.6.6.6, 203.0.113.9", "198.51.100.4, 10.0.2.1"]),
+            used("203.0.113.9")
+        );
+        // Every entry trusted: the leftmost.
+        assert_eq!(walk(&["10.0.2.1, 198.51.100.4"]), used("10.0.2.1"));
+        // Garbage the client wrote further left is never parsed, so it cannot force the fallback.
+        assert_eq!(
+            walk(&["garbage, 203.0.113.9, 198.51.100.4"]),
+            used("203.0.113.9")
+        );
+        // A bad entry among those walked over is invalid: the peer.
+        assert_eq!(
+            walk(&["203.0.113.9, nope"]),
+            (alb, Some(ForwardedFor::Invalid))
+        );
+        assert_eq!(walk(&[" , "]), (alb, Some(ForwardedFor::Short)));
+        assert_eq!(walk(&[]), (alb, Some(ForwardedFor::Absent)));
+        // At most 32 entries are walked: exactly that many trusted is the leftmost, one more is
+        // invalid, however short the rest.
+        let trusted = vec!["198.51.100.1"; MAX_FORWARDED_WALK].join(", ");
+        assert_eq!(walk(&[&trusted]), used("198.51.100.1"));
+        assert_eq!(
+            walk(&[&format!("203.0.113.9, {trusted}")]),
+            (alb, Some(ForwardedFor::Invalid))
+        );
+        // Ports and brackets, as with a count.
+        assert_eq!(
+            walk(&["[2001:db8::9]:443, 198.51.100.4:80"]),
+            used("2001:db8::9")
+        );
+    }
+
     #[test]
     fn forwarded_proto_reflects_tls_and_trust() {
         let mut cfg = Config::default();
@@ -4248,49 +4818,55 @@ mod tests {
         // We terminate TLS -> always https, regardless of any incoming header.
         cfg.tls.enabled = true;
         assert_eq!(
-            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "http")),
+            forwarded_proto(&cfg, true, &headers_with("x-forwarded-proto", "http")),
             "https"
         );
 
-        // Plain HTTP, untrusted: http, and an incoming XFP is NOT trusted.
+        // Plain HTTP from an untrusted hop: http, and an incoming XFP is NOT trusted.
         cfg.tls.enabled = false;
-        cfg.server.trust_forwarded_for = false;
         assert_eq!(
-            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "https")),
+            forwarded_proto(&cfg, false, &headers_with("x-forwarded-proto", "https")),
             "http"
         );
 
-        // Plain HTTP behind a trusted edge: preserve the edge's reported proto.
-        cfg.server.trust_forwarded_for = true;
+        // Plain HTTP from a trusted hop: preserve the edge's reported proto.
         assert_eq!(
-            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "https")),
+            forwarded_proto(&cfg, true, &headers_with("x-forwarded-proto", "https")),
             "https"
         );
         // The last value is the nearest proxy's; the first may be the client's own.
         assert_eq!(
-            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "http, https")),
+            forwarded_proto(
+                &cfg,
+                true,
+                &headers_with("x-forwarded-proto", "http, https")
+            ),
             "https"
         );
         assert_eq!(
-            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "https, http")),
+            forwarded_proto(
+                &cfg,
+                true,
+                &headers_with("x-forwarded-proto", "https, http")
+            ),
             "http"
         );
         // Over several header lines, the last line's last value.
         let mut lines = HeaderMap::new();
         lines.append("x-forwarded-proto", HeaderValue::from_static("http"));
         lines.append("x-forwarded-proto", HeaderValue::from_static("https"));
-        assert_eq!(forwarded_proto(&cfg, &lines), "https");
+        assert_eq!(forwarded_proto(&cfg, true, &lines), "https");
         let mut lines = HeaderMap::new();
         lines.append("x-forwarded-proto", HeaderValue::from_static("https"));
         lines.append(
             "x-forwarded-proto",
             HeaderValue::from_static("garbage, http"),
         );
-        assert_eq!(forwarded_proto(&cfg, &lines), "http");
+        assert_eq!(forwarded_proto(&cfg, true, &lines), "http");
         // Missing or unrecognized -> http.
-        assert_eq!(forwarded_proto(&cfg, &HeaderMap::new()), "http");
+        assert_eq!(forwarded_proto(&cfg, true, &HeaderMap::new()), "http");
         assert_eq!(
-            forwarded_proto(&cfg, &headers_with("x-forwarded-proto", "garbage")),
+            forwarded_proto(&cfg, true, &headers_with("x-forwarded-proto", "garbage")),
             "http"
         );
     }
@@ -4358,8 +4934,8 @@ mod tests {
     #[test]
     fn harden_cookie_skips_httponly_when_disabled() {
         // add_httponly=false → Secure + SameSite still added, but NOT HttpOnly. This is the
-        // path for a JS-readable double-submit CSRF cookie (e.g. doneyet_csrf).
-        let out = harden_cookie("doneyet_csrf=tok", false);
+        // path for a JS-readable double-submit CSRF cookie (e.g. app_csrf).
+        let out = harden_cookie("app_csrf=tok", false);
         assert!(out.contains("; Secure"), "{out}");
         assert!(out.contains("; SameSite=Lax"), "{out}");
         assert!(!out.to_ascii_lowercase().contains("httponly"), "{out}");
@@ -4367,16 +4943,10 @@ mod tests {
 
     #[test]
     fn cookie_name_exempt_matches_by_name_only() {
-        let exempt = vec!["doneyet_csrf".to_string()];
-        assert!(cookie_name_exempt(
-            "doneyet_csrf=abc; Path=/; Secure",
-            &exempt
-        ));
+        let exempt = vec!["app_csrf".to_string()];
+        assert!(cookie_name_exempt("app_csrf=abc; Path=/; Secure", &exempt));
         // a different cookie is not exempt; the value never triggers a match
-        assert!(!cookie_name_exempt(
-            "doneyet_auth=doneyet_csrf; Path=/",
-            &exempt
-        ));
+        assert!(!cookie_name_exempt("app_auth=app_csrf; Path=/", &exempt));
         assert!(!cookie_name_exempt("sid=x", &exempt));
     }
 

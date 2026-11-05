@@ -57,8 +57,9 @@ pub fn builder_trusting(
     let own_tls = !cfg.ca_path.is_empty() || !cfg.client_cert_path.is_empty();
     anyhow::ensure!(
         !own_tls || is_https(url),
-        "{what}.ca_path / client_cert_path are set but {url:?} is not https://, so neither would \
-         be used and the connection would not be encrypted"
+        "{what}.ca_path / client_cert_path are set but {:?} is not https://, so neither would \
+         be used and the connection would not be encrypted",
+        crate::redact::userinfo(url)
     );
     anyhow::ensure!(
         cfg.client_cert_path.is_empty() == cfg.client_key_path.is_empty(),
@@ -541,16 +542,14 @@ fn parse_proxy(raw: &str) -> Result<ProxyRoute> {
     Ok(ProxyRoute::Via(Box::new(proxy)))
 }
 
-/// `proxy` with any password in it replaced, for logs and errors.
+/// `proxy` with its credentials replaced, for logs and errors ([`crate::redact::userinfo`]). A
+/// value with an `@` but no scheme, which no URL parser would place, is hidden whole.
 pub fn redact_proxy(raw: &str) -> String {
-    match reqwest::Url::parse(raw.trim()) {
-        Ok(mut url) if url.password().is_some() => {
-            let _ = url.set_password(Some("redacted"));
-            url.to_string()
-        }
-        _ if raw.contains('@') => "<redacted>".to_string(),
-        _ => raw.trim().to_string(),
+    let raw = raw.trim();
+    if !raw.contains("://") && raw.contains('@') {
+        return "<redacted>".to_string();
     }
+    crate::redact::userinfo(raw).into_owned()
 }
 
 #[cfg(test)]
@@ -582,8 +581,9 @@ mod tests {
         assert!(!e.contains("hunter2"), "{e}");
         assert_eq!(
             redact_proxy("http://u:hunter2@egress:3128"),
-            "http://u:redacted@egress:3128/"
+            "http://***@egress:3128"
         );
+        assert_eq!(redact_proxy("u:hunter2@egress:3128"), "<redacted>");
         assert_eq!(redact_proxy("http://egress:3128"), "http://egress:3128");
     }
 

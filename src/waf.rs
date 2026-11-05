@@ -291,10 +291,18 @@ impl WafEngine {
     /// once, then every rule that targets that location is checked against it. The path is
     /// checked both raw and percent-decoded (so `%2e%2e%2f` is caught as `../`); headers and
     /// body are matched as-is.
+    ///
+    /// `host`, when given, is read as the request's one `host:` header line, in place of any
+    /// `Host` header it has. A caller screening a proxied request passes its effective host (an
+    /// HTTP/2 `:authority` or absolute-form target, else `Host`; `""` for none), so a Host rule
+    /// checks exactly the string `X-Forwarded-Host` carries, whatever the protocol: with `None`,
+    /// an HTTP/2 request's host is not in the headers at all. It is a required argument so that
+    /// every caller decides.
     pub fn evaluate(
         &self,
         path_and_query: &str,
         headers: &HeaderMap,
+        host: Option<&str>,
         body: &[u8],
     ) -> Option<WafHit> {
         if self.mode == WafMode::Off || self.rules.is_empty() {
@@ -308,7 +316,7 @@ impl WafEngine {
             None
         };
         let header_text = if self.inspect_headers {
-            Some(join_header_values(headers))
+            Some(join_header_values(headers, host))
         } else {
             None
         };
@@ -381,10 +389,18 @@ fn percent_decode_lossy(s: &str) -> String {
 
 /// Join header `name: value` lines into one string for inspection. Names are included so a rule
 /// can target a specific header; values that aren't valid UTF-8 are skipped (they can't carry a
-/// textual signature we'd match).
-fn join_header_values(headers: &HeaderMap) -> String {
+/// textual signature we'd match). `host`, when given, comes first as the only `host:` line.
+fn join_header_values(headers: &HeaderMap, host: Option<&str>) -> String {
     let mut out = String::new();
+    if let Some(h) = host {
+        out.push_str("host: ");
+        out.push_str(h);
+        out.push('\n');
+    }
     for (name, value) in headers.iter() {
+        if host.is_some() && name == axum::http::header::HOST {
+            continue;
+        }
         if let Ok(v) = value.to_str() {
             out.push_str(name.as_str());
             out.push_str(": ");
@@ -448,7 +464,7 @@ mod tests {
     }
 
     fn eval_path(e: &WafEngine, p: &str) -> Option<WafHit> {
-        e.evaluate(p, &HeaderMap::new(), b"")
+        e.evaluate(p, &HeaderMap::new(), None, b"")
     }
 
     #[test]
@@ -547,7 +563,33 @@ mod tests {
         // The same string in a header is not matched — the rule targets the path only.
         let mut h = HeaderMap::new();
         h.insert("x-test", HeaderValue::from_static("/wp-admin"));
-        assert!(e.evaluate("/safe", &h, b"").is_none());
+        assert!(e.evaluate("/safe", &h, None, b"").is_none());
+    }
+
+    #[test]
+    fn a_given_host_is_the_only_host_line_the_rules_see() {
+        let e = engine(WafCfg {
+            mode: "block".into(),
+            sqli: false,
+            xss: false,
+            path_traversal: false,
+            inspect_headers: true,
+            rules: vec![WafRule {
+                id: "host".into(),
+                pattern: r"(?mi)^host:[ \t]*(?:evil\.example)?[ \t]*$".into(),
+                target: "headers".into(),
+            }],
+            ..Default::default()
+        });
+        let mut h = HeaderMap::new();
+        h.insert("host", HeaderValue::from_static("evil.example"));
+        // As given, the raw Host line is not read: the effective host is.
+        assert!(e.evaluate("/", &h, Some("app.test"), b"").is_none());
+        h.insert("host", HeaderValue::from_static("app.test"));
+        assert!(e.evaluate("/", &h, Some("evil.example"), b"").is_some());
+        assert!(e.evaluate("/", &h, Some(""), b"").is_some());
+        // Without one, the headers as they are.
+        assert!(e.evaluate("/", &h, None, b"").is_none());
     }
 
     #[test]
@@ -556,7 +598,7 @@ mod tests {
         let e = engine(block_cfg());
         let mut h = HeaderMap::new();
         h.insert("user-agent", HeaderValue::from_static("<script>x</script>"));
-        assert!(e.evaluate("/", &h, b"<script>x</script>").is_none());
+        assert!(e.evaluate("/", &h, None, b"<script>x</script>").is_none());
 
         // With both enabled, the same payloads are caught and the location is reported.
         let e2 = engine(WafCfg {
@@ -565,9 +607,9 @@ mod tests {
             inspect_body: true,
             ..Default::default()
         });
-        assert_eq!(e2.evaluate("/", &h, b"").unwrap().location, "headers");
+        assert_eq!(e2.evaluate("/", &h, None, b"").unwrap().location, "headers");
         assert_eq!(
-            e2.evaluate("/", &HeaderMap::new(), b"<script>x</script>")
+            e2.evaluate("/", &HeaderMap::new(), None, b"<script>x</script>")
                 .unwrap()
                 .location,
             "body"

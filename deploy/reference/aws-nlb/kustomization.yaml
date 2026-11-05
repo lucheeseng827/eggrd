@@ -1,0 +1,43 @@
+# eggrd behind an AWS Network Load Balancer with PROXY protocol v2, on EKS with the AWS Load
+# Balancer Controller. Builds on ../kubernetes/base (namespaces, app, edge, NetworkPolicies).
+#
+#   kubectl apply -k deploy/reference/aws-nlb
+#
+# Set before applying: the NLB's subnets' CIDRs (config/edgeguard.toml proxy_protocol_trusted and
+# the NetworkPolicy patch below), the cluster's service CIDR in ../kubernetes/base, and the
+# eggrd-tls Secret. Validated with kubeconform; not run end to end here (see README.md).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../kubernetes/base
+  - service-nlb.yaml
+  - prometheusrule.yaml
+configMapGenerator:
+  - name: eggrd-config
+    namespace: eggrd-edge
+    behavior: replace
+    files:
+      - edgeguard.toml=config/edgeguard.toml
+patches:
+  # The pod must outlive drain_delay (25 s) + drain_timeout (25 s), or the kubelet kills it
+  # mid-drain.
+  - target: { kind: Deployment, name: eggrd }
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/terminationGracePeriodSeconds
+        value: 60
+  # Only the NLB reaches the edge: its subnets on the traffic ports AND on the admin port, where
+  # its health checks go (IP targets: the checks come from the NLB's own addresses, straight to
+  # the pod). Prometheus keeps its rule from the base.
+  - target: { kind: NetworkPolicy, name: eggrd, namespace: eggrd-edge }
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0
+        value:
+          from:
+            - ipBlock: { cidr: 10.0.0.0/24 }
+            - ipBlock: { cidr: 10.0.1.0/24 }
+          ports:
+            - { port: 443, protocol: TCP }
+            - { port: 80, protocol: TCP }
+            - { port: 9090, protocol: TCP }

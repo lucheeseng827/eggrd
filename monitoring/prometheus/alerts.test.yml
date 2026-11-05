@@ -221,6 +221,43 @@ tests:
           outside trusted_proxies, either a client forging it or a load balancer whose addresses are no
           longer listed. invalid: the balancer writes a different format than format says. unverified:
           the certificate failed the header''s ca_path or crl_paths.'
+- name: X-Forwarded-For mostly from outside trusted_forwarders
+  interval: 1m
+  input_series:
+  - series: edgeguard_forwarded_for_total{instance="edge-1:9090",job="edgeguard",result="untrusted_peer"}
+    values: 0+60x40
+  - series: edgeguard_forwarded_for_total{instance="edge-1:9090",job="edgeguard",result="used"}
+    values: 0+20x40
+  alert_rule_test:
+  - eval_time: 10m
+    alertname: EdgeGuardForwardedForUntrusted
+    exp_alerts: []
+  - eval_time: 20m
+    alertname: EdgeGuardForwardedForUntrusted
+    exp_alerts:
+    - exp_labels:
+        instance: edge-1:9090
+        severity: warning
+      exp_annotations:
+        summary: 'edge-1:9090 ignores most X-Forwarded-For headers: they come from outside trusted_forwarders'
+        description: 'For 15m, more than half of the requests reaching this edge carried an X-Forwarded-For
+          from a peer outside server.trusted_forwarders, so it was ignored and each was served as
+          its connection''s peer. Usually the load balancer''s addresses changed (a new subnet, a
+          replaced balancer) and every client now shares its address. Otherwise something
+          reaching the edge directly is writing the header.'
+- name: a few untrusted X-Forwarded-For headers, and a quiet edge, stay quiet
+  interval: 1m
+  input_series:
+  - series: edgeguard_forwarded_for_total{instance="edge-1:9090",job="edgeguard",result="untrusted_peer"}
+    values: 0+10x40
+  - series: edgeguard_forwarded_for_total{instance="edge-1:9090",job="edgeguard",result="used"}
+    values: 0+60x40
+  - series: edgeguard_forwarded_for_total{instance="edge-2:9090",job="edgeguard",result="untrusted_peer"}
+    values: 0+1x40
+  alert_rule_test:
+  - eval_time: 30m
+    alertname: EdgeGuardForwardedForUntrusted
+    exp_alerts: []
 - name: connections closed for an untrusted PROXY header, beside results that must stay quiet
   interval: 1m
   input_series:
@@ -250,6 +287,32 @@ tests:
           (untrusted), and the clients behind it got no answer. untrusted: the header came from outside
           server.proxy_protocol_trusted, because the balancer''s addresses changed or it preserves client
           IPs, so the peer is the client. invalid: what the peer sends is not a PROXY header.'
+- name: every connection refused, too slowly for the critical alert
+  interval: 1m
+  input_series:
+  - series: edgeguard_proxy_protocol_total{instance="edge-1:9090",job="edgeguard",listener="public",result="untrusted"}
+    values: 0+1x90
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: EdgeGuardProxyProtocolRefusedLowRate
+    exp_alerts: []
+  - eval_time: 50m
+    alertname: EdgeGuardProxyProtocolRefused
+    exp_alerts: []
+  - eval_time: 50m
+    alertname: EdgeGuardProxyProtocolRefusedLowRate
+    exp_alerts:
+    - exp_labels:
+        instance: edge-1:9090
+        listener: public
+        severity: warning
+      exp_annotations:
+        summary: Listener public on edge-1:9090 refuses every PROXY connection, too slowly for EdgeGuardProxyProtocolRefused
+        description: 'In the last hour, connections were closed for their PROXY protocol header
+          (untrusted or invalid) and none was proxied, so every client that arrived got no answer, just
+          too slowly for EdgeGuardProxyProtocolRefused (more than one every 10s). Same causes: the balancer''s
+          addresses changed or it preserves client IPs, so the peer is the client; or what the peer sends
+          is not a PROXY header.'
 - name: a balancer that sends no PROXY headers, beside one whose health checks only do not
   interval: 1m
   input_series:

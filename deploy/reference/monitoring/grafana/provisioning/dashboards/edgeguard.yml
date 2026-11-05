@@ -1,0 +1,17 @@
+# Load the dashboards from disk on startup. compose.yaml mounts the monitoring bundle's
+# (monitoring/grafana/dashboards: Overview, API usage) and this setup's 0.7 listener dashboard under
+# /var/lib/grafana/dashboards; the provider reads its subdirectories.
+
+apiVersion: 1
+
+providers:
+  - name: edgeguard
+    orgId: 1
+    folder: EdgeGuard
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,107 @@
+# eggrd 0.7 reference: one VM, Docker Compose (or Podman Compose), eggrd in front of one app.
+# See README.md. Bring up:  docker compose up -d     Smoke test:  ./smoke.sh
+#
+# Every port and path that differs between a laptop and a server is a variable with the server's
+# value as its default, so production runs this file unchanged and smoke.sh overrides them.
+name: ${COMPOSE_PROJECT_NAME:-eggrd-ref}
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs: ["/tmp:size=16m,mode=1777"]
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "20m", max-file: "5" }
+
+services:
+  # The edge. Distroless (no shell): see edge-health for its healthcheck.
+  edge:
+    <<: *hardened
+    # Pinned by digest: the tag is for people, the digest is what runs. eggrd 0.7.0, multi-arch.
+    image: docker.io/mancube/eggrd:0.7.0@sha256:b19278b379a457e626954e148effffa2fe559613d55ff497fdaa862c8c4096f6
+    command: ["--config", "/etc/edgeguard/edgeguard.toml"]
+    user: "65532:65532"
+    cap_add: ["NET_BIND_SERVICE"]          # binds :443 and :80 as a non-root user
+    restart: unless-stopped
+    stop_grace_period: 20s                 # > drain_delay + drain_timeout (2 s + 10 s)
+    mem_limit: 192m
+    cpus: 0.5
+    pids_limit: 256
+    environment:
+      RUST_LOG: info
+    volumes:
+      # The DIRECTORY, read-only: hot reload fires only for a directory mount.
+      - ${EDGE_CONFIG_DIR:-./config}:/etc/edgeguard:ro
+      # Certificate, key and ACME account. Survives recreates.
+      - edge-state:/var/lib/edgeguard
+    ports:
+      - "${EDGE_BIND:-0.0.0.0}:${EDGE_HTTPS_PORT:-443}:443"
+      - "${EDGE_BIND:-0.0.0.0}:${EDGE_HTTP_PORT:-80}:80"
+      - "127.0.0.1:${EDGE_ADMIN_PORT:-9090}:9090"    # admin: the host's loopback only
+    networks: [public, backend]
+    depends_on:
+      edge-init: { condition: service_completed_successfully }
+      app: { condition: service_started }
+
+  # One-shot: give the state volume to the edge's user (a fresh named volume is root's).
+  edge-init:
+    <<: *hardened
+    image: docker.io/library/busybox:1.36.1
+    user: "0:0"
+    cap_add: ["CHOWN", "FOWNER"]
+    command: ["sh", "-c", "chmod 700 /state && chown 65532:65532 /state"]
+    volumes: ["edge-state:/state"]
+    network_mode: none
+    restart: "no"
+
+  # The edge image has no shell, so it cannot run a HEALTHCHECK itself. This sidecar asks the
+  # admin listener for readiness and carries the healthcheck in its place (`docker compose ps`
+  # shows it). It also keeps the ACME files private: 0.7 writes them 0644 (fixed in 0.8).
+  # Docker does not restart an unhealthy container outside Swarm; restarts come from
+  # `restart: unless-stopped` (a crash) and, if you want one, the host watchdog in README.md.
+  edge-health:
+    <<: *hardened
+    image: docker.io/library/busybox:1.36.1
+    user: "65532:65532"
+    command:
+      - sh
+      - -c
+      - |
+        while :; do
+          chmod 600 /state/key.pem /state/acme/*.json 2>/dev/null
+          chmod 700 /state/acme 2>/dev/null
+          sleep 300
+        done
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-T", "3", "http://edge:9090/__edgeguard/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes: ["edge-state:/state"]
+    networks: [backend]
+    mem_limit: 16m
+    pids_limit: 16
+    restart: unless-stopped
+    depends_on: [edge]
+
+  # The sample app: echoes the request it received, headers included, so you can see what the
+  # edge forwards (X-Forwarded-For, X-Real-IP, Forwarded, no True-Client-IP). Swap in yours.
+  app:
+    <<: *hardened
+    image: docker.io/traefik/whoami:v1.10.3
+    command: ["--port", "8000"]
+    user: "65532:65532"
+    restart: unless-stopped
+    mem_limit: 64m
+    pids_limit: 64
+    networks: [backend]                    # not reachable from outside: only the edge is
+
+networks:
+  public: {}
+  backend:
+    internal: true                         # no route off the machine for the app
+
+volumes:
+  edge-state: {}

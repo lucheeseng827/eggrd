@@ -184,7 +184,7 @@ decides where the client's real address is:
 | In front of EdgeGuard | Where the client's address is | Configure |
 |---|---|---|
 | Nothing | The connection's own peer | Nothing |
-| An L7 balancer (AWS ALB, a GCP HTTPS LB, nginx `http`, Envoy, Cloudflare) | `X-Forwarded-For` | `server.trust_forwarded_for = true`, and `server.forwarded_hops` from the table below (`2` for a GCP load balancer) |
+| An L7 balancer (AWS ALB, a GCP HTTPS LB, nginx `http`, Envoy, Cloudflare) | `X-Forwarded-For` | `server.trust_forwarded_for = true`, `server.trusted_forwarders` = the balancer's addresses, and `server.forwarded_hops` from the table below (`2` for a GCP load balancer) |
 | An L4 balancer that keeps the client's address (an NLB with client IP preservation, a passthrough GCP network LB, `externalTrafficPolicy: Local`) | The connection's own peer | Nothing |
 | An L4 balancer that does not (an NLB with IP targets, HAProxy `mode tcp`, nginx `stream`, a GCP TCP proxy) | A PROXY protocol header at the start of the connection | `server.proxy_protocol = true` |
 
@@ -240,22 +240,45 @@ forwarded_hops = 1        # an ALB, Cloudflare, nginx, Traefik
   every CloudFront distribution, not only yours. `doctor` says so with `forwarded_hops > 1`.
 - A header with fewer entries than `forwarded_hops`, or a chosen entry that is not an address,
   falls back to the TCP peer. `edgeguard_forwarded_for_total{result}` counts `used`, `absent`,
-  `short` and `invalid`; a rise in `short` usually means `forwarded_hops` is higher than the
-  chain.
+  `short`, `invalid` and, with the list below, `untrusted_peer`; a rise in `short` usually means
+  `forwarded_hops` is higher than the chain.
+- **List the balancer: `server.trusted_forwarders`.** The header is otherwise believed on every
+  connection, so anything else that reaches the traffic port (another pod, a host in the VPC)
+  writes the whole header and chooses its address. With the list, the headers are believed only
+  on a connection whose TCP peer is in it, and anything else is served as itself and counted
+  `untrusted_peer`. `EdgeGuardForwardedForUntrusted` fires when most requests are, usually because
+  the balancer's addresses changed.
+
+  ```toml
+  [server]
+  trust_forwarded_for = true
+  trusted_forwarders = ["10.0.0.0/20"]   # the ALB's subnets
+  ```
+
+  It checks EdgeGuard's own peer, the innermost proxy: a client that reaches an inner proxy of a
+  chain directly still gets an entry that proxy appends, so the chain rule above still holds.
+  With `forwarded_hops = "auto"` and the outer proxy's ranges listed too (CloudFront's beside the
+  ALB's), the client is the rightmost entry outside the list, which also catches a client that
+  went straight to the ALB, at the cost of keeping those ranges current. In 0.8 an empty list
+  keeps the 0.7 behaviour with a `doctor` warning; from 0.9 `trust_forwarded_for` without it fails
+  startup.
 - **Up to 0.7.0-rc.1, the leftmost entry was taken.** That one is client-written, so any client
   could choose its address *through* the balancer, getting a fresh rate-limit bucket per request
   or passing `[access]` rules. Fixed in 0.7.0.
-- **Still let only the balancer reach EdgeGuard.** `trust_forwarded_for` believes the header on
-  any connection, so a client that bypasses the balancer and connects directly (another pod, a
-  host in the VPC) writes all of it. Admit only the balancer: a NetworkPolicy whose ingress rule
-  allows only its subnets, or a security group that allows only its. A list of trusted forwarder
-  addresses, to enforce this in EdgeGuard itself, is planned for 0.8. `proxy_protocol` and
-  `[trusted_client_cert_header]` already have their own (`proxy_protocol_trusted`,
-  `trusted_proxies`).
+- **Still let only the balancer reach EdgeGuard.** Without `trusted_forwarders`,
+  `trust_forwarded_for` believes the header on any connection, so a client that bypasses the
+  balancer and connects directly (another pod, a host in the VPC) writes all of it. With the list,
+  EdgeGuard checks the peer itself; admit only the balancer at the network as well, so that one
+  mistake in either is not enough: a NetworkPolicy whose ingress rule allows only its subnets, or
+  a security group that allows only its. `proxy_protocol` and `[trusted_client_cert_header]` have
+  their own lists (`proxy_protocol_trusted`, `trusted_proxies`).
 - **What the app receives.** EdgeGuard sends its own client headers upstream and drops the
   client's: `X-Forwarded-For` and `X-Real-IP` are the resolved address, `Forwarded` is
   `for=<address>;proto=<http|https>` (an IPv6 address as `"[…]"`), `X-Forwarded-Proto` its own,
-  `X-Forwarded-Host` the `Host` EdgeGuard received, and `True-Client-IP` is removed. Frameworks
+  `X-Forwarded-Host` the request's host (`Host` as sent, else the HTTP/2 `:authority`: the
+  same host the WAF checks), and `True-Client-IP` is removed. A request
+  whose target authority and `Host` differ, or an HTTP/1.1 or HTTP/2 request with no host at
+  all, is refused with `400` (an HTTP/1.0 one without `Host` is served). Frameworks
   that read any of these (chi's `RealIP` prefers `True-Client-IP` and `X-Real-IP`) see the same
   client the edge rate-limited. A CDN that rewrites `Host` and sends the viewer's host as
   `X-Forwarded-Host` should forward the original `Host` instead. `X-Forwarded-Host` now always
@@ -613,7 +636,9 @@ docker run -p 80:80 -p 443:443 \
 - The `Host` header is attacker-controlled. A malformed host (spaces, CR/LF, userinfo, over-long)
   is always answered `400` rather than reflected into `Location`; set `redirect_hosts` to pin
   redirects to the names you serve, which is what stops a forged `Host` from producing a redirect
-  that appears to come from your domain.
+  that appears to come from your domain. The redirect reads the same host as the proxy: an
+  HTTP/2 request's `:authority` (it sends no `Host`), and `400` when the authority and `Host`
+  differ.
 - `/.well-known/acme-challenge/` is answered `404`, never redirected — a CA must read the HTTP-01
   token in plaintext, and bouncing it to the port whose certificate is being issued would deadlock
   the order. With `[tls.acme]` on, issuance runs first and the redirect listener binds `:80`

@@ -26,6 +26,12 @@ trust_forwarded_for = false
 # 1 = an ALB (append mode), Cloudflare, nginx, Traefik; 2 = a GCP external Application Load
 # Balancer (it appends two), or CloudFront -> ALB. Other platforms: check before use.
 forwarded_hops = 1
+# With trust_forwarded_for, the proxies whose X-Forwarded-For (and X-Forwarded-Proto) are believed,
+# matched on the connection's own address: e.g. ["10.0.0.0/20"] for a load balancer's subnets.
+# Anything else that reaches this port is served as itself. Empty = every connection is believed
+# (doctor warns; from 0.9 it fails startup). With a list, forwarded_hops = "auto" takes the
+# rightmost entry outside it, for a chain whose length varies.
+trusted_forwarders = []
 # Public/private split (optional). When admin_port is non-zero, EdgeGuard serves the internal
 # ops endpoints (/__edgeguard/health, /ready, /metrics) on a SECOND, plain-HTTP listener at
 # admin_addr:admin_port instead of the public port — so metrics/health aren't exposed publicly.

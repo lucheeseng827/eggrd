@@ -1,0 +1,37 @@
+# Fluent Bit (3.2) for eggrd's container log on Kubernetes or a Docker host: tested against eggrd
+# 0.7.0 output in CRI format and Loki 3.4 (see ../LOGGING-AND-EVIDENCE.md, "Shipping").
+#
+# Reads the node's container log files, takes off the runtime's wrapper (the cri or docker
+# multiline parser), parses eggrd's JSON line, and ships it to Loki. Run it as a DaemonSet with
+# /var/log mounted read-only, or on a Docker host against /var/lib/docker/containers/*/*-json.log.
+#
+# The record keeps eggrd's own nesting, so LogQL sees `fields_client_ip`, `fields_status`, …
+# after `| json` (examples/vector.yaml flattens to the schema-2 names instead).
+service:
+  flush: 1
+  log_level: info
+  parsers_file: /fluent-bit/etc/parsers.conf   # the image's built-in json, docker and cri parsers
+
+pipeline:
+  inputs:
+    - name: tail
+      tag: eggrd
+      path: /var/log/containers/*_eggrd-edge_eggrd-*.log
+      multiline.parser: cri, docker
+      read_from_head: true
+      db: /var/fluent-bit/eggrd.db
+
+  filters:
+    - name: parser
+      match: eggrd
+      key_name: log
+      parser: json
+      reserve_data: false
+
+  outputs:
+    - name: loki
+      match: eggrd
+      host: loki
+      port: 3100
+      labels: job=eggrd, level=$level
+      line_format: json

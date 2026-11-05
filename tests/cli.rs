@@ -278,6 +278,34 @@ fn doctor_errors_when_tls_is_on_with_no_certificate_source() {
     );
 }
 
+#[test]
+fn doctor_fails_on_a_key_the_parser_ignores_and_names_the_one_meant() {
+    let dir = TempDir::new("doctor-keys");
+    let cfg = dir.path("edgeguard.toml");
+    // A typo keeps the default silently: `auth.mode` stays "none" and every request is let in.
+    std::fs::write(&cfg, "[auth]\nmdoe = \"jwt\"\n").unwrap();
+    let out = bin()
+        .args(["doctor", "--config", &cfg])
+        .output()
+        .expect("failed to run edgeguard");
+    assert!(!out.status.success(), "a typo must fail doctor");
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        text.contains("unknown key auth.mdoe (did you mean auth.mode?)"),
+        "{text}"
+    );
+
+    std::fs::write(&cfg, "[auth]\nmode = \"none\"\n").unwrap();
+    let out = bin()
+        .args(["doctor", "--config", &cfg])
+        .output()
+        .expect("failed to run edgeguard");
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!text.contains("unknown key"), "{text}");
+}
+
 /// Kills the child when dropped, so a failed assertion does not leave a server running.
 struct Running(std::process::Child);
 

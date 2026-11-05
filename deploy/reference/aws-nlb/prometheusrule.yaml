@@ -1,0 +1,60 @@
+# The PROXY protocol alerts from the monitoring bundle (monitoring/prometheus/alerts.yml,
+# group edgeguard), as a prometheus-operator PrometheusRule. Without the operator, load the
+# bundle's alerts.yml instead; it has these and the rest. Keep the expressions in step with it.
+#
+# EdgeGuardProxyProtocolRefused is the one an NLB deployment cannot do without: the NLB's HTTP
+# health check catches its subnets leaving proxy_protocol_trusted, but NOT client IP preservation
+# being turned on, where the checks still come from trusted addresses while every client is
+# refused. This alert fires on both. EdgeGuardProxyProtocolRefusedLowRate covers the same
+# refusals on a quiet listener, which may never reach one refusal every 10s.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: eggrd-proxy-protocol
+  namespace: eggrd-edge
+  labels: { app: eggrd }
+spec:
+  groups:
+    - name: eggrd-proxy-protocol
+      rules:
+        - alert: EdgeGuardProxyProtocolRefused
+          expr: |
+            sum by (instance, listener, result) (rate(edgeguard_proxy_protocol_total{result=~"untrusted|invalid"}[5m])) > 0.1
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "Listener {{ $labels.listener }} on {{ $labels.instance }} is closing connections for their PROXY header ({{ $labels.result }})"
+            description: >-
+              More than one connection every 10s for 5m was closed for its PROXY protocol header
+              ({{ $labels.result }}), and the clients behind it got no answer. untrusted: the header
+              came from outside server.proxy_protocol_trusted, because the balancer's addresses
+              changed or it preserves client IPs, so the peer is the client. invalid: what the peer
+              sends is not a PROXY header.
+        - alert: EdgeGuardProxyProtocolRefusedLowRate
+          expr: |
+            sum by (instance, listener) (increase(edgeguard_proxy_protocol_total{result=~"untrusted|invalid"}[1h])) > 0
+            unless
+            sum by (instance, listener) (increase(edgeguard_proxy_protocol_total{result="proxied"}[1h])) > 0
+          for: 30m
+          labels: { severity: warning }
+          annotations:
+            summary: "Listener {{ $labels.listener }} on {{ $labels.instance }} refuses every PROXY connection, too slowly for EdgeGuardProxyProtocolRefused"
+            description: >-
+              In the last hour, connections were closed for their PROXY protocol header (untrusted
+              or invalid) and none was proxied, so every client that arrived got no answer, just
+              too slowly for EdgeGuardProxyProtocolRefused (more than one every 10s). Same causes:
+              the balancer's addresses changed or it preserves client IPs, so the peer is the
+              client; or what the peer sends is not a PROXY header.
+        - alert: EdgeGuardProxyProtocolMissing
+          expr: |
+            sum by (instance, listener) (rate(edgeguard_proxy_protocol_total{result="missing"}[15m])) > 0
+            unless
+            sum by (instance, listener) (rate(edgeguard_proxy_protocol_total{result="proxied"}[15m])) > 0
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "The balancer in front of listener {{ $labels.listener }} on {{ $labels.instance }} sends no PROXY headers"
+            description: >-
+              For 15m, connections from server.proxy_protocol_trusted arrived without a PROXY
+              protocol header and none with one, so every client is served as the balancer.
+              Enable proxy protocol on the balancer (the NLB target group).

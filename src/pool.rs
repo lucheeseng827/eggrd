@@ -571,20 +571,24 @@ impl Pool {
             let url = &entry.url;
             check_url(url).with_context(|| format!("upstreams[].{key} (path {path:?})"))?;
             let mut t = target(url, backup);
+            // The URL as the errors below name it, without its credentials. Only ever printed.
+            let shown = crate::redact::userinfo(url);
+            // As configured (the id), credentials included: two entries that differ only in
+            // them were two targets before userinfo was stripped from `base`, and still are.
             anyhow::ensure!(
-                !targets.iter().any(|o| o.base == t.base),
-                "upstreams[] (path {path:?}) lists {url:?} twice (targets and backup together)"
+                !targets.iter().any(|o| o.id == t.id),
+                "upstreams[] (path {path:?}) lists {shown:?} twice (targets and backup together)"
             );
             if let Some(weight) = entry.weight {
                 anyhow::ensure!(
                     balance != Balance::Priority,
-                    "upstreams[] (path {path:?}) gives {url:?} a weight, but weights only apply \
+                    "upstreams[] (path {path:?}) gives {shown:?} a weight, but weights only apply \
                      to balance = \"round_robin\", \"least_conn\" or \"hash\""
                 );
                 anyhow::ensure!(
                     weight > 0,
-                    "upstreams[] (path {path:?}) gives {url:?} weight 0: a target that should take \
-                     no requests belongs in backup, or out of the pool"
+                    "upstreams[] (path {path:?}) gives {shown:?} weight 0: a target that should \
+                     take no requests belongs in backup, or out of the pool"
                 );
                 t.weight = weight;
             }
@@ -1133,11 +1137,26 @@ impl Pool {
     }
 }
 
+/// A target URL as the pool keys it (`configured`, credentials included: its id) and as it
+/// reaches the wire (`base`, without them). `doctor` compares targets with the same pair.
+pub(crate) fn target_urls(url: &str) -> (&str, String) {
+    let configured = url.trim_end_matches('/');
+    // Requests and checks go to the URL without its credentials. Both use the proxy's client,
+    // hyper (`proxy::UpstreamClient`), which does not turn URL userinfo into `Authorization`
+    // (unlike reqwest), so nothing changes on the wire (`tests/credentials_redacted.rs` checks
+    // what the upstream receives); and hyper's trace logs print the URL it is given. The id stays
+    // the configured URL's, so hashing, sticky cookies and duplicate detection are unchanged.
+    (
+        configured,
+        crate::redact::without_userinfo(configured).into_owned(),
+    )
+}
+
 fn target(url: &str, backup: bool) -> Target {
-    let base = url.trim_end_matches('/').to_string();
+    let (configured, base) = target_urls(url);
     Target {
         label: crate::proxy::upstream_for_log(&base),
-        id: hash64(base.as_bytes()),
+        id: hash64(configured.as_bytes()),
         base: Arc::new(base),
         backup,
         weight: 1,
@@ -1279,14 +1298,16 @@ fn weighted_turn(tier: &[&Target], turn: usize) -> usize {
 
 /// An upstream URL: `http://` or `https://`, with a host.
 pub(crate) fn check_url(url: &str) -> Result<()> {
+    // Errors name the URL without its credentials: they reach the startup error and `doctor`.
+    let shown = crate::redact::userinfo(url);
     let uri: axum::http::Uri = url
         .parse()
-        .with_context(|| format!("{url:?} is not a URL"))?;
+        .with_context(|| format!("{shown:?} is not a URL"))?;
     anyhow::ensure!(
         matches!(uri.scheme_str(), Some("http" | "https")),
-        "{url:?} must start with http:// or https://"
+        "{shown:?} must start with http:// or https://"
     );
-    anyhow::ensure!(uri.host().is_some(), "{url:?} has no host");
+    anyhow::ensure!(uri.host().is_some(), "{shown:?} has no host");
     Ok(())
 }
 
@@ -3571,7 +3592,8 @@ mod tests {
         .unwrap();
         let hc = pool.health_check.as_ref().unwrap();
         assert_eq!(hc.label(), "GET :8081/healthz");
-        assert_eq!(hc.base_for(&pool.targets[0]), "http://u:pw@a:8081/v1");
+        // The target's URL is kept without its credentials, which nothing sends.
+        assert_eq!(hc.base_for(&pool.targets[0]), "http://a:8081/v1");
         assert_eq!(hc.base_for(&pool.targets[1]), "https://b:8081");
         let j = pool.status_json(None, |_| serde_json::json!({}));
         assert_eq!(j["health_check"]["port"], 8081);
@@ -3585,7 +3607,7 @@ mod tests {
         )
         .unwrap();
         let hc = own.health_check.as_ref().unwrap();
-        assert_eq!(hc.base_for(&own.targets[0]), "http://u:pw@a:8080/v1");
+        assert_eq!(hc.base_for(&own.targets[0]), "http://a:8080/v1");
         assert_eq!(hc.label(), "GET /healthz");
         assert!(own.status_json(None, |_| serde_json::json!({}))["health_check"]["port"].is_null());
         // A TCP check takes one too.

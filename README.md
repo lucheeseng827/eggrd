@@ -35,7 +35,7 @@ hardening) in a single static binary.
 ```bash
 cargo install eggrd && edgeguard init && edgeguard doctor
 # or
-docker run -p 8080:8080 mancube/eggrd:0.7.0
+docker run -p 8080:8080 mancube/eggrd:0.7.1
 ```
 
 ## Status
@@ -132,7 +132,7 @@ EdgeGuard is a focused security front door, not a platform. It does **not** repl
 - **Reverse proxy** to one upstream (a wrapped child process, or an external URL).
 - **Streaming / LLM-proxy passthrough** (`validation.stream_passthrough`, off by default):
   forward `text/event-stream` (SSE) responses **unbuffered, frame-by-frame** — so EdgeGuard fronts
-  **streaming LLM backends** (OpenAI-compatible token streams) and any SSE app without collapsing
+  **streaming LLM backends** (OpenAI, Anthropic and OpenAI-compatible token streams) and any SSE app without collapsing
   time-to-first-byte. Egress bytes are still counted as frames flow.
 - **Streamed responses of any type** (`validation.stream_responses`, off by default): downloads
   and large bodies are forwarded as they arrive instead of held in memory, whenever nothing on the
@@ -395,7 +395,8 @@ $ echo $?
 0
 ```
 
-`doctor` checks, among others: the placeholder/plaintext credential, `auth.mode = "none"` on a
+`doctor` checks, among others: keys the parser ignores (a typo such as `[auth] mdoe`, reported with
+the key it is closest to), the placeholder/plaintext credential, `auth.mode = "none"` on a
 public port, secrets committed to the file (prefer the env vars / `*_FILE`), an over-permissive or
 credentialed-wildcard CORS policy, a `redis` limiter store with no URL, and `enforce_quota` without
 managed mode. Wire it into CI to fail the build on a misconfiguration:
@@ -442,6 +443,7 @@ EdgeGuard is running hot-reloads the policy in place (see [Configuration](#confi
 │   ├── CONFIG.md         # complete configuration reference (every flag/env/TOML key)
 │   ├── API.md            # endpoints, proxy-added headers/status codes, metrics
 │   ├── OPERATIONS.md     # ops runbook: deploy, state, monitoring, troubleshooting
+│   ├── security/         # hardening checklist, logging & evidence, incident-response runbook
 │   ├── REQUIREMENTS.md   # product requirements & scope
 │   ├── DEPLOYMENT.md     # deployment & integration strategy
 │   └── ROADMAP.md        # phased dev plan → OSS launch → product roadmap
@@ -533,6 +535,12 @@ symptom-first troubleshooting for every status code EdgeGuard can generate — i
 [docs/OPERATIONS.md](docs/OPERATIONS.md). The full strategy (interface patterns, platform
 matrix, rollout order) is in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
+Securing what runs behind eggrd — a hardening checklist with stable IDs (`EG-HARD-001`…), what to
+log and keep as evidence (with jq and LogQL queries run against a synthetic log, and CloudWatch
+Logs Insights equivalents written but not run), and an incident-response runbook whose
+containment levers are, most of them, timed against 0.7.0 — is in
+[docs/security/](docs/security/README.md).
+
 > Static/edge hosts (Vercel, Netlify, Cloudflare Pages) can't run a long-lived proxy
 > process — see [Static & edge hosts](#static--edge-hosts) for the `edgeguard generate` config
 > generator and the Rust→WASM Cloudflare Worker that cover that surface.
@@ -598,8 +606,8 @@ edge DLP, compiled in only with `--features ner`).
 
 **Request:** client-IP resolution (the client a trusted balancer's PROXY protocol header names,
 with `server.proxy_protocol`; `X-Forwarded-For` only when `server.trust_forwarded_for = true`,
-disabled by default so clients cannot spoof their IP, and then the entry the trusted proxy appended,
-`server.forwarded_hops` from the right) → IP access control (`[access]`, allow-all by default) → header-size limit →
+disabled by default so clients cannot spoof their IP, and then only from `server.trusted_forwarders`:
+the entry the trusted proxy appended, `server.forwarded_hops` from the right) → IP access control (`[access]`, allow-all by default) → header-size limit →
 pooled-quota hard-stop (managed mode only, when `control_plane.enforce_quota` is on —
 `429` + `Retry-After`) → rate-limit (per-IP / per-route) → CORS preflight
 (answered before auth, when `[cors]` is on) → auth → per-key

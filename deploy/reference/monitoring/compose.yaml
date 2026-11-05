@@ -1,0 +1,86 @@
+# eggrd 0.7 reference: Prometheus + Grafana with monitoring bundle 1.6.2 (../../../monitoring),
+# plus this setup's dashboard and alerts for the 0.7 listener series, against a live 0.7.0 edge
+# with traffic. See README.md; ./smoke.sh runs and checks it.
+#
+# To monitor your own edges, keep prometheus + grafana and point prometheus/prometheus.yml at
+# their admin listeners; drop edge, front, app and traffic.
+name: ${COMPOSE_PROJECT_NAME:-eggrd-monitoring}
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs: ["/tmp:size=16m"]
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+
+services:
+  edge:
+    <<: *hardened
+    image: docker.io/mancube/eggrd:0.7.0@sha256:b19278b379a457e626954e148effffa2fe559613d55ff497fdaa862c8c4096f6
+    command: ["--config", "/etc/edgeguard/edgeguard.toml"]
+    user: "65532:65532"
+    cap_add: ["NET_BIND_SERVICE"]
+    environment:
+      RUST_LOG: info
+      EDGEGUARD_API_KEYS: demo-key-alpha,demo-key-beta,demo-key-gamma   # demo only
+    volumes: ["./config:/etc/edgeguard:ro"]
+    ports: ["127.0.0.1:${EDGE_ADMIN_PORT:-9092}:9090"]                   # for you to curl the metrics
+
+  front:
+    image: docker.io/library/nginx:1.27-alpine
+    volumes: ["./front/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on: [edge]
+
+  app:
+    <<: *hardened
+    image: docker.io/traefik/whoami:v1.10.3
+    command: ["--port", "8000"]
+    user: "65532:65532"
+
+  # Moves every panel: three consumers and anonymous calls, two routes and a failing upstream,
+  # slow requests (in flight), WAF and rate-limit refusals, traffic through the L7 front
+  # (X-Forwarded-For used) and straight to the edge (absent), TCP connections that close before a
+  # ClientHello, and plaintext sent to the TLS port (failed handshakes).
+  traffic:
+    image: docker.io/curlimages/curl:8.11.1
+    depends_on: [edge, front]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sleep 5
+        E=https://edge:443; F=http://front:8080; K="-sk -o /dev/null --max-time 10"
+        while true; do
+          for key in demo-key-alpha demo-key-beta demo-key-gamma; do
+            curl $$K -H "X-API-Key: $$key" $$F/ ; curl $$K -H "X-API-Key: $$key" $$F/api/items
+          done
+          curl $$K -H "X-API-Key: demo-key-alpha" $$F/legacy/report
+          curl $$K $$F/                                                        # anonymous 401
+          curl $$K -H "X-API-Key: demo-key-beta" "$$F/?q=1%20UNION%20SELECT%201" # WAF 403
+          for i in 1 2 3 4 5 6 7 8; do curl $$K -H "X-API-Key: demo-key-gamma" $$F/login; done
+          curl $$K -H "X-API-Key: demo-key-alpha" -H "Host: app.example.test" $$E/api/direct
+          curl $$K -H "X-API-Key: demo-key-alpha" "$$F/api/slow?wait=3s" &        # in flight
+          curl -s -o /dev/null --max-time 2 http://edge:443/ || true             # plaintext to TLS
+          curl -s -o /dev/null --max-time 1 telnet://edge:443 </dev/null || true  # no ClientHello
+          sleep 1
+        done
+
+  prometheus:
+    image: docker.io/prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../../monitoring/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ./prometheus/rules-0.7.yml:/etc/prometheus/rules-0.7.yml:ro
+    ports: ["127.0.0.1:${PROMETHEUS_PORT:-9091}:9090"]
+
+  grafana:
+    image: docker.io/grafana/grafana:11.2.0
+    depends_on: [prometheus]
+    environment:
+      # Local stack: anonymous viewer, bound to 127.0.0.1. Not for a shared host.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../../monitoring/grafana/dashboards:/var/lib/grafana/dashboards/bundle:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards/reference:ro
+    ports: ["127.0.0.1:${GRAFANA_PORT:-3000}:3000"]

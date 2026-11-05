@@ -61,11 +61,11 @@ The traffic generator exercises every series, so the dashboard's panels all move
   these are counted without blocking the demo traffic).
 - **Request latency percentiles** — p50/p90/p99 from the histogram.
 
-The **API usage** dashboard reads newer series than the pinned demo image exports: per route, per
-consumer and per upstream, the edge's own overhead, and the connection cap. Its panels fill in once
-the image pin in `compose.yaml` moves to a release that has them. The demo config and traffic are
-already set up for it. The `api` route answers, and the `legacy` route points at a closed port,
-so one upstream shows `connect_error` beside a healthy one.
+The **API usage** dashboard reads the per-route, per-consumer and per-upstream series, the edge's
+own overhead, and the connection cap, which the pinned 0.7.0 image exports. The `api` route
+answers, and the `legacy` route points at a closed port, so one upstream shows `connect_error`
+beside a healthy one. For the 0.7 listener series (TLS handshakes, requests in flight,
+`X-Forwarded-For` resolution) with traffic, see `deploy/reference/monitoring`.
 
 ## Monitor your own EdgeGuard
 
@@ -165,7 +165,9 @@ The `edgeguard-api` alerts:
 | `EdgeGuardUpstreamTargetOut` | one target of a pool is out of rotation while another is in, for 5m |
 | `EdgeGuardUpstreamTargetFlapping` | a pool target is ejected 3 times or more in 15m, for 5m |
 | `EdgeGuardProxyProtocolRefused` (critical) | more than one connection every 10s is closed for an `untrusted` or `invalid` PROXY header, for 5m |
+| `EdgeGuardProxyProtocolRefusedLowRate` | connections are closed for an `untrusted` or `invalid` PROXY header in the last hour and none was proxied, for 30m (the low-traffic case of the alert above) |
 | `EdgeGuardProxyProtocolMissing` | connections from `proxy_protocol_trusted` arrive without a PROXY header and none with one, for 15m |
+| `EdgeGuardForwardedForUntrusted` | more than half of the requests carry an `X-Forwarded-For` from outside `server.trusted_forwarders`, at more than one request every 20s, for 15m |
 
 Each has a unit test in [`prometheus/alerts.test.yml`](prometheus/alerts.test.yml), as do
 `EdgeGuardCrlStale` and the expiry alert on a client certificate: an input that

@@ -438,7 +438,7 @@ impl CpClient {
             .send()
             .await;
         if let Err(e) = res {
-            warn!(error = %e, lease_id, "reporting the ACME lease outcome failed");
+            warn!(error = %crate::redact::display(&e), lease_id, "reporting the ACME lease outcome failed");
         }
     }
 
@@ -453,7 +453,7 @@ impl CpClient {
             .send()
             .await;
         if let Err(e) = res {
-            warn!(error = %e, "forwarding CSP report to control plane failed");
+            warn!(error = %crate::redact::display(&e), "forwarding CSP report to control plane failed");
         }
     }
 }
@@ -497,13 +497,13 @@ pub async fn poll_loop(
                         info!("applied policy from control plane");
                     }
                     Err(e) => warn!(
-                        error = format!("{e:#}"),
+                        error = crate::redact::display(&e),
                         "rejected control-plane policy; keeping current"
                     ),
                 }
             }
             Err(e) => warn!(
-                error = format!("{e:#}"),
+                error = crate::redact::display(&e),
                 "policy pull failed; keeping current"
             ),
         }
@@ -534,7 +534,7 @@ pub async fn report_loop(
         let drained = metrics.drain_usage();
         if let Err(e) = client.report_usage(&UsageDelta::from(drained)).await {
             warn!(
-                error = format!("{e:#}"),
+                error = crate::redact::display(&e),
                 "usage report failed; will retry next period"
             );
             if !drained.is_empty() {
@@ -547,7 +547,7 @@ pub async fn report_loop(
     if !drained.is_empty() {
         if let Err(e) = client.report_usage(&UsageDelta::from(drained)).await {
             warn!(
-                error = format!("{e:#}"),
+                error = crate::redact::display(&e),
                 "final usage report on shutdown failed"
             );
         }
@@ -588,7 +588,7 @@ pub async fn quota_loop(
                 quota.apply(over_quota, reset_epoch);
             }
             Err(e) => warn!(
-                error = format!("{e:#}"),
+                error = crate::redact::display(&e),
                 "quota poll failed; keeping last verdict"
             ),
         }

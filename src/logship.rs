@@ -196,7 +196,7 @@ pub fn spawn(
             .build()
             .context("building the log shipper's HTTP client")?,
     };
-    info!(url = %cfg.url, batch = task.batch, ?task.interval, "access-log shipping enabled");
+    info!(url = %crate::redact::userinfo(&cfg.url), batch = task.batch, ?task.interval, "access-log shipping enabled");
     tokio::spawn(task.run(rx, shutdown));
     Ok(Some(shipper))
 }

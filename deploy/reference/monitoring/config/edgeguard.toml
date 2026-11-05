@@ -1,0 +1,61 @@
+# The edge under observation. Set up so every series the bundle's dashboards and the 0.7 listener
+# dashboard read has something in it: TLS (handshakes), API keys (consumers), named routes and an
+# upstream that fails (per-route and per-upstream series), a cap (connections vs cap), and an L7
+# proxy in front (X-Forwarded-For resolution). Passes doctor with 0 errors on 0.7.0.
+
+[server]
+port = 443
+upstream = "http://app:8000"
+admin_port = 9090
+admin_addr = "0.0.0.0"          # Prometheus scrapes it over the compose network; not published publicly
+trust_forwarded_for = true      # "front" (nginx, like an ALB) appends the client
+forwarded_hops = 1
+header_read_timeout = "30s"
+max_connections = 512
+drain_delay = "2s"
+drain_timeout = "10s"
+
+[tls]
+enabled = true
+self_signed = true
+self_signed_hosts = ["app.example.test", "edge"]
+cert_path = "/tmp/tls/cert.pem"
+key_path = "/tmp/tls/key.pem"
+
+[auth]
+mode = "apikey"                 # keys from EDGEGUARD_API_KEYS; each is a consumer (apikey:<id>)
+
+[[upstreams]]
+path = "/api/"
+target = "http://app:8000"
+name = "api"
+
+[[upstreams]]
+path = "/legacy/"
+target = "http://app:8001"      # nothing listens: connect_error, for the per-upstream panels
+name = "legacy"
+
+[ratelimit]
+enabled = true
+rate = "1200/min"
+burst = 200
+
+[[ratelimit.routes]]
+path = "/login"
+rate = "30/min"
+burst = 5
+name = "login"
+
+[waf]
+mode = "block"
+inspect_path = true
+
+[validation]
+upstream_connect_timeout = "2s"
+allow_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+[metrics]
+consumer_series_max = 100
+
+[log]
+principal = "hash"

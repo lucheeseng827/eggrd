@@ -494,7 +494,7 @@ impl JwksCache {
                     });
                 }
                 Err(e) if guard.is_some() => {
-                    warn!(error = %format!("{e:#}"), "JWKS refresh failed; using cached keys");
+                    warn!(error = %crate::redact::display(&e), "JWKS refresh failed; using cached keys");
                 }
                 Err(e) => return Err(e.context("JWKS refresh failed and no cached keys")),
             }
@@ -561,7 +561,9 @@ fn parse_jwks(json: &str) -> Result<HashMap<String, Arc<DecodingKey>>> {
                 let kid = jwk.common.key_id.clone().unwrap_or_default();
                 by_kid.insert(kid, Arc::new(key));
             }
-            Err(e) => warn!(error = %e, "skipping unusable JWKS key"),
+            Err(e) => {
+                warn!(error = %crate::redact::display(&e), "skipping unusable JWKS key")
+            }
         }
     }
     anyhow::ensure!(!by_kid.is_empty(), "JWKS contained no usable keys");

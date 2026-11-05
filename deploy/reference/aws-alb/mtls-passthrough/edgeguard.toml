@@ -1,0 +1,66 @@
+# eggrd behind an ALB with mutual TLS in PASSTHROUGH mode. The ALB asks the client for a
+# certificate and forwards it, unverified, in X-Amzn-Mtls-Clientcert (URL-encoded PEM). eggrd
+# verifies it (ca_path, crl_paths), believes the header only from the ALB's subnets, removes it
+# before forwarding whoever sent it, and authenticates by the certificate (auth.mode = "mtls").
+# The ALB's VERIFY mode (a trust store on the listener) sends the leaf certificate in a different
+# header (X-Amzn-Mtls-Clientcert-Leaf), not X-Amzn-Mtls-Clientcert. This config is for PASSTHROUGH.
+#
+# The PKI files come from the eggrd-pki Secret mounted at /etc/eggrd/pki (client CA and its CRL).
+
+[server]
+port = 443
+upstream = "http://whoami.eggrd-app.svc.cluster.local:8000"
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = true
+forwarded_hops = 1             # ALB append mode, Cloudflare, nginx $proxy_add_x_forwarded_for, Traefik
+# eggrd 0.7 believes the header from ANY peer: only the ALB may reach the pod (the NetworkPolicy
+# in the kustomization, or the target security group). 0.8 adds server.trusted_forwarders.
+header_read_timeout = "30s"
+max_connections = 2048
+drain_delay = "10s"            # ALB deregistration: endpoints update, then the ALB stops sending
+drain_timeout = "15s"
+
+[trusted_client_cert_header]
+name = "X-Amzn-Mtls-Clientcert"
+format = "pem"
+# The ALB's subnets: the TCP peer, never X-Forwarded-For. They must hold ONLY the ALB: any pod or
+# node with an address in them can send this header with a copy of someone's certificate (a
+# certificate is public; the header proves no key) and authenticate as its owner. The VPC CNI
+# gives pods addresses from the nodes' subnets, so give the ALB a dedicated subnet pair.
+trusted_proxies = ["10.0.0.0/24", "10.0.1.0/24"]
+ca_path = "/etc/eggrd/pki/ca.pem"                    # passthrough: the ALB verifies nothing
+crl_paths = ["/etc/eggrd/pki/crl.pem"]
+
+[auth]
+mode = "mtls"                                        # no allowed certificate -> 401
+
+[auth.mtls]
+allowed = ["spiffe://example.test/ns/web/*"]         # which of the CA's certificates may call
+
+[tls]
+enabled = true                 # ALB -> eggrd stays encrypted; the ALB does not verify this cert
+cert_path = "/etc/eggrd-tls/tls.crt"
+key_path = "/etc/eggrd-tls/tls.key"
+
+[tls.client_auth]
+forward_client_cert = "xfcc"   # the app gets X-Forwarded-Client-Cert: Hash=...;URI="spiffe://..."
+
+[headers]
+hsts = true
+csp = "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+
+[waf]
+mode = "block"
+inspect_path = true
+
+[ratelimit]
+enabled = true
+rate = "120/min"               # per client: the address the ALB appended, not the ALB's
+burst = 30
+
+[validation]
+allow_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+[log]
+principal = "hash"

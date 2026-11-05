@@ -55,6 +55,10 @@ pub struct Config {
     /// proxy, the edge's client certificate, CAs to trust beside the public ones. See
     /// [`OutboundDefaultsCfg`].
     pub outbound: OutboundDefaultsCfg,
+    /// Keys in the config file the parser ignores (a misspelt setting keeps its default), found
+    /// by [`Config::load`]. Startup and reload log them; `doctor` reports them as errors.
+    #[serde(skip)]
+    pub unknown_keys: Vec<crate::unknown_keys::UnknownKey>,
 }
 
 /// `[outbound]` — how the edge reaches what it calls itself, once for every section.
@@ -274,7 +278,8 @@ pub struct LlmCfg {
     /// Turn on the LLM gateway: token metering, cost attribution, budgets, the key vault
     /// and DLP. Off by default, and irrelevant unless the upstream is an LLM API.
     pub enabled: bool,
-    /// Wire format. Only `"openai"` is understood today (the default).
+    /// Wire format, recorded for forward compatibility (default `"openai"`). Usage is read from
+    /// OpenAI Chat Completions, OpenAI Responses and Anthropic Messages whatever it says.
     pub api_style: String,
     /// Per-model price book, keyed by the `model` string clients send. Prices are USD per
     /// 1,000,000 tokens. Example:
@@ -697,6 +702,62 @@ impl Default for ControlPlaneCfg {
     }
 }
 
+/// `server.forwarded_hops`: a count of appending proxies, or `"auto"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardedHops {
+    /// The client is the entry this many from the right.
+    Count(usize),
+    /// The client is the rightmost entry outside `server.trusted_forwarders`.
+    Auto,
+}
+
+impl Default for ForwardedHops {
+    fn default() -> Self {
+        ForwardedHops::Count(1)
+    }
+}
+
+impl std::fmt::Display for ForwardedHops {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ForwardedHops::Count(n) => write!(f, "{n}"),
+            ForwardedHops::Auto => write!(f, "\"auto\""),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ForwardedHops {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = ForwardedHops;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a count of proxies from 1 to 10, or \"auto\"")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                Ok(ForwardedHops::Count(
+                    usize::try_from(v).unwrap_or(usize::MAX),
+                ))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                // A negative count is out of range, like 0: the runtime build says so.
+                Ok(ForwardedHops::Count(usize::try_from(v).unwrap_or(0)))
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                if v.trim().eq_ignore_ascii_case("auto") {
+                    Ok(ForwardedHops::Auto)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ServerCfg {
@@ -715,13 +776,26 @@ pub struct ServerCfg {
     /// header lines are one list, in order): each proxy appends the address it saw, so the
     /// leftmost entries are whatever the client sent and only the trusted proxies' own are
     /// believed. A header with fewer entries, or a chosen entry that is not an IP address, falls
-    /// back to the TCP peer.
+    /// back to the TCP peer. Set `trusted_forwarders` with it: without the list, the header is
+    /// believed on every connection, so anything that reaches this port directly writes its own.
     pub trust_forwarded_for: bool,
     /// How many `X-Forwarded-For` entries the trusted proxies in front of EdgeGuard append: `1`
     /// (default) for an ALB in `append` mode, Cloudflare, nginx or Traefik; `2` for a GCP external
     /// Application Load Balancer (it appends the client and its own address) or CloudFront → ALB.
-    /// `1` to `10`. Only read with `trust_forwarded_for`.
-    pub forwarded_hops: usize,
+    /// `1` to `10`. Or `"auto"`, with `trusted_forwarders`: the client is the rightmost entry
+    /// that is not itself in the list, for a chain whose length varies. Only read with
+    /// `trust_forwarded_for`.
+    pub forwarded_hops: ForwardedHops,
+    /// The proxies `X-Forwarded-For` and `X-Forwarded-Proto` are believed from, as IPs or CIDRs:
+    /// `["10.0.0.0/20"]` for a load balancer's subnets. Matched against the connection's **TCP
+    /// peer**, never an address a header or a PROXY header names. From any other peer the headers
+    /// are ignored: the request is served as its connection's client, and counted
+    /// (`edgeguard_forwarded_for_total{result="untrusted_peer"}`). Not refused: a direct caller (a
+    /// probe, an in-cluster client) is legitimate, it just cannot choose its address. A `/0` is
+    /// refused, and so is a list without `trust_forwarded_for`. Empty (default): the header is
+    /// believed on every connection, as in 0.7; from 0.9, `trust_forwarded_for` without a list
+    /// fails startup.
+    pub trusted_forwarders: Vec<String>,
     /// Private listener port for the internal `/__edgeguard/*` ops endpoints (health,
     /// readiness, metrics). `0` (default) keeps them on the public port. When non-zero,
     /// EdgeGuard binds a second, plain-HTTP listener on `admin_addr:admin_port` that serves
@@ -1197,7 +1271,7 @@ pub struct HeadersCfg {
     /// e.g. a double-submit CSRF token the frontend must read from `document.cookie`.
     pub httponly_cookies: bool,
     /// Cookie NAMES that must never get `HttpOnly`, even when `httponly_cookies` is on. The
-    /// surgical exemption for a readable double-submit CSRF cookie, e.g. `["doneyet_csrf"]`.
+    /// surgical exemption for a readable double-submit CSRF cookie, e.g. `["app_csrf"]`.
     /// Names match exactly (cookies are case-sensitive).
     pub httponly_cookie_exempt: Vec<String>,
     /// Response headers to strip (case-insensitive), e.g. ["Server", "X-Powered-By"].
@@ -1211,7 +1285,8 @@ impl Default for ServerCfg {
             app_port: 3000,
             upstream: String::new(),
             trust_forwarded_for: false,
-            forwarded_hops: 1,
+            forwarded_hops: ForwardedHops::Count(1),
+            trusted_forwarders: Vec::new(),
             admin_port: 0,
             admin_addr: "127.0.0.1".into(),
             header_read_timeout: "30s".into(),
@@ -2072,7 +2147,10 @@ impl Config {
         let mut cfg = if let Some(p) = path {
             let raw =
                 std::fs::read_to_string(p).with_context(|| format!("reading config file {p}"))?;
-            toml::from_str::<Config>(&raw).with_context(|| format!("parsing config file {p}"))?
+            let mut cfg = toml::from_str::<Config>(&raw)
+                .with_context(|| format!("parsing config file {p}"))?;
+            cfg.unknown_keys = crate::unknown_keys::unknown_keys(&raw);
+            cfg
         } else {
             Config::default()
         };
@@ -2251,6 +2329,8 @@ impl Config {
         let p: Config =
             toml::from_str(policy_toml).context("parsing control-plane policy document")?;
         Ok(Config {
+            // About the local file, which the policy does not replace.
+            unknown_keys: self.unknown_keys.clone(),
             server: self.server.clone(),
             tls: self.tls.clone(),
             control_plane: self.control_plane.clone(),

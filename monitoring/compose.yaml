@@ -31,12 +31,11 @@ services:
   # is on the private admin listener :9090, which is the listener Prometheus scrapes — exactly
   # the split a real deployment uses to keep metrics off the public port.
   #
-  # Pinned to the newest published release; bump it when a new one ships. The certificate panels
-  # and alerts (edgeguard_tls_cert_*, from 0.5.0) stay empty here either way: this demo serves
-  # plain HTTP. The API-usage dashboard reads series newer than this pin (per route, consumer and
-  # upstream, edge overhead, the connection cap) and fills in once it moves past them.
+  # Pinned to the newest published release by its multi-arch index digest; bump it when a new one
+  # ships. The certificate panels and alerts (edgeguard_tls_cert_*) stay empty here: this demo
+  # serves plain HTTP. For the 0.7 TLS listener series as well, see deploy/reference/monitoring.
   edgeguard:
-    image: docker.io/mancube/eggrd:0.4.0
+    image: docker.io/mancube/eggrd:0.7.0@sha256:b19278b379a457e626954e148effffa2fe559613d55ff497fdaa862c8c4096f6
     command: ["--config", "/etc/edgeguard/edgeguard.toml"]
     depends_on:
       - upstream

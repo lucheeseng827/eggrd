@@ -1,0 +1,51 @@
+# Two alerts on eggrd 0.7's new listener series, beside the monitoring bundle's alerts.yml (which
+# this setup loads too). Unit-tested in rules-0.7.test.yml (`promtool test rules`, run by smoke.sh).
+groups:
+  - name: eggrd-0.7-listeners
+    rules:
+      # With trust_forwarded_for, requests whose client came from the TCP peer instead of
+      # X-Forwarded-For: the header was absent (someone reaches eggrd without the balancer), short
+      # (forwarded_hops is higher than the chain) or invalid. Either way the rate limits and
+      # [access] rules are keyed on the wrong address for those requests.
+      - alert: EdgeGuardForwardedForFallback
+        expr: |
+          (
+            sum by (instance) (rate(edgeguard_forwarded_for_total{result=~"absent|short|invalid"}[10m]))
+            /
+            clamp_min(sum by (instance) (rate(edgeguard_forwarded_for_total[10m])), 1e-9)
+          ) > 0.1
+          and
+          sum by (instance) (rate(edgeguard_forwarded_for_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanizePercentage }} of requests did not get their client from X-Forwarded-For"
+          description: >-
+            More than 10% of requests fell back to the TCP peer for 10m (result absent, short or
+            invalid in edgeguard_forwarded_for_total). absent: clients reach eggrd without the
+            balancer, so let only the balancer connect. short: forwarded_hops is higher than the
+            number of entries the proxies append. Note "used" does not prove forwarded_hops is
+            right: compare the access log's client_ip with a known client.
+
+      # Failed TLS handshakes as a share of all handshakes. Connections closed before a
+      # ClientHello (health checks, port scans) are in neither series, so they cannot drive this.
+      - alert: EdgeGuardTlsHandshakeFailureRatio
+        expr: |
+          (
+            sum by (instance, listener) (rate(edgeguard_tls_handshake_failures_total[10m]))
+            /
+            clamp_min(sum by (instance, listener) (rate(edgeguard_tls_handshakes_total[10m])), 1e-9)
+          ) > 0.2
+          and
+          sum by (instance, listener) (rate(edgeguard_tls_handshakes_total[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} {{ $labels.listener }}: {{ $value | humanizePercentage }} of TLS handshakes fail"
+          description: >-
+            More than 20% of TLS handshakes failed for 10m. By reason
+            (edgeguard_tls_handshake_failures_total): client_cert is clients without an accepted
+            certificate (a CA or CRL change?), timeout is slow or stalled clients, other is
+            protocol or cipher mismatches (an old client, or plaintext sent to the TLS port).

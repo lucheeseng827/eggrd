@@ -239,8 +239,12 @@ impl RedisStore {
             !url.trim().is_empty(),
             "ratelimit.redis_url is required when ratelimit.store = \"redis\""
         );
-        let client = redis::Client::open(url)
-            .with_context(|| format!("opening redis client for {url:?} (ratelimit.redis_url)"))?;
+        let client = redis::Client::open(url).with_context(|| {
+            format!(
+                "opening redis client for {:?} (ratelimit.redis_url)",
+                crate::redact::userinfo(url)
+            )
+        })?;
         Ok(RedisStore {
             client,
             conn: tokio::sync::OnceCell::new(),

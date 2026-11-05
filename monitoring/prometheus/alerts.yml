@@ -274,6 +274,26 @@ groups:
             changed or it preserves client IPs, so the peer is the client. invalid: what the peer
             sends is not a PROXY header.
 
+      # The low-traffic case of the alert above: a quiet listener can refuse every client for
+      # hours without ever reaching one refusal every 10s. Any refusal while nothing at all was
+      # proxied means every client that arrived got no answer.
+      - alert: EdgeGuardProxyProtocolRefusedLowRate
+        expr: |
+          sum by (instance, listener) (increase(edgeguard_proxy_protocol_total{result=~"untrusted|invalid"}[1h])) > 0
+          unless
+          sum by (instance, listener) (increase(edgeguard_proxy_protocol_total{result="proxied"}[1h])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Listener {{ $labels.listener }} on {{ $labels.instance }} refuses every PROXY connection, too slowly for EdgeGuardProxyProtocolRefused"
+          description: >-
+            In the last hour, connections were closed for their PROXY protocol header (untrusted
+            or invalid) and none was proxied, so every client that arrived got no answer, just
+            too slowly for EdgeGuardProxyProtocolRefused (more than one every 10s). Same causes:
+            the balancer's addresses changed or it preserves client IPs, so the peer is the
+            client; or what the peer sends is not a PROXY header.
+
       # The trusted balancer connecting without headers and never with them. Health checks that
       # send none (HAProxy without check-send-proxy) do not fire it while traffic carries headers.
       - alert: EdgeGuardProxyProtocolMissing
@@ -291,6 +311,27 @@ groups:
             protocol header and none with one, so every client is served as the balancer: one
             shared rate limit, and access rules and logs that see the balancer's address. Enable
             proxy protocol on the balancer (the NLB target group, HAProxy's server line).
+
+      # server.trusted_forwarders ignoring most X-Forwarded-For headers. A spoof attempt is a few
+      # requests; most of them means the balancer's addresses left the list, so every client is
+      # served as the balancer: one shared rate limit, and access rules and logs that see it.
+      - alert: EdgeGuardForwardedForUntrusted
+        expr: |
+          sum by (instance) (rate(edgeguard_forwarded_for_total{result="untrusted_peer"}[15m]))
+            > 0.5 * sum by (instance) (rate(edgeguard_forwarded_for_total[15m]))
+          and
+          sum by (instance) (rate(edgeguard_forwarded_for_total[15m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} ignores most X-Forwarded-For headers: they come from outside trusted_forwarders"
+          description: >-
+            For 15m, more than half of the requests reaching this edge carried an X-Forwarded-For
+            from a peer outside server.trusted_forwarders, so it was ignored and each was served as
+            its connection's peer. Usually the load balancer's addresses changed (a new subnet, a
+            replaced balancer) and every client now shares its address. Otherwise something
+            reaching the edge directly is writing the header.
 
   # ACME issuance budget. The point of these is to fire while there is still time to act: a CA
   # rate limit, once hit, is a week-long wait with no certificate — there is no fast remedy, so an

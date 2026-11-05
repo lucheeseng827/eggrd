@@ -337,10 +337,15 @@ fn run_doctor(config: Option<String>) -> Result<()> {
     let cfg = match Config::load(config.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("✗ [error] config failed to load: {e:#}");
+            eprintln!(
+                "✗ [error] config failed to load: {}",
+                edgeguard::redact::userinfo(&format!("{e:#}"))
+            );
             std::process::exit(1);
         }
     };
+    // Everything printed below names configured URLs without their credentials.
+    let shown = |text: String| edgeguard::redact::userinfo(&text).into_owned();
 
     let findings = doctor::lint(&cfg);
     // Hard validation: the same startup sequence the proxy runs. `build_state` does
@@ -357,15 +362,26 @@ fn run_doctor(config: Option<String>) -> Result<()> {
             Level::Warn => warns += 1,
             Level::Info => {}
         }
-        println!("{} [{}] {}", f.level.glyph(), f.level.label(), f.message);
+        println!(
+            "{} [{}] {}",
+            f.level.glyph(),
+            f.level.label(),
+            shown(f.message.clone())
+        );
     }
     if let Some(e) = &cp_err {
         errors += 1;
-        println!("✗ [error] control-plane config does not build: {e:#}");
+        println!(
+            "✗ [error] control-plane config does not build: {}",
+            shown(format!("{e:#}"))
+        );
     }
     if let Some(e) = &build_err {
         errors += 1;
-        println!("✗ [error] config does not build: {e:#}");
+        println!(
+            "✗ [error] config does not build: {}",
+            shown(format!("{e:#}"))
+        );
     }
 
     // Only claim a clean bill of health when there was genuinely nothing to report — info-level
@@ -417,6 +433,14 @@ fn run_init(force: bool) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // A startup error can quote a configured URL (an upstream, a Redis or collector URL, a proxy);
+    // its credentials never reach the terminal or the container log.
+    run()
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", edgeguard::redact::display(&e)))
+}
+
+async fn run() -> Result<()> {
     // `--hash` and `generate` are standalone utilities: no logging setup, no listener. `serve`
     // (the default) falls through to the proxy bootstrap below.
     let (wrap, config) = match parse_args()? {
@@ -446,6 +470,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Arc::new(Config::load(config.as_deref())?);
+    for key in &cfg.unknown_keys {
+        warn!("{key}: it is ignored, so its setting keeps the default");
+    }
     // Listener settings are read once, here, so a bad duration or PROXY protocol trust list fails
     // before anything starts.
     let serve_opts = serve::ServeOpts::from_cfg(&cfg.server)?;
@@ -540,6 +567,9 @@ async fn main() -> Result<()> {
     if policy.pending() {
         warn!("control_plane.boot_without_policy = \"refuse\" and no cached policy: answering 503 until the control plane provides one");
     }
+    if state.runtime.load().forwarders.trusts_any_peer() {
+        warn!("{}", edgeguard::proxy::Forwarders::TRUSTS_ANY_PEER);
+    }
     // Upstream pools: their active health checks, for whichever runtime is current.
     for pool in state.runtime.load().pools().filter(|p| p.is_pool()) {
         let tier = |backup: bool| -> Vec<String> {
@@ -620,7 +650,10 @@ async fn main() -> Result<()> {
         let policy = Arc::clone(&policy);
         tokio::spawn(async move {
             if let Err(e) = reload::watch(PathBuf::from(path), policy).await {
-                warn!(error = format!("{e:#}"), "config watcher stopped");
+                warn!(
+                    error = edgeguard::redact::display(&e),
+                    "config watcher stopped"
+                );
             }
         });
     }
@@ -749,7 +782,7 @@ async fn main() -> Result<()> {
                 &cfg.tls.acme.directory_url,
             );
             info!(
-                directory = %cfg.tls.acme.directory_url,
+                directory = %edgeguard::redact::userinfo(&cfg.tls.acme.directory_url),
                 trust = settings.trust.label_for(edgeguard::outbound::PublicRoots::System),
                 client_cert = settings.identity.is_some(),
                 proxy = %edgeguard::outbound::redact_proxy(settings.proxy.0),
@@ -882,7 +915,7 @@ async fn main() -> Result<()> {
                 let rx = shutdown_rx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = certstore::watch(store, rx).await {
-                        warn!(error = format!("{e:#}"), "certificate watcher stopped; changes on disk are picked up by the hourly check");
+                        warn!(error = edgeguard::redact::display(&e), "certificate watcher stopped; changes on disk are picked up by the hourly check");
                     }
                 });
             }
@@ -907,7 +940,7 @@ async fn main() -> Result<()> {
             let rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 if let Err(e) = certstore::watch(store, rx).await {
-                    warn!(error = format!("{e:#}"), "certificate watcher stopped; changes on disk are picked up by the hourly check");
+                    warn!(error = edgeguard::redact::display(&e), "certificate watcher stopped; changes on disk are picked up by the hourly check");
                 }
             });
         }
@@ -959,7 +992,8 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("binding public TLS listener on {addr}"))?;
         info!(
-            listen = %addr,
+            // The bound address: with `port = 0`, the port the system chose.
+            listen = %listener.local_addr().unwrap_or(addr),
             upstream = %default_upstream(&cfg),
             auth = %cfg.auth.mode,
             rate_limit = cfg.ratelimit.enabled,
@@ -984,7 +1018,8 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("binding public listener on {addr}"))?;
         info!(
-            listen = %addr,
+            // The bound address: with `port = 0`, the port the system chose.
+            listen = %listener.local_addr().unwrap_or(addr),
             upstream = %default_upstream(&cfg),
             auth = %cfg.auth.mode,
             rate_limit = cfg.ratelimit.enabled,
@@ -1029,7 +1064,7 @@ fn watch_client_identity(
     let rx = shutdown_rx.clone();
     runtime.spawn(async move {
         if let Err(e) = certstore::watch(watched, rx).await {
-            warn!(error = format!("{e:#}"), "client certificate watcher stopped; changes on disk are picked up by the hourly check");
+            warn!(error = edgeguard::redact::display(&e), "client certificate watcher stopped; changes on disk are picked up by the hourly check");
         }
     });
     let renewer = certstore::Renewer {
@@ -1043,9 +1078,9 @@ fn watch_client_identity(
 }
 
 /// Where requests no other prefix claims go, for the startup log: a `/` route's target or
-/// targets, else `server.upstream`.
+/// targets, else `server.upstream`; without any credentials in them.
 fn default_upstream(cfg: &Config) -> String {
-    match cfg.upstreams.iter().find(|u| u.path == "/") {
+    let all = match cfg.upstreams.iter().find(|u| u.path == "/") {
         Some(root) if !root.targets.is_empty() => root
             .targets
             .iter()
@@ -1054,7 +1089,8 @@ fn default_upstream(cfg: &Config) -> String {
             .join(", "),
         Some(root) => root.target.clone(),
         None => cfg.upstream_base(),
-    }
+    };
+    edgeguard::redact::userinfo(&all).into_owned()
 }
 
 /// Poll the upstream port until it accepts a connection or the timeout elapses.

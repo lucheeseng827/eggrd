@@ -5,11 +5,21 @@
 //! *metering only*: it never blocks, rewrites, or delays a request. Token counts come from the
 //! upstream's own `usage` object (authoritative), so the proxy does not tokenize anything itself.
 //!
-//! Two response shapes are handled:
-//!   * **non-streaming** — a JSON body carrying `usage.{prompt,completion}_tokens` ([`parse_response_usage`]);
-//!   * **streaming (SSE)** — the terminal `data:` frame carries `usage` when the client sets
-//!     `stream_options.include_usage` ([`parse_sse_usage`]); without it, no usage is emitted and the
-//!     request is metered as `no_usage`.
+//! Three APIs' `usage` are read, whatever `api_style` says:
+//!   * **OpenAI Chat Completions** (and OpenAI-compatible servers): `prompt_tokens` and
+//!     `completion_tokens`, with `prompt_tokens_details.cached_tokens` and
+//!     `completion_tokens_details.reasoning_tokens`. Streamed, the final frame carries `usage` when the
+//!     client sets `stream_options.include_usage`; without it the request is metered `no_usage`.
+//!   * **OpenAI Responses**: `input_tokens` (cached ones included, in `input_tokens_details`) and
+//!     `output_tokens` (with `output_tokens_details.reasoning_tokens`). Streamed, in the
+//!     `response.completed` event's `response.usage`.
+//!   * **Anthropic Messages**: `input_tokens` and `output_tokens`, with cache reads and writes
+//!     counted **beside** `input_tokens` (`cache_read_input_tokens`, `cache_creation_input_tokens`),
+//!     not inside it. Streamed, `message_start` carries the input side and `message_delta` the
+//!     running output count, so the two are merged.
+//!
+//! A buffered body is read whole ([`parse_response_usage`]); a stream is read as it passes
+//! ([`StreamUsage`]), so a long one keeps nothing but the line being read.
 //!
 //! Pricing is a per-model book ([`LlmRuntime`]). What happens to a request for an **unmapped** model
 //! is a config choice ([`UnpricedPolicy`]): `count` keeps the historical fail-open behaviour (tokens
@@ -46,30 +56,104 @@ pub struct Usage {
     pub reasoning_tokens: u64,
 }
 
-/// The raw `usage` wire shape, including the nested detail objects OpenAI added for cached/reasoning
-/// accounting. Flattened into [`Usage`] on deserialize so the rest of the crate sees four flat dims.
-#[derive(Deserialize)]
+/// The raw `usage` wire shape of all three APIs (see the module doc), every field optional so a
+/// streamed Anthropic `message_delta` (which carries only some) can be merged over `message_start`.
+/// Flattened into [`Usage`] so the rest of the crate sees four flat dimensions.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 struct UsageWire {
-    #[serde(default)]
-    prompt_tokens: u64,
-    #[serde(default)]
-    completion_tokens: u64,
-    #[serde(default)]
-    prompt_tokens_details: Option<PromptTokensDetails>,
-    #[serde(default)]
-    completion_tokens_details: Option<CompletionTokensDetails>,
+    // OpenAI Chat Completions.
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    prompt_tokens_details: Option<CachedDetails>,
+    completion_tokens_details: Option<ReasoningDetails>,
+    // OpenAI Responses and Anthropic Messages.
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    // OpenAI Responses: cached tokens are inside `input_tokens`.
+    input_tokens_details: Option<CachedDetails>,
+    output_tokens_details: Option<ReasoningDetails>,
+    // Anthropic: cache reads and writes are beside `input_tokens`, not inside it.
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
 }
 
-#[derive(Deserialize)]
-struct PromptTokensDetails {
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct CachedDetails {
     #[serde(default)]
     cached_tokens: u64,
 }
 
-#[derive(Deserialize)]
-struct CompletionTokensDetails {
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct ReasoningDetails {
     #[serde(default)]
     reasoning_tokens: u64,
+}
+
+impl UsageWire {
+    /// `later`'s fields where it has them, this one's elsewhere: Anthropic's `message_delta` over
+    /// `message_start`.
+    fn merged(self, later: UsageWire) -> UsageWire {
+        UsageWire {
+            prompt_tokens: later.prompt_tokens.or(self.prompt_tokens),
+            completion_tokens: later.completion_tokens.or(self.completion_tokens),
+            prompt_tokens_details: later.prompt_tokens_details.or(self.prompt_tokens_details),
+            completion_tokens_details: later
+                .completion_tokens_details
+                .or(self.completion_tokens_details),
+            input_tokens: later.input_tokens.or(self.input_tokens),
+            output_tokens: later.output_tokens.or(self.output_tokens),
+            input_tokens_details: later.input_tokens_details.or(self.input_tokens_details),
+            output_tokens_details: later.output_tokens_details.or(self.output_tokens_details),
+            cache_read_input_tokens: later
+                .cache_read_input_tokens
+                .or(self.cache_read_input_tokens),
+            cache_creation_input_tokens: later
+                .cache_creation_input_tokens
+                .or(self.cache_creation_input_tokens),
+        }
+    }
+}
+
+impl From<UsageWire> for Usage {
+    fn from(w: UsageWire) -> Usage {
+        let (prompt, completion, cached, reasoning) =
+            if w.prompt_tokens.is_some() || w.completion_tokens.is_some() {
+                // Chat Completions.
+                (
+                    w.prompt_tokens.unwrap_or(0),
+                    w.completion_tokens.unwrap_or(0),
+                    w.prompt_tokens_details.map_or(0, |d| d.cached_tokens),
+                    w.completion_tokens_details
+                        .map_or(0, |d| d.reasoning_tokens),
+                )
+            } else {
+                // Responses or Messages. Anthropic's cache reads and writes are input tokens it
+                // reports beside `input_tokens`; the Responses API has no such fields, and counts
+                // its cached tokens inside `input_tokens`.
+                let read = w.cache_read_input_tokens.unwrap_or(0);
+                let write = w.cache_creation_input_tokens.unwrap_or(0);
+                let prompt = w
+                    .input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(read)
+                    .saturating_add(write);
+                let cached = w.input_tokens_details.map_or(read, |d| d.cached_tokens);
+                (
+                    prompt,
+                    w.output_tokens.unwrap_or(0),
+                    cached,
+                    w.output_tokens_details.map_or(0, |d| d.reasoning_tokens),
+                )
+            };
+        // Clamp the sub-dimensions to their parent so a malformed upstream (cached > prompt) can't
+        // make the priced "uncached" remainder underflow later.
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_tokens: cached.min(prompt),
+            reasoning_tokens: reasoning.min(completion),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Usage {
@@ -77,25 +161,7 @@ impl<'de> Deserialize<'de> for Usage {
     where
         D: Deserializer<'de>,
     {
-        let w = UsageWire::deserialize(deserializer)?;
-        // Clamp the sub-dimensions to their parent so a malformed upstream (cached > prompt) can't
-        // make the priced "uncached" remainder underflow later.
-        let cached = w
-            .prompt_tokens_details
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0)
-            .min(w.prompt_tokens);
-        let reasoning = w
-            .completion_tokens_details
-            .map(|d| d.reasoning_tokens)
-            .unwrap_or(0)
-            .min(w.completion_tokens);
-        Ok(Usage {
-            prompt_tokens: w.prompt_tokens,
-            completion_tokens: w.completion_tokens,
-            cached_tokens: cached,
-            reasoning_tokens: reasoning,
-        })
+        UsageWire::deserialize(deserializer).map(Usage::from)
     }
 }
 
@@ -339,16 +405,22 @@ pub fn parse_request_model(body: &[u8]) -> Option<String> {
 
 #[derive(Deserialize)]
 struct MaxTokensField {
-    /// OpenAI's completion ceiling. The newer `max_completion_tokens` is accepted as a fallback.
+    /// The completion ceiling: `max_tokens` (OpenAI Chat, Anthropic Messages), else OpenAI's newer
+    /// `max_completion_tokens`, else the Responses API's `max_output_tokens`.
     max_tokens: Option<u64>,
     max_completion_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
 }
 
-/// Extract the request's completion-token ceiling (`max_tokens`, or `max_completion_tokens`). Used
-/// only to size the budget *reserve* estimate; the reservation is reconciled to actual usage after.
+/// Extract the request's completion-token ceiling (`max_tokens`, `max_completion_tokens` or
+/// `max_output_tokens`). Used only to size the budget *reserve* estimate; the reservation is
+/// reconciled to actual usage after.
 pub fn parse_request_max_tokens(body: &[u8]) -> Option<u64> {
     let parsed: MaxTokensField = serde_json::from_slice(body).ok()?;
-    parsed.max_tokens.or(parsed.max_completion_tokens)
+    parsed
+        .max_tokens
+        .or(parsed.max_completion_tokens)
+        .or(parsed.max_output_tokens)
 }
 
 /// A rough prompt-token estimate from the raw request size (~4 bytes/token, the common English
@@ -364,36 +436,157 @@ struct UsageField {
     usage: Option<Usage>,
 }
 
-/// Extract `usage` from a non-streaming OpenAI-style response body. `None` if absent/zero (an error
-/// response or a stream that didn't include usage).
+/// Extract `usage` from a non-streaming response body (any of the three APIs: each puts `usage` at
+/// the top). `None` if absent/zero (an error response).
 pub fn parse_response_usage(body: &[u8]) -> Option<Usage> {
     let parsed: UsageField = serde_json::from_slice(body).ok()?;
     parsed.usage.filter(|u| !u.is_empty())
 }
 
-/// Extract the terminal `usage` from an SSE stream's bytes. OpenAI emits a final
-/// `data: {…, "usage": {…}}` frame when the client sets `stream_options.include_usage`; earlier
-/// frames carry `"usage": null`. Returns the **last** non-empty usage seen (the authoritative
-/// totals), or `None` if the stream never reported usage.
+/// The usage of a whole buffered SSE stream: [`StreamUsage`] fed all of it at once.
 pub fn parse_sse_usage(bytes: &[u8]) -> Option<Usage> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let mut last = None;
-    for line in text.lines() {
-        let line = line.trim_start();
-        let Some(payload) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
+    let mut stream = StreamUsage::default();
+    stream.feed(bytes);
+    stream.finish()
+}
+
+/// How much of a line [`StreamUsage`] keeps: its start (enough for the event's `type`), and when
+/// it is longer, its last bytes. OpenAI Responses' `response.completed` carries the whole response
+/// on one line, `usage` near the end.
+const LINE_HEAD: usize = 512;
+const LINE_TAIL: usize = 16 * 1024;
+
+/// The usage a streamed (SSE) response reports, read as the stream passes, so its memory is the
+/// line being read whatever the stream's length.
+///
+/// - OpenAI Chat: the last frame with a non-empty top-level `usage` (`stream_options.include_usage`).
+/// - OpenAI Responses: `response.usage` in `response.completed` (or `response.incomplete`).
+/// - Anthropic Messages: `message.usage` in `message_start`, with each `message_delta`'s `usage`
+///   merged over it field by field: the input side comes first, the output count last.
+#[derive(Debug, Default)]
+pub struct StreamUsage {
+    /// The line being read: its start, then (once it is longer than both caps) its last
+    /// [`LINE_TAIL`] bytes.
+    line: Vec<u8>,
+    /// Whether the middle of `line` was dropped.
+    cut: bool,
+    /// OpenAI's totals, Chat or Responses: the last seen.
+    totals: Option<Usage>,
+    /// Anthropic's, merged.
+    anthropic: Option<UsageWire>,
+}
+
+/// One SSE event's JSON, as far as usage goes.
+#[derive(Deserialize)]
+struct Frame {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    usage: Option<UsageWire>,
+    /// Anthropic `message_start`.
+    message: Option<Nested>,
+    /// OpenAI Responses events.
+    response: Option<Nested>,
+}
+
+#[derive(Deserialize)]
+struct Nested {
+    usage: Option<UsageWire>,
+}
+
+impl StreamUsage {
+    /// Read the next bytes of the stream.
+    pub fn feed(&mut self, mut bytes: &[u8]) {
+        while let Some(i) = bytes.iter().position(|b| *b == b'\n') {
+            self.push(&bytes[..i]);
+            self.line_done();
+            bytes = &bytes[i + 1..];
         }
-        if let Ok(parsed) = serde_json::from_str::<UsageField>(payload) {
-            if let Some(u) = parsed.usage.filter(|u| !u.is_empty()) {
-                last = Some(u);
+        self.push(bytes);
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.line.extend_from_slice(bytes);
+        if self.line.len() > LINE_HEAD + LINE_TAIL {
+            let end = self.line.len() - LINE_TAIL;
+            self.line.drain(LINE_HEAD..end);
+            self.cut = true;
+        }
+    }
+
+    /// The usage the stream reported, once it has ended. `None` if it reported none.
+    pub fn finish(mut self) -> Option<Usage> {
+        self.line_done();
+        let anthropic = self.anthropic.map(Usage::from).filter(|u| !u.is_empty());
+        self.totals.or(anthropic)
+    }
+
+    fn line_done(&mut self) {
+        let line = std::mem::take(&mut self.line);
+        let cut = std::mem::take(&mut self.cut);
+        let Some(payload) = data_payload(&line) else {
+            return;
+        };
+        // Most frames are content: only one that names `usage` is parsed.
+        if find(payload, b"\"usage\"").is_none() {
+            return;
+        }
+        let frame = if cut {
+            None
+        } else {
+            serde_json::from_slice::<Frame>(payload).ok()
+        };
+        match frame {
+            Some(f) => match f.kind.as_deref() {
+                Some("message_start") => {
+                    if let Some(u) = f.message.and_then(|m| m.usage) {
+                        self.anthropic = Some(self.anthropic.unwrap_or_default().merged(u));
+                    }
+                }
+                Some("message_delta") => {
+                    if let Some(u) = f.usage {
+                        self.anthropic = Some(self.anthropic.unwrap_or_default().merged(u));
+                    }
+                }
+                _ => {
+                    let wire = f.response.and_then(|r| r.usage).or(f.usage);
+                    if let Some(u) = wire.map(Usage::from).filter(|u| !u.is_empty()) {
+                        self.totals = Some(u);
+                    }
+                }
+            },
+            // A line too long to keep whole (Responses' `response.completed`), or one that is not
+            // a frame this reads: the last `"usage":` object in it.
+            None => {
+                if let Some(u) = last_usage_object(payload).filter(|u| !u.is_empty()) {
+                    self.totals = Some(u);
+                }
             }
         }
     }
-    last
+}
+
+/// The JSON of an SSE `data:` line, without `[DONE]` or an empty payload.
+fn data_payload(line: &[u8]) -> Option<&[u8]> {
+    let start = line.iter().position(|b| !b.is_ascii_whitespace())?;
+    let payload = line[start..].strip_prefix(b"data:")?;
+    let payload = payload.trim_ascii();
+    (!payload.is_empty() && payload != b"[DONE]").then_some(payload)
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The usage object after the last `"usage":` key in `payload`. A key cannot appear inside a JSON
+/// string (its quotes would be escaped), so this is a real key; the object is parsed and the rest
+/// of the line, which may have been cut, is not.
+fn last_usage_object(payload: &[u8]) -> Option<Usage> {
+    let key = b"\"usage\"";
+    let at = payload.windows(key.len()).rposition(|w| w == key)?;
+    let rest = payload[at + key.len()..].trim_ascii_start();
+    let rest = rest.strip_prefix(b":")?;
+    let mut de = serde_json::Deserializer::from_slice(rest);
+    Option::<Usage>::deserialize(&mut de).ok().flatten()
 }
 
 #[cfg(test)]
@@ -417,6 +610,160 @@ mod tests {
             models,
             ..Default::default()
         })
+    }
+
+    fn usage(prompt: u64, completion: u64, cached: u64, reasoning: u64) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_tokens: cached,
+            reasoning_tokens: reasoning,
+        }
+    }
+
+    #[test]
+    fn reads_the_responses_and_messages_shapes_beside_chat_completions() {
+        // OpenAI Responses: cached tokens are inside `input_tokens`.
+        let responses = br#"{"id":"resp_1","object":"response","output":[],"usage":{
+            "input_tokens":40,"input_tokens_details":{"cached_tokens":10},
+            "output_tokens":20,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":60}}"#;
+        assert_eq!(parse_response_usage(responses), Some(usage(40, 20, 10, 5)));
+        // Anthropic Messages: cache reads and writes are beside `input_tokens`, so the prompt is
+        // all three, and the reads are the cached part.
+        let messages = br#"{"id":"msg_1","type":"message","content":[],"usage":{
+            "input_tokens":100,"cache_creation_input_tokens":20,"cache_read_input_tokens":50,
+            "output_tokens":30}}"#;
+        assert_eq!(parse_response_usage(messages), Some(usage(170, 30, 50, 0)));
+        // Plain input/output, no cache fields: both readings agree.
+        assert_eq!(
+            parse_response_usage(br#"{"usage":{"input_tokens":3,"output_tokens":4}}"#),
+            Some(usage(3, 4, 0, 0))
+        );
+        // A malformed sub-count is clamped to its parent.
+        assert_eq!(
+            parse_response_usage(
+                br#"{"usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":9},"output_tokens":1}}"#
+            ),
+            Some(usage(5, 1, 5, 0))
+        );
+        assert_eq!(
+            parse_response_usage(br#"{"usage":{"input_tokens":0,"output_tokens":0}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn an_anthropic_stream_merges_message_start_and_message_delta() {
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":",
+            "{\"input_tokens\":25,\"cache_read_input_tokens\":10,\"cache_creation_input_tokens\":0,",
+            "\"output_tokens\":1}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",",
+            "\"text\":\"Hello\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"output_tokens\":15}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        // The delta's output count replaces the start's; the start's input side stays. Taking the
+        // last frame with `usage`, as for OpenAI, would have kept 15 output tokens and no input.
+        assert_eq!(
+            parse_sse_usage(stream.as_bytes()),
+            Some(usage(35, 15, 10, 0))
+        );
+        // A delta that also carries the input side overrides it.
+        let restated = stream.replace(
+            "{\"output_tokens\":15}",
+            "{\"input_tokens\":26,\"output_tokens\":15}",
+        );
+        assert_eq!(
+            parse_sse_usage(restated.as_bytes()),
+            Some(usage(36, 15, 10, 0))
+        );
+    }
+
+    #[test]
+    fn a_responses_stream_is_read_from_response_completed() {
+        let completed = r#"{"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":2},"output_tokens":8,"output_tokens_details":{"reasoning_tokens":3}}}}"#;
+        let stream = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"usage\":null}}}}\n\n\
+             event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}}\n\n\
+             event: response.completed\ndata: {completed}\n\n"
+        );
+        assert_eq!(parse_sse_usage(stream.as_bytes()), Some(usage(12, 8, 2, 3)));
+    }
+
+    #[test]
+    fn a_stream_is_read_as_it_passes_whatever_its_length() {
+        // An Anthropic stream far longer than any tail: `message_start` is at the very start.
+        let mut stream = StreamUsage::default();
+        stream.feed(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":500,\"output_tokens\":1}}}\n\n",
+        );
+        let delta = b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"lorem ipsum dolor sit amet \"}}\n\n";
+        for _ in 0..2_000 {
+            stream.feed(delta);
+        }
+        // The last frame arrives split across reads, mid-line.
+        stream.feed(b"event: message_delta\ndata: {\"type\":\"message_del");
+        stream.feed(b"ta\",\"usage\":{\"output_tokens\":900}}\n\n");
+        assert!(
+            stream.line.len() < 64,
+            "nothing but the line being read is kept"
+        );
+        assert_eq!(stream.finish(), Some(usage(500, 900, 0, 0)));
+
+        // A `response.completed` line longer than the line cap: its middle is dropped, and the
+        // `usage` near its end still read.
+        let text = "x".repeat(LINE_HEAD + LINE_TAIL * 2);
+        let line = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"text\":\"{text}\"}}],\"usage\":{{\"input_tokens\":7,\"output_tokens\":9}}}}}}\n\n"
+        );
+        let mut stream = StreamUsage::default();
+        for chunk in line.as_bytes().chunks(1000) {
+            stream.feed(chunk);
+            assert!(
+                stream.line.len() <= LINE_HEAD + LINE_TAIL,
+                "a long line is held to its head and tail"
+            );
+        }
+        assert_eq!(stream.finish(), Some(usage(7, 9, 0, 0)));
+        // In a cut line, the last `usage` key is the one read: the totals come at the end.
+        let line = format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"previous\":{{\"usage\":null}},\"output\":[{{\"text\":\"{text}\"}}],\"usage\":{{\"input_tokens\":4,\"output_tokens\":6}}}}}}\n"
+        );
+        assert_eq!(parse_sse_usage(line.as_bytes()), Some(usage(4, 6, 0, 0)));
+        // A stream that ends without a final newline is still read.
+        assert_eq!(
+            parse_sse_usage(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}"
+            ),
+            Some(usage(2, 3, 0, 0))
+        );
+        // CRLF line endings.
+        assert_eq!(
+            parse_sse_usage(b"data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3}}\r\n\r\ndata: [DONE]\r\n"),
+            Some(usage(2, 3, 0, 0))
+        );
+    }
+
+    #[test]
+    fn max_output_tokens_sizes_the_reserve_for_the_responses_api() {
+        assert_eq!(
+            parse_request_max_tokens(br#"{"model":"m","max_output_tokens":64}"#),
+            Some(64)
+        );
+        assert_eq!(
+            parse_request_max_tokens(br#"{"model":"m","max_tokens":32}"#),
+            Some(32)
+        );
+        assert_eq!(
+            parse_request_max_tokens(br#"{"model":"m","max_completion_tokens":16}"#),
+            Some(16)
+        );
     }
 
     #[test]

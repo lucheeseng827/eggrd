@@ -1,0 +1,17 @@
+# The cloud standby, played by nginx: the app over TLS on :8443, REQUIRING a client certificate
+# from the test CA (mutual TLS: only the edge, holding edge-client.pem, gets in), and its health on
+# plain HTTP on a management port :8081, reached through a separate name (check_host).
+server {
+  listen 8443 ssl;
+  ssl_certificate /pki/upstream-cloud.pem;
+  ssl_certificate_key /pki/upstream-cloud.key;
+  ssl_client_certificate /pki/ca.pem;
+  ssl_verify_client on;
+  default_type text/plain;
+  location / { return 200 "server=${SRV} uri=$request_uri client=$ssl_client_s_dn\n"; }
+}
+server {
+  listen 8081;
+  default_type text/plain;
+  location = /health { return 200 "ok server=${SRV} host=$host\n"; }
+}

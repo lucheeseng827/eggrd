@@ -1,0 +1,39 @@
+# The ALB, made by the AWS Load Balancer Controller from this Ingress. Annotations follow the eggrd
+# 0.7 end-to-end run on EKS (ALB with IP targets, the health check on the admin port), with that
+# run's names, subnets, certificate and tags replaced by placeholders, and the backend switched to
+# HTTPS so the ALB -> eggrd hop stays encrypted.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: eggrd-alb
+  namespace: eggrd-edge
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"          # the ALB answers :80 with a redirect
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-0000-0000-000000000000
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # Re-encrypt to eggrd's :443. The ALB does not verify the target's certificate.
+    alb.ingress.kubernetes.io/backend-protocol: HTTPS
+    # Health check on the admin port: /ready turns 503 when eggrd starts draining.
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-port: "9090"
+    alb.ingress.kubernetes.io/healthcheck-path: /__edgeguard/ready
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+    # X-Forwarded-For processing: `append` (the default) is what forwarded_hops = 1 assumes. Never
+    # `preserve` with trust_forwarded_for: the ALB then appends nothing, and the rightmost entry is
+    # the client's own writing.
+    alb.ingress.kubernetes.io/load-balancer-attributes: routing.http.xff_header_processing.mode=append,routing.http.drop_invalid_header_fields.enabled=true
+    # alb.ingress.kubernetes.io/inbound-cidrs: 203.0.113.0/24                 # to admit only some clients
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: eggrd
+                port: { name: https }

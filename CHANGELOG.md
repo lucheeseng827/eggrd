@@ -6,6 +6,210 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-11-05
+
+A security release on 0.7.0. It fixes two holes: credentials in a configured URL reached the logs,
+and the WAF's Host allow-list rule could be bypassed over cleartext HTTP/2, with an absolute-form
+target, or with no `Host` at all. Read "Upgrading from 0.7.0" before rolling it out: a request
+with no host, or two that disagree, now gets `400`, and WebSocket handshakes now go through the
+WAF. It also carries what was merged since 0.7.0: `server.trusted_forwarders`, reporting of
+unknown config keys, and LLM metering of Anthropic Messages and OpenAI Responses traffic.
+
+### Security
+
+- **A WAF Host rule was bypassed over cleartext HTTP/2.** On a plain listener, an HTTP/2
+  prior-knowledge (`h2c`) client carries the host in `:authority`, with no `Host` header line, so
+  the WAF's `headers` location had nothing to match: the Host allow-list rule from
+  `deploy/reference/tools/host-rule.sh` answered `403` to `curl --http1.1 -H 'Host: evil.example'`
+  and `200` to the same request with `--http2-prior-knowledge`, and the app still received
+  `X-Forwarded-Host: evil.example`. The TLS listener was not affected (its ALPN offers only
+  `http/1.1`). The edge now has one effective host per request: `Host` as sent when there is one, else the
+  HTTP/2 `:authority` (without the scheme's default port). A target's authority (HTTP/2
+  `:authority`, or an HTTP/1.1 absolute-form target, which RFC 9112 says wins over `Host`) must
+  agree with `Host`, case and the default port aside. The WAF always sees the effective host as
+  its one `host:` line, `X-Forwarded-Host`, the span's
+  `server.address` and the `:80` redirect use the same value, and a request whose authority and
+  `Host` differ, or that sends `Host` twice, is refused with `400` (outcome `bad_request`, RFC 9113
+  §8.3.1). So is a `Host` that is not visible ASCII text: the WAF reads header values as text and
+  skipped it, so it too went past the rule. **A request with no host at all also slipped past the rule** (it needs a `host:` line
+  to match, and its regex engine cannot say "absent"), over TLS and plain HTTP alike: an
+  HTTP/1.1 or HTTP/2 request with no `Host` and no authority is now refused with `400`, as RFC 9112
+  §3.2 and RFC 9113 §8.3.1 require, before the WAF runs. An empty or blank `Host:` counts as none
+  (0.7.0 served it, with an empty `X-Forwarded-Host`). An HTTP/1.0 request may lawfully omit
+  `Host`: it is still served, and the WAF sees an empty `host:` line, which the Host allow-list
+  rule refuses (`403`). WebSocket upgrade handshakes, which went straight to the tunnel, are now
+  screened by the WAF on their path and headers too.
+
+- **Credentials in an upstream URL reached the logs.** With `server.upstream`, a route's `target`
+  or a pool target written as `http://user:pass@host`, the `upstream unreachable` and `upstream
+  timed out` warnings (and the pool's "trying the next target") printed the full URL, password
+  included; at trace level the HTTP client's own connection-pool logs did too. The access record
+  already named the upstream as `scheme://host:port`. Now one helper replaces URL userinfo with
+  `***` in these places:
+  - the upstream failure warnings, on the normal and the WebSocket path, and pool failover (only
+    the configured URL is redacted there, never the request's path, so an `@` in a path keeps
+    the upstream host in the line);
+  - error chains from the upstream client, which also feed `/__edgeguard/upstreams`
+    (`last_connect_error`, health-check results) and the health-check logs;
+  - errors about a bad pool target, a Redis URL (`ratelimit.redis_url`, `llm.redis_url`) or an
+    `[outbound]` section's URL, in startup errors and in `edgeguard doctor`'s output, every line of
+    which is now redacted;
+  - the startup lines naming the upstream, the log-ship, tracing and OTLP endpoints and the ACME
+    directory, and the egress proxy (which used to keep the user name);
+  - the send-failure warnings of log shipping, span shipping, the OTLP metrics push, LLM
+    telemetry and the alert webhook (all five go through the upstream client's error chain).
+    These did not leak in 0.7.0: reqwest moves URL userinfo into Basic auth and quotes the URL
+    without it. The redaction guards against that changing, and a test runs the first three
+    against a credentialed collector that refuses;
+  - control-plane, JWKS, ACME and certificate-renewal errors, including `last_renewal.error` on
+    `/__edgeguard/tls`.
+
+  Upstream requests and active health checks are now built from the URL without its userinfo.
+  Both go through the proxy's own HTTP client (hyper), which does not turn URL userinfo into an
+  `Authorization` header, so the upstream received no credentials from it before and receives
+  none now (a test asserts what the upstream sees); the client's trace logs no longer print it.
+  To authenticate to an upstream, set the header on the app side or in front of it. Hash routing,
+  sticky cookies and duplicate detection still key on the URL as configured, so two pool entries
+  that differ only in credentials stay two targets; they are one backend on the wire, and
+  `doctor` now warns about them. The edge's other
+  clients (control plane, log shipping, tracing, OTLP metrics, alerts, JWKS) use `reqwest`, which
+  does send URL userinfo as Basic auth: their URLs are unchanged and keep working; only what
+  they log is redacted. The redaction over-hides rather than leaks: from `://`, everything up to
+  the last `@` before the next whitespace is hidden, and when there is no `@` before it, up to the
+  next `@` on the same line that comes before another `://`. So a password with `;`, `,`, `'`, `)`,
+  or even an unencoded `/`, `?`, `#`, `"`, `` ` `` or a space in it is hidden whole. The cost: a
+  logged path that contains an `@` is hidden too, and so is the text between a clean URL and an
+  email address later on the same line (`http://a:1 failed; contact ops@example.com` is logged as
+  `http://***@example.com`).
+
+### Fixed
+
+- **LLM metering, and so budgets, now see Anthropic Messages and OpenAI Responses traffic.** Only
+  OpenAI Chat Completions' `prompt_tokens`/`completion_tokens` were read. Those two APIs report
+  `input_tokens`/`output_tokens`, so their requests were metered `no_usage`, the budget
+  reservation was released, and a token or cost budget never bound on them.
+  - **Anthropic:** cache reads and writes count as input (Anthropic reports them beside
+    `input_tokens`), and the reads as cached. Cache writes are priced at the input rate, not
+    Anthropic's cache-write premium.
+  - **Responses:** cached and reasoning tokens come from `input_tokens_details` and
+    `output_tokens_details`. `max_output_tokens` sizes the budget reserve, as `max_tokens` does.
+  - **Streams are read as they pass.** The meter kept only a stream's last 16 KiB. That held
+    OpenAI's final usage frame, but not Anthropic's `message_start`, which carries the input side
+    at the start of the stream, or a long Responses `response.completed`. Each line is now read as
+    it arrives, keeping only the line being read.
+
+### Upgrading from 0.7.0
+
+- **A request with no host, or two, now gets `400`** (outcome `bad_request`): an HTTP/1.1 or
+  HTTP/2 request with no `Host` header and no authority (RFC 9112 §3.2 already requires one), a
+  request whose HTTP/2 `:authority` or absolute-form target differs from its `Host`, `Host`
+  sent twice, and a `Host` that is not visible ASCII text (0.7.0 served that one, unchecked by
+  the WAF). Browsers, `curl`, load-balancer and kubelet health checks all send a host and are
+  unaffected; an HTTP/1.0 client without `Host` is still served. **With the Host allow-list
+  rule (`host-rule.sh`), an HTTP/1.0 request without `Host` on a proxied path is now refused
+  (`403`)**: 0.7.0's WAF had no host line to match and passed it. Some health checkers send
+  exactly that (HAProxy's default `option httpchk`); point them at `/__edgeguard/health`, which no
+  host check or WAF rule applies to. The `/__edgeguard/*` endpoints
+  are not behind this check.
+- **An HTTP/2 intermediary that rewrites `host` but not `:authority`, or the reverse, now gets
+  `400`** on every request it forwards: the two must name the same host (RFC 9113 §8.3.1), and
+  0.7.0 forwarded such requests with the WAF checking one and the app possibly using the other.
+  There is no switch. After upgrading, check `edgeguard_requests_total{outcome="bad_request"}`; a
+  steady count from one peer is such an intermediary, and the debug log line "request refused:
+  bad host" says which rule it broke. An absolute-form HTTP/1.1 request whose target names a
+  different host from its `Host` is refused the same way.
+- **WebSocket upgrade handshakes now go through the WAF.** With
+  `validation.websocket_passthrough` and the WAF in `block` mode, a handshake's path, query and
+  (with `inspect_headers`) headers are screened by every enabled rule, the built-in SQLi, XSS and
+  path-traversal sets included; 0.7.0 tunnelled them unscreened. A WebSocket URL that carries a
+  token in its query can now be refused (`403`). Run the WAF in `report` mode for a while first
+  and read `edgeguard_waf_hits_total` and the "WAF rule matched (report-only)" warnings.
+- **Upstream URLs lose their userinfo when loaded** (see Security). The proxy's client never sent
+  it, so upstreams see the same requests as before. Nothing to do.
+- **`server.trust_forwarded_for = true` now wants `server.trusted_forwarders`.** Without the list
+  it behaves as in 0.7, with a `doctor` warning and a line at startup and after each reload.
+  **From 0.9 that combination fails startup.** Set it to your balancer's addresses.
+- **`doctor` now fails on a config key the parser ignores.** A misspelt or retired key used to
+  keep its setting's default without a word. If `doctor` gates your deploys, fix or remove the
+  keys it names. The proxy itself only logs them and starts as before.
+- **Using `eggrd` as a library:** `ServerCfg.forwarded_hops` is now a `ForwardedHops`
+  (`Count(n)` or `Auto`), and `Config` has a public `unknown_keys` field, so a struct literal of
+  either needs updating. `WafEngine::evaluate` takes a required `host: Option<&str>` argument
+  (`evaluate(path, headers, host, body)`): pass the request's host to have it read as the one
+  `host:` line in place of any `Host` header, as the proxy does, or `None` to read the headers
+  as they are. A caller screening a request whose host is only in an HTTP/2 `:authority` must
+  pass it, or a Host rule never sees it.
+
+### Added
+
+- **`server.trusted_forwarders`: whom `X-Forwarded-For` is believed from.** 0.7 took the entry the
+  balancer appended, so a client could no longer choose its address *through* the balancer, but
+  the header was still believed on every connection: anything that reached the traffic port
+  directly (another pod, a host in the VPC; the EKS run showed it from an in-cluster pod) wrote the
+  whole header and chose its address.
+  - The headers, `X-Forwarded-Proto` too, are believed only on a connection whose **TCP peer** is in
+    the list, never an address a header or a PROXY header names. Any other peer is served as
+    itself, not refused, and counted `edgeguard_forwarded_for_total{result="untrusted_peer"}`.
+  - `forwarded_hops = "auto"`, with the list: the client is the rightmost entry outside it, for a
+    chain whose length varies. Only the entries walked over and the chosen one are parsed, so
+    garbage a client writes further left cannot force the fallback. At most 32 are walked.
+  - `EdgeGuardForwardedForUntrusted` in monitoring bundle 1.7.0: most requests ignored for 15m,
+    usually because the balancer's addresses changed.
+  - `doctor`: warns on `trust_forwarded_for` without the list, and on a guarded
+    `[trusted_client_cert_header]` beside an unguarded `X-Forwarded-For`; an overlap with
+    `proxy_protocol_trusted` is an error. A `/0`, a list without `trust_forwarded_for`, and
+    `"auto"` without a list fail at load.
+- **Unknown config keys are reported.** `[auth] mdoe = "jwt"` used to leave `auth.mode` at its
+  default, `none`, without a word. Now the startup log, and the log of every reload, say
+  `unknown key auth.mdoe (did you mean auth.mode?)`, and `doctor` reports it as an error.
+  - The check replays the parser itself, so it cannot drift from it. In the sections that take
+    the outbound keys (`[control_plane]`, `[log.ship]`, `[tracing]` and the rest), where serde
+    used to drop unknown keys unseen, they are caught too.
+  - A key inside an array of tables is named by its place, e.g.
+    `upstreams[1].health_check.paht`. A map's own keys (`[auth.users]`, `[llm.models]`) are yours
+    and never reported, but what is inside them is checked.
+  - The crate's example, reference-deployment, load-test and workshop configs are tested to have
+    none.
+
+- **`EdgeGuardProxyProtocolRefusedLowRate`, also in monitoring bundle 1.7.0:** a listener that
+  refused every PROXY connection in the last hour and proxied none, for 30m. It is the low-traffic
+  case of `EdgeGuardProxyProtocolRefused`, which a quiet listener never reaches at one refusal
+  every 10s.
+
+### Docs
+
+- **Security guides for eggrd users** (`docs/security/`): a hardening checklist of 77 items with
+  stable IDs (`EG-HARD-001`…) grouped by layer, each with why it matters, the exact 0.7.0 config,
+  how to verify it, its severity and the reference setup that implements it (also as
+  `checklist.yaml`); logging and evidence (every access-record field and event, retention,
+  integrity, shipping with Vector, Fluent Bit and CloudWatch, and jq, LogQL and Logs Insights
+  queries); and an incident-response runbook (triage, evidence scripts for Docker and Kubernetes,
+  most containment levers timed against a running 0.7.0, eight playbooks). Every config block
+  passes `edgeguard doctor` on 0.7.0 and every key was checked against `src/config.rs`; the jq and
+  LogQL queries were run on a synthetic log; the CloudWatch Logs Insights queries are written to
+  the documented grammar and were not run. Found while testing:
+  - an in-place ConfigMap edit did hot-reload on k3s v1.31.14 (containerd), 27–62 s after the
+    edit, four times out of four; one run on k3s v1.33.4 (Docker runtime) saw no reload, and
+    other platforms are untested, so do not depend on it (the reference README and the 0.8 plan
+    said it never does; both are corrected);
+  - two security bugs in 0.7.0 and earlier, fixed in this release (the Security entries above): the
+    `upstream unreachable` and `upstream timed out` lines printed credentials embedded in an
+    upstream URL, and the WAF Host-allowlist rule did not see an HTTP/2 `:authority` (h2c prior
+    knowledge on the plain listener) or a request with no `Host`. The guides give the 0.7.0
+    reproduction and mitigations (EG-HARD-082, EG-HARD-165) for edges not yet upgraded;
+  - `ip_denied`, `cors_preflight` and `ws_upgrade` are counted as `outcome="other"` in
+    `edgeguard_requests_total` (API.md now says so), and the ACME account
+    file is written `0644`: both planned for 0.8.0.
+- **Tested reference deployments for 0.7** (`deploy/reference/`): one VM with Docker Compose, Kubernetes
+  with kustomize (a LoadBalancer and a hostPort variant), an AWS NLB with PROXY protocol v2, L7
+  balancers and chains (an ALB, CloudFront → ALB, GCP's external Application Load Balancer, ALB mTLS
+  passthrough, `trusted_proxy_names`), a hybrid on-prem/cloud pool with mTLS to upstreams and ACME
+  through an egress proxy, and Prometheus + Grafana with monitoring bundle 1.6.2 plus a dashboard
+  and two alerts for the 0.7 listener series. Each has a README with a hardening checklist and a
+  `smoke.sh` that brings it up and checks it; the cloud-only parts are validated (kubeconform,
+  `terraform validate`) and their eggrd side is run against local stand-ins. `tools/host-rule.sh`
+  writes the interim Host allow-list WAF rule until `allowed_hosts` lands.
+
 ### CI
 
 - **The release now guards its image tags after it finishes, and runs once per release.** On
@@ -2012,7 +2216,7 @@ bundle — fails on the pinned toolchain, so there is no artifact to run.
   session). Two new `[headers]` keys make it configurable:
   - `httponly_cookies` (bool, default `true`) — global toggle for adding `HttpOnly`.
   - `httponly_cookie_exempt` (string list, default `[]`) — cookie **names** to never add
-    `HttpOnly` to, e.g. `["doneyet_csrf"]`. The surgical fix.
+    `HttpOnly` to, e.g. `["app_csrf"]`. The surgical fix.
 
   `Secure` and the `SameSite=Lax` default are unchanged. Existing configs keep the previous
   behaviour (HttpOnly on by default); opt out only for cookies you intend JS to read.
@@ -2306,7 +2510,8 @@ unchanged). Ships the v0–v2.5 feature set below.
 - Added an optional `validation.max_response_body` cap so a huge upstream response can't
   OOM the proxy.
 
-[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/lucheeseng827/eggrd/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/lucheeseng827/eggrd/compare/v0.5.0...v0.7.0
 [0.7.0-rc.1]: https://github.com/lucheeseng827/eggrd/compare/v0.5.0...v0.7.0-rc.1
 [0.5.0]: https://github.com/lucheeseng827/eggrd/compare/v0.4.0...v0.5.0

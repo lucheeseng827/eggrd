@@ -1,0 +1,59 @@
+# eggrd behind an L7 balancer trusted by its CERTIFICATE, not its address (trusted_proxy_names).
+# For a balancer whose addresses others share (a provider's edge network, a shared ingress tier),
+# where "the header came from these CIDRs" proves nothing. The balancer presents a TLS client
+# certificate to eggrd; eggrd verifies it against a CA that issues ONLY the balancer's certificate
+# (lb-ca.pem), and believes the client-certificate header only on such a connection.
+#
+# Fits: Envoy or an Istio ingress with its own SPIFFE ID, nginx with proxy_ssl_certificate,
+# HAProxy with `crt` on the server line. Not AWS ALB/NLB: they present no client certificate to
+# targets. Name a certificate issued to YOU; a provider's origin certificate shared by all its
+# customers proves no more than its shared ranges.
+
+[server]
+port = 443
+upstream = "http://whoami.eggrd-app.svc.cluster.local:8000"
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = true     # the balancer appends the client (nginx $proxy_add_x_forwarded_for)
+forwarded_hops = 1
+header_read_timeout = "30s"
+drain_delay = "10s"
+drain_timeout = "15s"
+
+[tls]
+enabled = true
+cert_path = "/etc/eggrd-tls/tls.crt"
+key_path = "/etc/eggrd-tls/tls.key"
+
+[tls.client_auth]
+# "optional": the balancer presents its certificate; a client connecting directly without one is
+# still let in (and gets 401 below, since nothing authenticates it). "required" if only the
+# balancer should ever complete a handshake.
+mode = "optional"
+ca_path = "/etc/eggrd/pki/lb-ca.pem"     # a CA that issues nothing but the balancer's certificate
+forward_client_cert = "xfcc"
+
+[trusted_client_cert_header]
+name = "X-Client-Cert"                    # nginx: proxy_set_header X-Client-Cert $ssl_client_escaped_cert
+format = "pem"
+trusted_proxy_names = ["lb.example.internal"]
+ca_path = "/etc/eggrd/pki/ca.pem"         # and re-verify the forwarded client certificate
+crl_paths = ["/etc/eggrd/pki/crl.pem"]
+
+[auth]
+mode = "mtls"
+
+[auth.mtls]
+allowed = ["spiffe://example.test/ns/web/*"]
+
+[waf]
+mode = "block"
+inspect_path = true
+
+[ratelimit]
+enabled = true
+rate = "120/min"
+burst = 30
+
+[validation]
+allow_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]

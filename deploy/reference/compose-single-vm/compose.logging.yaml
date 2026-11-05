@@ -1,0 +1,27 @@
+# Optional: ship the edge's logs off the VM with the container engine's logging driver.
+#
+#   docker compose -f compose.yaml -f compose.logging.yaml up -d
+#
+# eggrd writes one JSON access record per request to stdout, so any logging driver ships them
+# without an agent on the VM. This override uses AWS CloudWatch Logs; the commented blocks are
+# journald (then ship with the host's journal forwarder) and a Fluent Bit / Fluentd endpoint.
+# The VM needs permission to write the log group (an instance role with logs:CreateLogStream and
+# logs:PutLogEvents on it); create the group, with a retention, before the first start.
+#
+# The alternative inside eggrd is [log.ship]: NDJSON over HTTP(S) to a collector, with the
+# [outbound] proxy / CA / client certificate settings. See README.md.
+services:
+  edge:
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: us-east-1
+        awslogs-group: /example/eggrd
+        awslogs-stream: edge
+        mode: non-blocking            # a slow CloudWatch never stalls the edge's stdout
+        max-buffer-size: 4m
+      # driver: journald
+      # options: { tag: "eggrd" }
+      #
+      # driver: fluentd
+      # options: { fluentd-address: "127.0.0.1:24224", tag: "eggrd", fluentd-async: "true" }

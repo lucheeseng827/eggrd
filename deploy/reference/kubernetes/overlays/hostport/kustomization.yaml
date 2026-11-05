@@ -1,0 +1,49 @@
+# Variant 2: one edge on the node's own ports 443 and 80 (hostPort), with an ACME certificate
+# kept on a PersistentVolumeClaim. For a single-node cluster (k3s on a VM) with no load balancer.
+#
+#   kubectl apply -k overlays/hostport
+#
+# What changes from the base, and why:
+# - eggrd-edge enforces Pod Security `privileged`: hostPort is refused by `baseline` and
+#   `restricted`. warn/audit stay `restricted`, and eggrd-app stays `restricted` throughout. Keep
+#   nothing else in eggrd-edge.
+# - One replica, `Recreate`: two pods cannot hold the same hostPort on one node, so the old pod
+#   must go first (a few seconds without the edge on each roll).
+# - The certificate, key and ACME account live on the eggrd-acme PVC instead of a Secret.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - pvc.yaml
+configMapGenerator:
+  - name: eggrd-config
+    namespace: eggrd-edge
+    behavior: replace
+    files:
+      - edgeguard.toml=config/edgeguard.toml
+patches:
+  - target: { kind: Namespace, name: eggrd-edge }
+    patch: |-
+      - op: replace
+        path: /metadata/labels/pod-security.kubernetes.io~1enforce
+        value: privileged
+  - target: { kind: Deployment, name: eggrd }
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/strategy
+        value: { type: Recreate }
+      - op: replace
+        path: /spec/template/spec/containers/0/ports
+        value:
+          - { name: https, containerPort: 443, hostPort: 443 }
+          - { name: http, containerPort: 80, hostPort: 80 }
+          - { name: admin, containerPort: 9090 }
+      - op: replace
+        path: /spec/template/spec/containers/0/volumeMounts/1
+        value: { name: state, mountPath: /var/lib/edgeguard }
+      - op: replace
+        path: /spec/template/spec/volumes/1
+        value: { name: state, persistentVolumeClaim: { claimName: eggrd-acme } }

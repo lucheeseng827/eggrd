@@ -81,6 +81,7 @@ pub fn lint(cfg: &Config) -> Vec<Finding> {
     lint_trusted_header(cfg, &mut f);
     lint_client_cert_expiry(cfg, &mut f);
     lint_cors(cfg, &mut f);
+    lint_unknown_keys(cfg, &mut f);
     lint_forwarded(cfg, &mut f);
     lint_proxy_protocol(cfg, &mut f);
     lint_secrets(cfg, &mut f);
@@ -708,6 +709,30 @@ fn lint_pools(cfg: &Config, f: &mut Vec<Finding>) {
         ));
     }
     for u in pools {
+        // Two entries that differ only in URL credentials: the edge sends neither's userinfo, so
+        // they are one backend listed twice (it takes twice the share, and the status page shows
+        // two identical rows). Kept as two targets so hash and sticky routing do not move.
+        // Compared exactly as the pool loads them (`pool::target_urls`), one warning per backend.
+        // Byte-identical entries are another case: the pool refuses those at load ("twice").
+        let mut backends: Vec<(String, Vec<&str>)> = Vec::new();
+        for t in u.targets.iter().chain(&u.backup) {
+            let (configured, bare) = crate::pool::target_urls(&t.url);
+            match backends.iter_mut().find(|(b, _)| *b == bare) {
+                Some((_, seen)) if !seen.contains(&configured) => seen.push(configured),
+                Some(_) => {}
+                None => backends.push((bare, vec![configured])),
+            }
+        }
+        for (bare, variants) in backends.iter().filter(|(_, v)| v.len() > 1) {
+            f.push(Finding::warn(format!(
+                "[[upstreams]] path = {:?} lists {bare:?} {} times with different URL \
+                 credentials: the edge does not send URL credentials, so these are one backend \
+                 taking a {}-fold share. Remove the duplicates.",
+                u.path,
+                variants.len(),
+                variants.len()
+            )));
+        }
         let checked = !u.health_check.path.is_empty() || u.health_check.kind == "tcp";
         if !checked && u.eject_after == 0 {
             f.push(Finding::warn(format!(
@@ -802,11 +827,61 @@ fn is_remote_http(url: &str) -> bool {
     url.scheme() == "http" && !local
 }
 
-/// `server.trust_forwarded_for` and `server.forwarded_hops`: a reminder that the header is
-/// believed, which entry is the client, and a hop count that has no effect.
+/// A key the parser ignores is a setting that silently keeps its default: an error, so `doctor`
+/// fails a deploy over a typo.
+fn lint_unknown_keys(cfg: &Config, f: &mut Vec<Finding>) {
+    for key in &cfg.unknown_keys {
+        f.push(Finding::error(format!(
+            "{key}: it is ignored, so its setting keeps the default"
+        )));
+    }
+}
+
+/// `server.trust_forwarded_for`, `forwarded_hops` and `trusted_forwarders`: a reminder that the
+/// header is believed and which entry is the client, the peers it is believed from, and a hop
+/// count that has no effect.
 fn lint_forwarded(cfg: &Config, f: &mut Vec<Finding>) {
-    let hops = cfg.server.forwarded_hops;
-    if cfg.server.trust_forwarded_for {
+    use crate::config::ForwardedHops;
+    let s = &cfg.server;
+    let listed = !s.trusted_forwarders.is_empty();
+    if s.trust_forwarded_for && !listed {
+        f.push(Finding::warn(
+            "server.trust_forwarded_for = true without server.trusted_forwarders: \
+             X-Forwarded-For is believed on every connection, so anything that reaches this \
+             port directly (another pod, a host in the network) writes its own and chooses the \
+             client address rate limits, [access] and the log use. List the proxies, e.g. \
+             trusted_forwarders = [\"10.0.0.0/20\"] for a load balancer's subnets. From 0.9 \
+             this combination fails startup.",
+        ));
+        let header = &cfg.trusted_client_cert_header;
+        if !header.name.is_empty() && !header.trusted_proxies.is_empty() {
+            f.push(Finding::warn(
+                "trusted_client_cert_header.trusted_proxies is set but \
+                 server.trusted_forwarders is not: the certificate header is believed only \
+                 from the balancer, X-Forwarded-For from anyone. Set trusted_forwarders, \
+                 usually to the same ranges.",
+            ));
+        }
+    }
+    let ForwardedHops::Count(hops) = s.forwarded_hops else {
+        if s.trust_forwarded_for {
+            f.push(Finding::info(
+                "server.trust_forwarded_for = true with server.forwarded_hops = \"auto\": the \
+                 client is the rightmost X-Forwarded-For entry that is not in \
+                 server.trusted_forwarders; entries further left are what the client sent, and are \
+                 ignored. List every proxy whose entries should be walked past, the outer ones of \
+                 a chain (CloudFront's ranges in front of an ALB) included.",
+            ));
+        }
+        return;
+    };
+    if s.trust_forwarded_for {
+        let direct = if listed {
+            ""
+        } else {
+            " Only correct when nothing but those proxies can reach EdgeGuard: a client that \
+             connects directly writes the whole header (set trusted_forwarders)."
+        };
         let chain = if hops > 1 {
             " With a chain, every proxy but the outermost must accept traffic only from the one in \
              front of it (an ALB behind CloudFront: CloudFront's origin-facing prefix list in its \
@@ -822,9 +897,7 @@ fn lint_forwarded(cfg: &Config, f: &mut Vec<Finding>) {
              in front of EdgeGuard append (1 for an ALB in its default append mode or \
              Cloudflare; 2 for a GCP external Application Load Balancer, which appends two, or \
              CloudFront in front of an ALB): too few takes a proxy's address for every client's, \
-             too many lets a client choose its address. Only correct when nothing but those \
-             proxies can reach EdgeGuard: a client that connects directly writes the whole \
-             header.{chain}"
+             too many lets a client choose its address.{direct}{chain}"
         )));
     } else if hops > 1 {
         f.push(Finding::warn(format!(
@@ -864,6 +937,28 @@ fn lint_proxy_protocol(cfg: &Config, f: &mut Vec<Finding>) {
             .filter_map(|t| crate::access::Cidr::parse(t).ok())
             .collect()
     };
+    // A PROXY balancer listed as a forwarder: behind an L4 balancer, X-Forwarded-For is the
+    // client's own, believed as the balancer's, and the client chooses its address.
+    if s.trust_forwarded_for {
+        let balancers = cidrs(&s.proxy_protocol_trusted);
+        let shared: Vec<&String> = s
+            .trusted_forwarders
+            .iter()
+            .filter(|t| {
+                crate::access::Cidr::parse(t)
+                    .is_ok_and(|c| balancers.iter().any(|b| b.overlaps(&c)))
+            })
+            .collect();
+        if !shared.is_empty() {
+            f.push(Finding::error(format!(
+                "server.trusted_forwarders {shared:?} overlaps server.proxy_protocol_trusted: \
+                 X-Forwarded-For is believed from the PROXY balancer. Behind an L4 balancer (an \
+                 NLB, a TCP proxy) that header is the client's own, so any client chooses its \
+                 address. With PROXY protocol the client is already named by the PROXY header: \
+                 remove the balancer from trusted_forwarders."
+            )));
+        }
+    }
     let header = &cfg.trusted_client_cert_header;
     if !header.name.is_empty() {
         let balancers = cidrs(&s.proxy_protocol_trusted);
@@ -973,6 +1068,7 @@ fn lint_control_plane(cfg: &Config, f: &mut Vec<Finding>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ForwardedHops;
     use std::collections::BTreeMap;
 
     fn has_error(f: &[Finding]) -> bool {
@@ -1061,6 +1157,33 @@ mod tests {
         cfg.upstreams[0].health_check.kind = "http".into();
         cfg.upstreams[0].health_check.path = "/healthz".into();
         assert!(!warned(&cfg, "nothing takes a target out"));
+
+        // Targets that differ only in credentials are one backend: warned, and named without them.
+        assert!(!warned(&cfg, "different URL credentials"));
+        cfg.upstreams[0].targets = vec!["http://u:one@a:1".into(), "http://b:1".into()];
+        cfg.upstreams[0].backup = vec!["http://u:two@a:1".into()];
+        assert!(warned(&cfg, "\"http://a:1\" 2 times"));
+        assert!(!lint(&cfg)
+            .iter()
+            .any(|f| f.message.contains("one@") || f.message.contains("two@")));
+        // A trailing `/` is trimmed as the pool trims it: still the same backend.
+        cfg.upstreams[0].targets = vec!["http://u:x@a:1/".into(), "http://b:1".into()];
+        cfg.upstreams[0].backup = vec!["http://a:1".into()];
+        assert!(warned(&cfg, "\"http://a:1\" 2 times"));
+        // Three variants of one backend: one warning, naming all three.
+        cfg.upstreams[0].targets = vec!["http://u:1@a:1".into(), "http://u:2@a:1".into()];
+        cfg.upstreams[0].backup = vec!["http://u:3@a:1".into()];
+        let count = lint(&cfg)
+            .iter()
+            .filter(|f| f.message.contains("different URL credentials"))
+            .count();
+        assert_eq!(count, 1);
+        assert!(warned(&cfg, "\"http://a:1\" 3 times"));
+        // Byte-identical entries are not this case (the pool refuses them at load), nor are the
+        // same entry with and without a trailing `/`.
+        cfg.upstreams[0].targets = vec!["http://u:x@a:1".into(), "http://u:x@a:1".into()];
+        cfg.upstreams[0].backup = vec!["http://u:x@a:1/".into()];
+        assert!(!warned(&cfg, "different URL credentials"));
     }
 
     #[test]
@@ -1164,6 +1287,7 @@ mod tests {
         };
         assert!(!has(&cfg, Level::Info, "forwarded_hops"));
         cfg.server.trust_forwarded_for = true;
+        cfg.server.trusted_forwarders = vec!["10.0.0.0/20".into()];
         assert!(has(&cfg, Level::Info, "server.forwarded_hops = 1:"));
         // One note, not two.
         assert_eq!(
@@ -1174,20 +1298,85 @@ mod tests {
             1
         );
         assert!(!has(&cfg, Level::Info, "every proxy but the outermost"));
-        cfg.server.forwarded_hops = 2;
+        cfg.server.forwarded_hops = ForwardedHops::Count(2);
         assert!(has(&cfg, Level::Info, "server.forwarded_hops = 2:"));
         assert!(has(&cfg, Level::Info, "every proxy but the outermost"));
         assert!(!has(&cfg, Level::Warn, "forwarded_hops"));
         cfg.server.trust_forwarded_for = false;
+        cfg.server.trusted_forwarders.clear();
         assert!(has(&cfg, Level::Warn, "without server.trust_forwarded_for"));
         // Out of range fails the runtime build, which doctor reports as the startup error it is.
-        cfg.server.forwarded_hops = 0;
+        cfg.server.forwarded_hops = ForwardedHops::Count(0);
         let err = crate::build_runtime(std::sync::Arc::new(cfg.clone()))
             .err()
             .unwrap();
         assert!(format!("{err:#}").contains("server.forwarded_hops = 0"));
-        cfg.server.forwarded_hops = 11;
+        cfg.server.forwarded_hops = ForwardedHops::Count(11);
         assert!(crate::build_runtime(std::sync::Arc::new(cfg)).is_err());
+    }
+
+    #[test]
+    fn trusting_forwarded_for_without_the_proxies_listed_is_flagged() {
+        let mut cfg = Config::default();
+        let has = |cfg: &Config, level: Level, needle: &str| {
+            lint(cfg)
+                .iter()
+                .any(|f| f.level == level && f.message.contains(needle))
+        };
+        cfg.server.trust_forwarded_for = true;
+        assert!(has(&cfg, Level::Warn, "without server.trusted_forwarders"));
+        assert!(has(&cfg, Level::Warn, "From 0.9"));
+        assert!(has(&cfg, Level::Info, "connects directly"));
+        cfg.server.trusted_forwarders = vec!["10.0.0.0/20".into()];
+        assert!(!has(&cfg, Level::Warn, "without server.trusted_forwarders"));
+        assert!(!has(&cfg, Level::Info, "connects directly"));
+
+        // The certificate header guarded by its peer, the address header not: only with the
+        // header read.
+        cfg.trusted_client_cert_header.name = "X-Client-Cert".into();
+        cfg.trusted_client_cert_header.trusted_proxies = vec!["10.0.0.0/20".into()];
+        assert!(!has(&cfg, Level::Warn, "trusted_proxies is set but"));
+        cfg.server.trusted_forwarders.clear();
+        assert!(has(&cfg, Level::Warn, "trusted_proxies is set but"));
+        cfg.server.trust_forwarded_for = false;
+        assert!(!has(&cfg, Level::Warn, "trusted_proxies is set but"));
+        cfg.trusted_client_cert_header = Default::default();
+
+        // "auto" is named for what it does.
+        cfg.server.trust_forwarded_for = true;
+        cfg.server.trusted_forwarders = vec!["10.0.0.0/20".into()];
+        cfg.server.forwarded_hops = ForwardedHops::Auto;
+        assert!(has(
+            &cfg,
+            Level::Info,
+            "rightmost X-Forwarded-For entry that is not"
+        ));
+        assert!(!has(&cfg, Level::Info, "server.forwarded_hops = 1:"));
+
+        // A PROXY balancer listed as a forwarder: an error. Not without PROXY protocol, and not
+        // for ranges apart.
+        cfg.server.forwarded_hops = ForwardedHops::Count(1);
+        cfg.server.proxy_protocol = true;
+        cfg.server.proxy_protocol_trusted = vec!["10.0.0.0/16".into()];
+        cfg.server.trusted_forwarders = vec!["10.0.1.0/24".into()];
+        assert!(has(
+            &cfg,
+            Level::Error,
+            "overlaps server.proxy_protocol_trusted"
+        ));
+        cfg.server.trusted_forwarders = vec!["192.168.0.0/24".into()];
+        assert!(!has(
+            &cfg,
+            Level::Error,
+            "overlaps server.proxy_protocol_trusted"
+        ));
+        cfg.server.trusted_forwarders = vec!["10.0.1.0/24".into()];
+        cfg.server.proxy_protocol = false;
+        assert!(!has(
+            &cfg,
+            Level::Error,
+            "overlaps server.proxy_protocol_trusted"
+        ));
     }
 
     #[test]

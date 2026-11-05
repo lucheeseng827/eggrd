@@ -249,12 +249,17 @@ fn redirect_router(
                 };
             }
 
-            let host = req
-                .headers()
-                .get(axum::http::header::HOST)
-                .and_then(|h| h.to_str().ok());
+            // The same host the proxy uses: `:authority` for an HTTP/2 request, which sends no
+            // `Host`. A request whose authority and `Host` differ, or that sends `Host` twice, is
+            // refused here, whatever `redirect_hosts` says.
+            let host = match crate::proxy::effective_host(req.headers(), req.uri()) {
+                Ok(host) => host,
+                Err(why) => {
+                    return (StatusCode::BAD_REQUEST, format!("{why}\n")).into_response();
+                }
+            };
 
-            match redirect_location(host, path_and_query, tls_port, &allowed) {
+            match redirect_location(host.as_deref(), path_and_query, tls_port, &allowed) {
                 Some(location) => match HeaderValue::from_str(&location) {
                     Ok(value) => (status, [(axum::http::header::LOCATION, value)]).into_response(),
                     Err(_) => (StatusCode::BAD_REQUEST, "bad host\n").into_response(),
@@ -463,10 +468,53 @@ mod tests {
 
         // No Host at all (HTTP/1.0) gets a 400, not a redirect to nowhere.
         let res = app
+            .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // An HTTP/2 request names its host in the authority, with no Host header: redirected.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("http://localhost/x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            res.headers().get("location").unwrap(),
+            "https://localhost:8443/x"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_redirect_refuses_an_authority_and_host_that_differ_even_when_allowed() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        // Both names allowed: the mismatch is still a 400, never a redirect to either.
+        let app = redirect_router(
+            8443,
+            StatusCode::PERMANENT_REDIRECT,
+            vec!["app.test".into(), "other.test".into()],
+            None,
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("http://other.test/x")
+                    .header("host", "app.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(res.headers().get("location").is_none());
     }
 
     #[tokio::test]

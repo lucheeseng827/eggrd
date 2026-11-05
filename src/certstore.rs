@@ -349,6 +349,8 @@ impl CertStore {
     }
 
     fn record_renewal(&self, source: &'static str, outcome: &'static str, error: Option<String>) {
+        // Shown on `/__edgeguard/tls`: an ACME error can quote the directory or a proxy URL.
+        let error = error.map(|e| crate::redact::userinfo(&e).into_owned());
         if let (Some(s), Some(o)) = (
             RENEW_SOURCES.iter().position(|x| *x == source),
             RENEW_OUTCOMES.iter().position(|x| *x == outcome),
@@ -724,7 +726,7 @@ pub async fn watch(store: Arc<CertStore>, shutdown: tokio_watch::Receiver<bool>)
     let reload = move || {
         if let Err(e) = store.reload() {
             warn!(
-                error = format!("{e:#}"),
+                error = crate::redact::display(&e),
                 "certificate files changed but do not load; still serving the previous certificate"
             );
         }
@@ -972,7 +974,7 @@ impl Renewer {
             }
             Ok(None) => (None, ARI_MAX_RECHECK_SECS),
             Err(e) => {
-                warn!(error = format!("{e:#}"), "could not read the CA's renewal window (ARI); the two-thirds rule still applies");
+                warn!(error = crate::redact::display(&e), "could not read the CA's renewal window (ARI); the two-thirds rule still applies");
                 // Keep what the CA said last time about this certificate.
                 (previous.and_then(|c| c.renew_at), ARI_MIN_RECHECK_SECS)
             }
@@ -1006,7 +1008,7 @@ pub async fn maintain(renewer: Renewer, mut shutdown: tokio_watch::Receiver<bool
         // filesystems that deliver no change events.
         if let Err(e) = renewer.store.reload() {
             debug!(
-                error = format!("{e:#}"),
+                error = crate::redact::display(&e),
                 "periodic certificate reload rejected"
             );
         }
@@ -1034,7 +1036,7 @@ pub async fn maintain(renewer: Renewer, mut shutdown: tokio_watch::Receiver<bool
             Err(e) => {
                 failures = failures.saturating_add(1);
                 error!(
-                    error = format!("{e:#}"),
+                    error = crate::redact::display(&e),
                     attempt = failures,
                     "certificate renewal failed; still serving the current certificate"
                 );

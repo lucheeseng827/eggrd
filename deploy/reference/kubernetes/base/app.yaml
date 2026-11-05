@@ -1,0 +1,50 @@
+# The sample app: traefik/whoami echoes the request it received, headers included. Replace it
+# with yours; keep the namespace's `restricted` profile and the NetworkPolicy that admits only
+# the edge.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+  namespace: eggrd-app
+  labels: { app: whoami }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: whoami }
+  template:
+    metadata:
+      labels: { app: whoami }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: whoami
+          image: docker.io/traefik/whoami:v1.10.3
+          args: ["--port", "8000"]
+          ports: [{ name: http, containerPort: 8000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: eggrd-app
+  labels: { app: whoami }
+spec:
+  type: ClusterIP
+  selector: { app: whoami }
+  ports:
+    - { name: http, port: 8000, targetPort: http }

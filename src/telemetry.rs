@@ -911,7 +911,7 @@ pub fn spawn_span_shipper(
         interval: std::time::Duration::from_secs(cfg.interval_secs.max(1)),
         stats: std::sync::Arc::clone(&stats),
     };
-    tracing::info!(endpoint = %cfg.endpoint, batch = task.batch, "request tracing enabled");
+    tracing::info!(endpoint = %crate::redact::userinfo(&cfg.endpoint), batch = task.batch, "request tracing enabled");
     tokio::spawn(task.run(rx, shutdown));
     Ok(Some(SpanShipper { tx, stats }))
 }

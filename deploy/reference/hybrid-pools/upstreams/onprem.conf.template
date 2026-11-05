@@ -1,0 +1,15 @@
+# An on-prem app server, played by nginx: the app on :8000 (it says which server answered, and
+# echoes the cookies it received), its health on a separate management port :8081.
+# ${SRV} and ${BOOM} are filled in from the environment by the nginx image at start.
+server {
+  listen 8000;
+  default_type text/plain;
+  location = /boom { return ${BOOM} "server=${SRV} boom\n"; }
+  location / { return 200 "server=${SRV} uri=$request_uri cookie=[$http_cookie]\n"; }
+}
+server {
+  listen 8081;
+  default_type text/plain;
+  # The edge's check sends a Host header of its own choosing (health_check.headers).
+  location = /health { return 200 "ok server=${SRV} host=$host\n"; }
+}

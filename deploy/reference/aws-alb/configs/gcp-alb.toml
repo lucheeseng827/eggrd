@@ -1,0 +1,43 @@
+# eggrd behind a GCP external Application Load Balancer. It appends TWO entries: the client, then
+# the load balancer's own address. With the default forwarded_hops = 1 every request resolves to
+# the load balancer: one rate-limit bucket for everyone (a site-wide 429), [access] allowlists
+# that lock everyone out, hash_on = "client_ip" on one target. Check the access log's client_ip
+# after deploying. Cloud Run and other Google Front End services: measure first (README).
+
+[server]
+port = 443
+upstream = "http://whoami.eggrd-app.svc.cluster.local:8000"
+admin_port = 9090
+admin_addr = "0.0.0.0"
+trust_forwarded_for = true
+forwarded_hops = 2             # GCP external Application LB: client, then the LB
+# eggrd 0.7 believes the header from ANY peer: admit only the load balancer's ranges
+# (35.191.0.0/16 and 130.211.0.0/22) in the VPC firewall. 0.8 adds server.trusted_forwarders.
+header_read_timeout = "30s"
+max_connections = 2048
+drain_delay = "10s"
+drain_timeout = "15s"
+
+[tls]
+enabled = true                 # backend service protocol HTTPS
+cert_path = "/etc/eggrd-tls/tls.crt"
+key_path = "/etc/eggrd-tls/tls.key"
+
+[headers]
+hsts = true
+csp = "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+
+[waf]
+mode = "block"
+inspect_path = true
+
+[ratelimit]
+enabled = true
+rate = "120/min"               # per client, once forwarded_hops is right
+burst = 30
+
+[validation]
+allow_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+[log]
+principal = "hash"

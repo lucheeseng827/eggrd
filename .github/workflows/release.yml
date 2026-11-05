@@ -10,7 +10,7 @@
 #
 # One x86 runner building both architectures means QEMU emulating aarch64, and a
 # `cargo build --release` under emulation is brutal: the 2026-07-14 release run on
-# this repo took **1h26m**. The same repo's `build-doneyet-backend.yml` already
+# this repo took **1h26m**. Another Rust image build in the source repository already
 # moved off QEMU for exactly this reason and records 5–10 min cold, 1–3 min warm.
 #
 # So each architecture builds on its own native runner, in parallel, and pushes by

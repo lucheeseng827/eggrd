@@ -1,0 +1,97 @@
+# Default deny in both namespaces, then exactly the paths the setup needs:
+#   world -> edge :443/:80        monitoring -> edge :9090     edge -> app :8000
+#   edge -> DNS                    edge -> internet :443 (ACME, JWKS, collectors), not the cluster
+# NetworkPolicies add up: a pod has what ANY policy selecting it allows, so keep these the only
+# ones that select the edge and the app.
+#
+# CIDRs to set for your cluster (the values are k3s's defaults):
+#   10.42.0.0/16  pod CIDR       10.43.0.0/16  service CIDR       169.254.169.254  cloud metadata
+# EKS with the VPC CNI's network policy agent: a podSelector egress rule did not let the edge
+# reach a Service's ClusterIP (connections timed out) until the rule also had an ipBlock for the
+# service CIDR. Find it with `aws eks describe-cluster --name <cluster> --query
+# cluster.kubernetesNetworkConfig.serviceIpv4Cidr` (10.100.0.0/16 or 172.20.0.0/16 unless set).
+# The ipBlock below does no harm on other CNIs; keep its port so it opens only that.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: eggrd-edge
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: eggrd-app
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eggrd
+  namespace: eggrd-edge
+spec:
+  podSelector:
+    matchLabels: { app: eggrd }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # The public ports, from anywhere. Behind a balancer, narrow `from` to its subnets: with
+    # trust_forwarded_for, anything that reaches the pod directly writes its own X-Forwarded-For.
+    - ports:
+        - { port: 443, protocol: TCP }
+        - { port: 80, protocol: TCP }
+    # The admin port, from the monitoring namespace only (kubelet probes are not subject to this).
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+      ports:
+        - { port: 9090, protocol: TCP }
+  egress:
+    # The app, by its pods and by the service CIDR (see the EKS note above).
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: eggrd-app }
+          podSelector:
+            matchLabels: { app: whoami }
+        - ipBlock: { cidr: 10.43.0.0/16 }
+      ports:
+        - { port: 8000, protocol: TCP }
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    # HTTPS out to the internet only: the ACME CA, a JWKS, a log collector. Not the cluster's own
+    # ranges, and not the cloud metadata endpoint (no credentials to steal from the node).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.42.0.0/16, 10.43.0.0/16, 169.254.169.254/32]
+      ports:
+        - { port: 443, protocol: TCP }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: whoami
+  namespace: eggrd-app
+spec:
+  podSelector:
+    matchLabels: { app: whoami }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: eggrd-edge }
+          podSelector:
+            matchLabels: { app: eggrd }
+      ports:
+        - { port: 8000, protocol: TCP }
+  egress: []                               # the app calls nothing; add what yours needs

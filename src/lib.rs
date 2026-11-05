@@ -33,6 +33,7 @@ pub mod policy;
 pub mod pool;
 pub mod proxy;
 pub mod proxy_protocol;
+pub mod redact;
 pub mod reload;
 pub mod scaffold;
 pub mod selfsigned;
@@ -41,6 +42,7 @@ pub mod stream_inspect;
 pub mod supervisor;
 pub mod telemetry;
 pub mod tls;
+pub mod unknown_keys;
 pub mod upstream;
 pub mod waf;
 
@@ -91,13 +93,7 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
     // Checked whether or not a section inherits it now, so a broken default fails here and not on
     // the reload that first turns on a client using it.
     crate::outbound::check_defaults(&cfg.outbound)?;
-    anyhow::ensure!(
-        (1..=crate::proxy::MAX_FORWARDED_HOPS).contains(&cfg.server.forwarded_hops),
-        "server.forwarded_hops = {}: it counts the trusted proxies in front of EdgeGuard that \
-         each append an X-Forwarded-For entry, from 1 to {}",
-        cfg.server.forwarded_hops,
-        crate::proxy::MAX_FORWARDED_HOPS
-    );
+    let forwarders = crate::proxy::Forwarders::from_cfg(&cfg.server)?;
     let rl = &cfg.ratelimit;
 
     // Pick the limiter backend. `local` keeps the in-process `governor` limiters below; a
@@ -227,6 +223,7 @@ pub fn build_runtime(cfg: Arc<Config>) -> Result<Runtime> {
     }
 
     Ok(Runtime {
+        forwarders,
         client_cert_header,
         route_labels,
         default_upstream: crate::pool::Pool::single(&cfg.upstream_base()),

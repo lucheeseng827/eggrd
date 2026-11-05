@@ -1,0 +1,39 @@
+# The NLB, made by the AWS Load Balancer Controller (v2.4+) from this Service. The annotations
+# are the ones used in the eggrd 0.7 end-to-end run on EKS (NLB with PROXY protocol v2 and the
+# HTTP health check on the admin port), with that run's names, subnets and tags taken out.
+apiVersion: v1
+kind: Service
+metadata:
+  name: eggrd-nlb
+  namespace: eggrd-edge
+  labels: { app: eggrd }
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    # IP targets: the NLB sends to pod IPs directly (no NodePort hop). Its connections come from
+    # its own private addresses, hence PROXY protocol for the client's.
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    # service.beta.kubernetes.io/aws-load-balancer-subnets: subnet-aaaa,subnet-bbbb   # optional
+    # PROXY protocol v2 on every target group (listener). eggrd reads it before the TLS handshake.
+    service.beta.kubernetes.io/aws-load-balancer-proxy-protocol: "*"
+    # HTTP health check of /__edgeguard/ready on the admin port (eggrd 0.7.0+): it reads the NLB's
+    # v2 LOCAL header there, and turns 503 the moment a pod starts draining, so the NLB stops
+    # sending to it. A TCP check would stay healthy while every connection is refused.
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: http
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "9090"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: /__edgeguard/ready
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-healthy-threshold: "2"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-unhealthy-threshold: "2"
+    # preserve_client_ip.enabled=false: with it on, connections come from the clients' addresses
+    # and eggrd refuses their PROXY headers as untrusted (every client cut off).
+    # deregistration_delay 30 s: longer than eggrd's drain_delay (25 s).
+    service.beta.kubernetes.io/aws-load-balancer-target-group-attributes: deregistration_delay.timeout_seconds=30,preserve_client_ip.enabled=false
+spec:
+  type: LoadBalancer
+  loadBalancerClass: service.k8s.aws/nlb
+  # loadBalancerSourceRanges: ["203.0.113.0/24"]    # to admit only some clients
+  selector: { app: eggrd }
+  ports:
+    - { name: https, port: 443, targetPort: https, protocol: TCP }
+    - { name: http, port: 80, targetPort: http, protocol: TCP }

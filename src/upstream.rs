@@ -462,7 +462,8 @@ impl UpstreamResult {
 }
 
 /// An error and its causes, outermost first: `client error (Connect): invalid peer certificate:
-/// UnknownIssuer` rather than hyper's bare `client error (Connect)`.
+/// UnknownIssuer` rather than hyper's bare `client error (Connect)`. Any URL credentials an error
+/// quotes are replaced ([`crate::redact::userinfo`]): this text reaches logs and the status page.
 pub fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     let mut out = e.to_string();
     let mut source = e.source();
@@ -475,7 +476,7 @@ pub fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
         }
         source = cause.source();
     }
-    out
+    crate::redact::userinfo(&out).into_owned()
 }
 
 #[cfg(test)]

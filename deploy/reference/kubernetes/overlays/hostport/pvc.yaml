@@ -1,0 +1,17 @@
+# The certificate, key and ACME account (cache_dir). Losing it means a new order on the next
+# start, which counts against the CA's rate limits: back it up, and use a reclaimPolicy of
+# Retain (on k3s's local-path class, set it on the PV after the first bind) so deleting the
+# claim does not delete the certificate.
+#
+# eggrd 0.7 writes the ACME account file and the key 0644 (0.8 writes them 0600). The volume is
+# readable only by fsGroup 65532 and root on the node; on a shared node, chmod them 0600 from a
+# CronJob or the node (find /var/lib/... -name '*.json' -o -name key.pem | xargs chmod 600).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: eggrd-acme
+  namespace: eggrd-edge
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 128Mi }

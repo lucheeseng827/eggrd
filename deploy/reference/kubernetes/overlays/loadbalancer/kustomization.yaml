@@ -1,0 +1,13 @@
+# Variant 1: the edge behind a LoadBalancer Service. Both namespaces stay `restricted`.
+#
+#   kubectl apply -k overlays/loadbalancer
+#
+# externalTrafficPolicy: Local keeps the client's source address (the TCP peer is the client, so
+# rate limits and [access] see real addresses with trust_forwarded_for off). It routes only to
+# nodes running an edge pod, so keep the two replicas spread (the base's topology constraint).
+# On AWS use ../../../aws-nlb instead, whose NLB with IP targets needs PROXY protocol.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - service-lb.yaml

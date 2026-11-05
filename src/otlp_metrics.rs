@@ -317,7 +317,7 @@ pub fn spawn_exporter(
     let service = cfg.service_name.clone();
     let interval = Duration::from_secs(cfg.interval_secs.max(1));
     let start = unix_nanos();
-    tracing::info!(endpoint = %endpoint, ?interval, "OTLP metrics export enabled");
+    tracing::info!(endpoint = %crate::redact::userinfo(&endpoint), ?interval, "OTLP metrics export enabled");
     Ok(Some(tokio::spawn(async move {
         let push = |http: reqwest::Client| {
             let body = to_otlp_json(&metrics.render(), &service, start, unix_nanos());

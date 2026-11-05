@@ -1,0 +1,128 @@
+# promtool test rules prometheus-security-rules.test.yml
+rule_files:
+  - prometheus-security-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # App 5xx: 10% of /api/ responses for 20 minutes fires; the default route at 0% does not.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_route_requests_total{instance="e1",route="/api/",method="GET",status_class="2xx"}'
+        values: '0+54x30'
+      - series: 'edgeguard_route_requests_total{instance="e1",route="/api/",method="GET",status_class="5xx"}'
+        values: '0+6x30'
+      - series: 'edgeguard_route_requests_total{instance="e1",route="default",method="GET",status_class="2xx"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: EggrdAppServerErrors
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: e1, route: /api/ }
+            exp_annotations:
+              summary: "e1 route /api/: 10% of responses are the app's 5xx"
+              description: >-
+                More than 5% of the route's responses were 5xx for 10m (edgeguard_route_requests_total,
+                which counts the app's own errors). Look at what preceded them: the "IPs that probed
+                and then saw a 5xx" query in LOGGING-AND-EVIDENCE.md.
+
+  # Log shipping drops fire at once; none, nothing.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_logship_dropped_total{instance="e1",reason="queue_full"}'
+        values: '0 0 0 0 0 40 40 40'
+      - series: 'edgeguard_logship_dropped_total{instance="e1",reason="send_failed"}'
+        values: '0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: EggrdLogShipDropping
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: EggrdLogShipDropping
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: e1, reason: queue_full }
+            exp_annotations:
+              summary: "e1 dropped access records before the collector (queue_full)"
+              description: >-
+                edgeguard_logship_dropped_total rose in the last 15m. queue_full: the collector is slower
+                than the traffic; send_failed: it refused the batch. Keep a stdout-based copy (a node
+                agent) as the evidence path; [log.ship] alone is not guaranteed delivery.
+
+  # Invalid X-Forwarded-For at one a second for 20 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_forwarded_for_total{instance="e1",result="invalid"}'
+        values: '0+60x30'
+      - series: 'edgeguard_forwarded_for_total{instance="e1",result="used"}'
+        values: '0+600x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: EggrdForwardedForInvalid
+        exp_alerts:
+          - exp_labels: { severity: warning, instance: e1 }
+            exp_annotations:
+              summary: "e1: X-Forwarded-For entries that are not addresses"
+              description: >-
+                edgeguard_forwarded_for_total{result="invalid"} is rising. Find the requests: their
+                client_ip is the balancer's address in the access log. Check what the proxies in front
+                write, and that only they can reach the edge.
+
+  # 60% rate limited for an hour fires; the first 30 minutes do not.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_requests_total{instance="e1",outcome="rate_limited"}'
+        values: '0+36x70'
+      - series: 'edgeguard_requests_total{instance="e1",outcome="ok"}'
+        values: '0+24x70'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: EggrdMostlyRateLimited
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: EggrdMostlyRateLimited
+        exp_alerts:
+          - exp_labels: { severity: info, instance: e1 }
+            exp_annotations:
+              summary: "e1: 60% of requests are rate limited"
+              description: >-
+                Over half of the requests were answered 429 for 30m. Run the "top offenders" and
+                "deny-list candidates" queries; consider [access] deny or a cloud WAF in front.
+
+  # A restart while the edge only rate-limits (no ok traffic at all) is caught too.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_requests_total{instance="e2",outcome="ok"}'
+        values: '0 0 0 0 0 0 0 0 0 0'
+      - series: 'edgeguard_requests_total{instance="e2",outcome="rate_limited"}'
+        values: '500 1000 1500 40 400 800 1200 1600 2000 2400'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: EggrdEdgeRestarted
+        exp_alerts:
+          - exp_labels: { severity: info, instance: e2 }
+            exp_annotations:
+              summary: "e2 restarted in the last 15m"
+              description: >-
+                The request counters reset. If no deploy explains it, read the edge's previous log
+                (kubectl logs --previous, docker logs) and the runtime's events, and compare the running
+                config and image digest with what you expect.
+
+  # A counter reset is a restart.
+  - interval: 1m
+    input_series:
+      - series: 'edgeguard_requests_total{instance="e1",outcome="ok"}'
+        values: '100 200 300 5 50 100 150 200 250 300 350 400 450 500 550 600 650 700 750 800'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: EggrdEdgeRestarted
+        exp_alerts:
+          - exp_labels: { severity: info, instance: e1 }
+            exp_annotations:
+              summary: "e1 restarted in the last 15m"
+              description: >-
+                The request counters reset. If no deploy explains it, read the edge's previous log
+                (kubectl logs --previous, docker logs) and the runtime's events, and compare the running
+                config and image digest with what you expect.
+      - eval_time: 19m
+        alertname: EggrdEdgeRestarted
+        exp_alerts: []

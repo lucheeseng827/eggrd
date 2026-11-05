@@ -1,0 +1,117 @@
+# eggrd 0.7 reference: a hybrid pool (two on-prem servers, a cloud standby behind mutual TLS), an
+# egress proxy, and an ACME CA reachable only through it. See README.md; ./smoke.sh runs it.
+#
+# Every upstream and the CA here are stand-ins (nginx, squid, Pebble) so the whole topology runs
+# on one machine. The edge is on ONE network, "site", which is internal: no route off the machine.
+# Clients reach it through "ingress" (HAProxy, TCP passthrough with PROXY protocol v2), the only
+# container on both "public" and "site"; the edge's only way out is the egress proxy, which sits on
+# "site" and "outside". So proxy-only egress is enforced by the topology, not by host rules: a
+# process in the edge cannot reach anything the proxy does not let through. smoke.sh checks it.
+#
+# Needs ./pki (or PKI_DIR): ../tools/mkpki.sh ./pki, plus pebble-minica.pem from the Pebble
+# container (smoke.sh does both). Test material only; never commit it.
+name: ${COMPOSE_PROJECT_NAME:-eggrd-hybrid}
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs: ["/tmp:size=16m"]
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+
+x-nginx: &nginx
+  image: docker.io/library/nginx:1.27-alpine
+  networks: [site]
+
+services:
+  edge:
+    <<: *hardened
+    image: docker.io/mancube/eggrd:0.7.0@sha256:b19278b379a457e626954e148effffa2fe559613d55ff497fdaa862c8c4096f6
+    command: ["--config", "/etc/edgeguard/edgeguard.toml"]
+    user: "65532:65532"
+    cap_add: ["NET_BIND_SERVICE"]          # :443, and :80 for the HTTP-01 challenge
+    restart: unless-stopped
+    stop_grace_period: 15s
+    mem_limit: 192m
+    cpus: 0.5
+    pids_limit: 256
+    environment: { RUST_LOG: info }
+    volumes:
+      - ${EDGE_CONFIG_DIR:-./config}:/etc/edgeguard:ro
+      - ${PKI_DIR:-./pki}:/pki:ro
+      - edge-state:/var/lib/edgeguard
+    networks:
+      site: {}                             # internal only: no published port, no route out
+    depends_on:
+      edge-init: { condition: service_completed_successfully }
+
+  # The way in. TCP passthrough with PROXY protocol v2 (server.proxy_protocol_trusted names this
+  # address), so the edge serves real client addresses. Its own networks are the only bridge
+  # between "public" and "site", and it forwards only to the edge's three ports.
+  ingress:
+    <<: *hardened
+    image: docker.io/library/haproxy:3.0.5-alpine
+    volumes: ["./ingress/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    ports:
+      - "${EDGE_BIND:-0.0.0.0}:${EDGE_HTTPS_PORT:-443}:8443"
+      - "${EDGE_BIND:-0.0.0.0}:${EDGE_HTTP_PORT:-80}:8080"
+      - "127.0.0.1:${EDGE_ADMIN_PORT:-9090}:9090"
+    networks:
+      public: { ipv4_address: 10.233.11.200 }
+      site: { ipv4_address: 10.233.10.200 }   # outside ip_range: never handed to another container
+    depends_on: [edge]
+    restart: unless-stopped
+
+  edge-init:
+    <<: *hardened
+    image: docker.io/library/busybox:1.36.1
+    user: "0:0"
+    cap_add: ["CHOWN", "FOWNER"]
+    command: ["sh", "-c", "chmod 700 /state && chown 65532:65532 /state"]
+    volumes: ["edge-state:/state"]
+    network_mode: none
+    restart: "no"
+
+  onprem-a:
+    <<: *nginx
+    environment: { SRV: onprem-a, BOOM: "200" }
+    volumes: ["./upstreams/onprem.conf.template:/etc/nginx/templates/default.conf.template:ro"]
+    networks: { site: { aliases: [onprem-a.example.internal] } }
+
+  onprem-b:
+    <<: *nginx
+    environment: { SRV: onprem-b, BOOM: "500" }       # /boom is broken on b: eject_after_5xx
+    volumes: ["./upstreams/onprem.conf.template:/etc/nginx/templates/default.conf.template:ro"]
+    networks: { site: { aliases: [onprem-b.example.internal] } }
+
+  cloud:
+    <<: *nginx
+    environment: { SRV: cloud }
+    volumes:
+      - ./upstreams/cloud.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ${PKI_DIR:-./pki}:/pki:ro
+    networks:
+      site: { aliases: [cloud.example.internal, cloud-mgmt.example.internal] }
+
+  egress:
+    image: docker.io/ubuntu/squid:6.6-24.04_beta
+    volumes: ["./egress/squid.conf:/etc/squid/squid.conf:ro"]
+    networks: [site, outside]
+
+  # Stand-in ACME CA. PEBBLE_VA_ALWAYS_VALID skips the HTTP-01 check (nothing here is reachable
+  # from a CA); every other step of the order runs, through the proxy.
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:2.6.0
+    command: ["-config", "test/config/pebble-config.json"]
+    environment: { PEBBLE_VA_ALWAYS_VALID: "1", PEBBLE_VA_NOSLEEP: "1" }
+    networks: { outside: { aliases: [pebble] } }
+
+networks:
+  public:                         # published ports; only the ingress is on it
+    ipam: { config: [{ subnet: 10.233.11.0/24, ip_range: 10.233.11.0/25 }] }   # fixed: smoke.sh's client
+  site:                           # the edge, the servers, the ingress and the proxy: no route out
+    internal: true
+    ipam: { config: [{ subnet: 10.233.10.0/24, ip_range: 10.233.10.0/25 }] }
+  outside: {}                     # the proxy's side: the "internet", where the CA is
+
+volumes:
+  edge-state: {}

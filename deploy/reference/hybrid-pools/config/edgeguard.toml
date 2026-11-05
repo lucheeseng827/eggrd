@@ -1,0 +1,150 @@
+# eggrd 0.7 in front of a pool that mixes on-prem and cloud targets, with mutual TLS to the cloud
+# target, an egress proxy for everything the edge calls itself, and ACME through that proxy.
+# Passes `edgeguard doctor` with 0 errors on 0.7.0 (with the PKI files in /pki).
+#
+# Names (all placeholders): onprem-a / onprem-b.example.internal on the local network, plain HTTP;
+# cloud.example.internal, TLS with a client certificate required; its management interface as
+# cloud-mgmt.example.internal; the egress proxy egress:3128; the ACME CA (Pebble, in the test).
+
+[server]
+port = 443
+admin_port = 9090
+admin_addr = "0.0.0.0"          # reached through the ingress, published on the host's 127.0.0.1 only
+# Clients arrive through the ingress (TCP passthrough), which names each one in a PROXY protocol
+# v2 header. Believed only from the ingress's address; a header from anyone else is refused.
+proxy_protocol = true
+proxy_protocol_trusted = ["10.233.10.200/32"]
+header_read_timeout = "30s"
+max_connections = 1024
+drain_delay = "2s"
+drain_timeout = "10s"
+
+[tls]
+enabled = true
+cert_path = "/var/lib/edgeguard/cert.pem"
+key_path = "/var/lib/edgeguard/key.pem"
+redirect_port = 80
+redirect_hosts = ["app.example.test"]
+
+# ACME through the egress proxy. The edge cannot reach the CA directly; every ACME request
+# (directory, account, order, finalize, download, renewal info) goes out as a CONNECT through
+# [outbound] proxy, TLS end to end. ca_path trusts only the test CA's root; for a public CA leave
+# it out (the host's trust store, plus [outbound] extra_ca_path, is used).
+[tls.acme]
+enabled = true
+domains = ["app.example.test"]
+email = "ops@example.com"
+directory_url = "https://pebble:14000/dir"
+ca_path = "/pki/pebble-minica.pem"
+cache_dir = "/var/lib/edgeguard/acme"
+accept_tos = true
+renew = true
+
+# Defaults for every client the edge opens itself: the ACME CA, log/span/metric shippers, the
+# JWKS fetch, alert webhooks, a control plane. A section's own key wins. Upstreams do NOT use
+# this: they have [upstream_tls].
+[outbound]
+proxy = "http://egress:3128"
+extra_ca_path = "/pki/ca.pem"            # a corporate CA, trusted BESIDE the public roots
+client_cert_path = "/pki/edge-client.pem" # the edge's identity, for endpoints that ask
+client_key_path = "/pki/edge-client.key"
+
+# mTLS to upstreams: trust only the private CA for https:// targets, and present the edge's client
+# certificate. The cloud target requires it.
+[upstream_tls]
+ca_path = "/pki/ca.pem"
+cert_path = "/pki/edge-client.pem"
+key_path = "/pki/edge-client.key"
+
+[[upstream_tls.targets]]
+target = "https://cloud.example.internal:8443"
+server_name = "cloud.example.internal"
+
+# The app: two on-prem servers in turn (a has twice b's capacity), the cloud standby only when
+# neither is in rotation. Browsers stay on the server that first answered them (in-memory
+# sessions), across browser restarts, and the app never sees the edge's cookie.
+[[upstreams]]
+path = "/"
+name = "app"
+balance = "round_robin"
+targets = [
+  { url = "http://onprem-a.example.internal:8000", weight = 2 },
+  "http://onprem-b.example.internal:8000",
+]
+backup = [
+  # Its health lives on the management network's name, over plain HTTP on :8081 (below).
+  { url = "https://cloud.example.internal:8443", check_host = "cloud-mgmt.example.internal" },
+]
+sticky_cookie = "eg_upstream"
+sticky_cookie_max_age = "8h"
+sticky_cookie_strip = true
+eject_after = 1                 # a refused connection takes a target out at once...
+eject_for = "10s"               # ...for 10 s, growing on repeat ejections
+eject_after_5xx = 3             # up but broken: three 5xx in a row
+[upstreams.health_check]
+path = "/health"
+port = 8081                     # each target's management port...
+scheme = "http"                 # ...over plain HTTP, even for the https:// cloud target
+method = "GET"
+headers = [["Host", "health.example.internal"]]
+expect_status = "200"
+expect_body = "ok"
+interval = "2s"
+timeout = "1s"
+unhealthy_after = 2
+healthy_after = 2
+
+# The API: strict priority. onprem-a takes everything; onprem-b only when a is out; the cloud tier
+# only when both are.
+[[upstreams]]
+path = "/api/"
+name = "api"
+balance = "priority"
+targets = ["http://onprem-a.example.internal:8000", "http://onprem-b.example.internal:8000"]
+backup = ["https://cloud.example.internal:8443"]
+[upstreams.health_check]
+path = "/health"
+port = 8081
+scheme = "http"
+interval = "2s"
+
+# A cache tier: the same path always reaches the same server (rendezvous hashing: a server
+# leaving moves only its own keys). A TCP check, for servers with no health endpoint.
+[[upstreams]]
+path = "/cache/"
+name = "cache"
+balance = "hash"
+hash_on = "path"
+targets = ["http://onprem-a.example.internal:8000", "http://onprem-b.example.internal:8000"]
+[upstreams.health_check]
+type = "tcp"
+interval = "2s"
+
+# Per tenant: a tenant's requests stay on one server.
+[[upstreams]]
+path = "/tenant/"
+name = "tenant"
+balance = "hash"
+hash_on = "header:x-tenant"
+targets = ["http://onprem-a.example.internal:8000", "http://onprem-b.example.internal:8000"]
+[upstreams.health_check]
+path = "/health"
+port = 8081
+interval = "2s"
+
+[validation]
+upstream_connect_timeout = "2s" # a partitioned site fails over in 2 s, not at upstream_timeout
+upstream_timeout = "30s"
+allow_methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+[waf]
+mode = "block"
+inspect_path = true
+
+[ratelimit]
+enabled = true
+rate = "600/min"
+burst = 100
+
+[log]
+principal = "hash"

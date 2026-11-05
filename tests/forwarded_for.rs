@@ -58,7 +58,7 @@ fn cfg(up: SocketAddr, hops: usize) -> Config {
     let mut c = Config::default();
     c.server.upstream = format!("http://{up}");
     c.server.trust_forwarded_for = true;
-    c.server.forwarded_hops = hops;
+    c.server.forwarded_hops = edgeguard::config::ForwardedHops::Count(hops);
     c.ratelimit.enabled = false;
     c
 }
@@ -253,4 +253,163 @@ async fn without_trust_the_header_is_ignored_and_not_counted() {
         .metrics
         .render()
         .contains("edgeguard_forwarded_for_total"));
+}
+
+// ---- server.trusted_forwarders: whom the headers are believed from ---------------------------
+
+/// Answers with the `X-Forwarded-For` and `X-Forwarded-Proto` the edge sent.
+async fn upstream_both() -> SocketAddr {
+    let app = Router::new().fallback(|headers: HeaderMap| async move {
+        let get = |n: &str| {
+            headers
+                .get(n)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_else(|| "-".into())
+        };
+        format!("{} {}", get("x-forwarded-for"), get("x-forwarded-proto"))
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+/// One request from the TCP source `from` (`127.0.0.1` or `127.0.0.2`: Linux and Windows route
+/// both to the loopback), after `preamble` (a PROXY header, or nothing). Status and body.
+async fn from(edge: &Edge, from: &str, preamble: &[u8], headers: &[(&str, &str)]) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr: SocketAddr = edge.url.trim_start_matches("http://").parse().unwrap();
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::new(from.parse().unwrap(), 0))
+        .unwrap();
+    let mut s = socket.connect(addr).await.unwrap();
+    let mut req = preamble.to_vec();
+    req.extend_from_slice(b"GET /orders HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        req.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    req.extend_from_slice(b"\r\n");
+    s.write_all(&req).await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    let text = String::from_utf8_lossy(&out).to_string();
+    let status = text[9..12].parse().unwrap();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+
+fn listed(up: SocketAddr, forwarders: &[&str]) -> Config {
+    let mut c = cfg(up, 1);
+    c.server.trusted_forwarders = forwarders.iter().map(|s| s.to_string()).collect();
+    c.access.deny = vec!["203.0.113.66".into()];
+    c
+}
+
+#[tokio::test]
+async fn a_listed_proxy_names_the_client_and_its_scheme() {
+    let edge = edge(listed(upstream_both().await, &["127.0.0.1"])).await;
+    let (status, body) = from(
+        &edge,
+        "127.0.0.1",
+        b"",
+        &[
+            ("X-Forwarded-For", "6.6.6.6, 198.51.100.7"),
+            ("X-Forwarded-Proto", "https"),
+        ],
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (200, "198.51.100.7 https"));
+    // `[access]` sees the client it names.
+    assert_eq!(
+        from(
+            &edge,
+            "127.0.0.1",
+            b"",
+            &[("X-Forwarded-For", "203.0.113.66")]
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(counted(&edge.metrics, "used"), 2);
+    assert_eq!(counted(&edge.metrics, "untrusted_peer"), 0);
+}
+
+#[tokio::test]
+async fn anything_else_that_reaches_the_port_is_served_as_itself() {
+    let edge = edge(listed(upstream_both().await, &["127.0.0.1"])).await;
+    // A pod or host that connects directly: it cannot claim the denied address, nor https.
+    let (status, body) = from(
+        &edge,
+        "127.0.0.2",
+        b"",
+        &[
+            ("X-Forwarded-For", "203.0.113.66"),
+            ("X-Forwarded-Proto", "https"),
+        ],
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (200, "127.0.0.2 http"));
+    assert_eq!(counted(&edge.metrics, "untrusted_peer"), 1);
+    assert_eq!(from(&edge, "127.0.0.2", b"", &[]).await.0, 200);
+    assert_eq!(counted(&edge.metrics, "absent"), 1);
+}
+
+#[tokio::test]
+async fn auto_walks_a_chain_whose_length_varies() {
+    let mut c = listed(upstream_both().await, &["127.0.0.1", "198.51.100.0/24"]);
+    c.server.forwarded_hops = edgeguard::config::ForwardedHops::Auto;
+    let edge = edge(c).await;
+    // Through the CDN and the balancer, with the client's own garbage on the left.
+    let (status, body) = from(
+        &edge,
+        "127.0.0.1",
+        b"",
+        &[("X-Forwarded-For", "not an ip, 203.0.113.9, 198.51.100.4")],
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (200, "203.0.113.9 http"));
+    // Straight to the balancer, no CDN: the same rule finds the client one entry earlier.
+    let (_, body) = from(
+        &edge,
+        "127.0.0.1",
+        b"",
+        &[("X-Forwarded-For", "203.0.113.10")],
+    )
+    .await;
+    assert_eq!(body, "203.0.113.10 http");
+}
+
+/// With PROXY protocol, the list is matched against the TCP peer: a trusted address named in a
+/// PROXY header does not make the connection a forwarder.
+#[tokio::test]
+async fn with_proxy_protocol_the_list_is_matched_against_the_tcp_peer() {
+    let up = upstream_both().await;
+    let proxy = |forwarders: &[&str]| {
+        let mut c = listed(up, forwarders);
+        c.server.proxy_protocol = true;
+        c.server.proxy_protocol_trusted = vec!["127.0.0.0/8".into()];
+        c
+    };
+    let header = b"PROXY TCP4 10.1.2.3 10.0.0.1 40000 443\r\n";
+    let edge1 = edge(proxy(&["10.0.0.0/8"])).await;
+    let (status, body) = from(
+        &edge1,
+        "127.0.0.1",
+        header,
+        &[("X-Forwarded-For", "198.51.100.9")],
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (200, "10.1.2.3 http"));
+    assert_eq!(counted(&edge1.metrics, "untrusted_peer"), 1);
+    let edge2 = edge(proxy(&["127.0.0.1"])).await;
+    let (_, body) = from(
+        &edge2,
+        "127.0.0.1",
+        header,
+        &[("X-Forwarded-For", "198.51.100.9")],
+    )
+    .await;
+    assert_eq!(body, "198.51.100.9 http");
 }

@@ -99,7 +99,7 @@ impl Policy {
             if let Err(e) = cache.save(&pushed) {
                 // The policy is live in memory; only a restart would miss the copy.
                 warn!(
-                    error = format!("{e:#}"),
+                    error = crate::redact::display(&e),
                     path = %cache.path,
                     "could not write the policy cache; a restart while the control plane is down \
                      would start without this policy"
@@ -119,7 +119,7 @@ impl Policy {
             Ok(None) => return None,
             Err(e) => {
                 warn!(
-                    error = format!("{e:#}"),
+                    error = crate::redact::display(&e),
                     path = %cache.path,
                     "ignoring the policy cache; starting without it"
                 );
@@ -137,7 +137,7 @@ impl Policy {
             }
             Err(e) => {
                 warn!(
-                    error = format!("{e:#}"),
+                    error = crate::redact::display(&e),
                     path = %cache.path,
                     "the cached policy no longer builds against this config; ignoring it"
                 );

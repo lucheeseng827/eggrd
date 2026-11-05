@@ -1,0 +1,91 @@
+# Security alerts for eggrd 0.7, beside the monitoring bundle's alerts.yml and the reference's
+# rules-0.7.yml (both still needed). These cover signals the bundle does not alert on.
+# Unit-tested: promtool test rules prometheus-security-rules.test.yml
+groups:
+  - name: eggrd-security
+    rules:
+      # The app's own 5xx pass through with outcome "ok", so EdgeGuardHighUpstream5xx (edge-made
+      # 502/504 only) never sees them. A burst of app errors after a run of probes is how an
+      # exploited path often shows first.
+      - alert: EggrdAppServerErrors
+        expr: |
+          (
+            sum by (instance, route) (rate(edgeguard_route_requests_total{status_class="5xx"}[5m]))
+            /
+            clamp_min(sum by (instance, route) (rate(edgeguard_route_requests_total[5m])), 1e-9)
+          ) > 0.05
+          and
+          sum by (instance, route) (rate(edgeguard_route_requests_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} route {{ $labels.route }}: {{ $value | humanizePercentage }} of responses are the app's 5xx"
+          description: >-
+            More than 5% of the route's responses were 5xx for 10m (edgeguard_route_requests_total,
+            which counts the app's own errors). Look at what preceded them: the "IPs that probed
+            and then saw a 5xx" query in LOGGING-AND-EVIDENCE.md.
+
+      # [log.ship] is best-effort: records dropped here never reach the collector. That is a gap in
+      # the evidence, whatever caused it.
+      - alert: EggrdLogShipDropping
+        expr: sum by (instance, reason) (increase(edgeguard_logship_dropped_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} dropped access records before the collector ({{ $labels.reason }})"
+          description: >-
+            edgeguard_logship_dropped_total rose in the last 15m. queue_full: the collector is slower
+            than the traffic; send_failed: it refused the batch. Keep a stdout-based copy (a node
+            agent) as the evidence path; [log.ship] alone is not guaranteed delivery.
+
+      # X-Forwarded-For whose chosen entry is not an address: a proxy that writes something odd, or
+      # someone probing how the edge parses the header. Either way those requests are keyed on the
+      # TCP peer.
+      - alert: EggrdForwardedForInvalid
+        expr: sum by (instance) (rate(edgeguard_forwarded_for_total{result="invalid"}[10m])) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: X-Forwarded-For entries that are not addresses"
+          description: >-
+            edgeguard_forwarded_for_total{result="invalid"} is rising. Find the requests: their
+            client_ip is the balancer's address in the access log. Check what the proxies in front
+            write, and that only they can reach the edge.
+
+      # Most of the traffic is being rate limited. Informational: usually a scanner flood, which the
+      # limit is absorbing; sustained, it is capacity and noise worth a deny list.
+      - alert: EggrdMostlyRateLimited
+        expr: |
+          (
+            sum by (instance) (rate(edgeguard_requests_total{outcome="rate_limited"}[15m]))
+            /
+            clamp_min(sum by (instance) (rate(edgeguard_requests_total[15m])), 1e-9)
+          ) > 0.5
+          and
+          sum by (instance) (rate(edgeguard_requests_total[15m])) > 0.2
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanizePercentage }} of requests are rate limited"
+          description: >-
+            Over half of the requests were answered 429 for 30m. Run the "top offenders" and
+            "deny-list candidates" queries; consider [access] deny or a cloud WAF in front.
+
+      # Counters went back to zero: the process restarted (a crash, an OOM kill, a deploy, or a
+      # change nobody announced). Every restart is also a config load from disk.
+      - alert: EggrdEdgeRestarted
+        # Every outcome series, not just ok: an edge serving only 429s or 403s (a flood, a lockdown)
+        # restarts too. eggrd exports no process_start_time_seconds, so a counter reset is the signal;
+        # an edge that served nothing before the restart shows none.
+        expr: sum by (instance) (resets(edgeguard_requests_total[15m])) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }} restarted in the last 15m"
+          description: >-
+            The request counters reset. If no deploy explains it, read the edge's previous log
+            (kubectl logs --previous, docker logs) and the runtime's events, and compare the running
+            config and image digest with what you expect.

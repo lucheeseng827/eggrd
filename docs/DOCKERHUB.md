@@ -80,9 +80,10 @@ Pin a version in production: `mancube/eggrd:0.7.1`.
 
 > **Upgrading from 0.7.0 to 0.7.1: check these before rolling out.**
 >
-> - A request with no host, an empty `Host`, two `Host` headers, a `Host` that is not ASCII text,
->   or an HTTP/2 `:authority` (or absolute-form target) that differs from `Host` now gets `400`
->   (outcome `bad_request`). An HTTP/2 intermediary that rewrites one but not the other is refused
+> - An HTTP/1.1 or HTTP/2 request with no host or an empty `Host`, and any request with two `Host`
+>   headers, a `Host` that is not ASCII text, or an HTTP/2 `:authority` (or absolute-form target)
+>   that differs from `Host`, now gets `400` (outcome `bad_request`). HTTP/1.0 may still omit
+>   `Host`. An HTTP/2 intermediary that rewrites one but not the other is refused
 >   on every request.
 > - With the Host allow-list rule, an HTTP/1.0 request without `Host` on a proxied path gets
 >   `403`; point such health checks at `/__edgeguard/health`.

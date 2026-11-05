@@ -10,10 +10,13 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 A security release on 0.7.0. It fixes two holes: credentials in a configured URL reached the logs,
 and the WAF's Host allow-list rule could be bypassed over cleartext HTTP/2, with an absolute-form
-target, or with no `Host` at all. Read "Upgrading from 0.7.0" before rolling it out: a request
-with no host, or two that disagree, now gets `400`, and WebSocket handshakes now go through the
-WAF. It also carries what was merged since 0.7.0: `server.trusted_forwarders`, reporting of
-unknown config keys, and LLM metering of Anthropic Messages and OpenAI Responses traffic.
+target, or with no `Host` at all. Read "Upgrading from 0.7.0" before rolling it out: an HTTP/1.1
+or HTTP/2 request with no host, or one whose hosts disagree, now gets `400` (an HTTP/1.0 request
+without `Host` is still served, or refused with `403` by the Host allow-list rule), and WebSocket
+handshakes now go through the WAF. Crate users: 0.7.1 changes the library API (see "Library API"
+under "Upgrading from 0.7.0"). It also carries what was merged since 0.7.0:
+`server.trusted_forwarders`, reporting of unknown config keys, and LLM metering of Anthropic
+Messages and OpenAI Responses traffic.
 
 ### Security
 
@@ -132,13 +135,21 @@ unknown config keys, and LLM metering of Anthropic Messages and OpenAI Responses
 - **`doctor` now fails on a config key the parser ignores.** A misspelt or retired key used to
   keep its setting's default without a word. If `doctor` gates your deploys, fix or remove the
   keys it names. The proxy itself only logs them and starts as before.
-- **Using `eggrd` as a library:** `ServerCfg.forwarded_hops` is now a `ForwardedHops`
-  (`Count(n)` or `Auto`), and `Config` has a public `unknown_keys` field, so a struct literal of
-  either needs updating. `WafEngine::evaluate` takes a required `host: Option<&str>` argument
-  (`evaluate(path, headers, host, body)`): pass the request's host to have it read as the one
-  `host:` line in place of any `Host` header, as the proxy does, or `None` to read the headers
-  as they are. A caller screening a request whose host is only in an HTTP/2 `:authority` must
-  pass it, or a Host rule never sees it.
+- **Library API (crate users only).** 0.7.1 changes the public library API, although it is a
+  patch release. The `edgeguard` binary, the `mancube/eggrd` image and the config file are not
+  affected. Three changes break code that uses `eggrd` as a library:
+  - `WafEngine::evaluate` takes a required `host: Option<&str>` argument
+    (`evaluate(path, headers, host, body)`). Pass the request's host to have it read as the one
+    `host:` line in place of any `Host` header, as the proxy does, or `None` to read the
+    headers as they are. A caller screening a request whose host is only in an HTTP/2
+    `:authority` must pass it, or a Host rule never sees it.
+  - `ServerCfg.forwarded_hops` is now a `ForwardedHops` (`Count(n)` or `Auto`), not a number:
+    write `forwarded_hops: ForwardedHops::Count(2)` where you wrote `forwarded_hops: 2`, and
+    update any code that reads it as a number. `..Default::default()` does not help here.
+  - `Config` has a new public field, `unknown_keys`: a `Config` struct literal must name it or
+    end in `..Default::default()` (`Config` and `ServerCfg` both implement `Default`).
+
+  Pin `eggrd = "=0.7.0"` until you update those call sites.
 
 ### Added
 

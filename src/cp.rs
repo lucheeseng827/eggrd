@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -442,19 +441,70 @@ impl CpClient {
         }
     }
 
-    /// Forward a raw CSP report body (best-effort; errors are logged, never surfaced).
-    pub async fn forward_csp(&self, raw: &Bytes) {
-        let res = self
-            .http
+    /// Send one folded CSP report: the `report-uri` envelope the control plane already reads, plus
+    /// `count`, the number of identical reports it stands for. A control plane that predates
+    /// `count` ignores the field and counts the request once.
+    pub async fn send_csp(&self, v: &crate::csp_sink::CspViolation, count: u64) -> Result<()> {
+        let body = serde_json::json!({
+            "csp-report": {
+                "violated-directive": v.directive,
+                "blocked-uri": v.blocked_uri,
+                "document-uri": v.document_uri,
+            },
+            "count": count,
+        });
+        self.http
             .post(format!("{}/csp-report", self.edge_base))
             .bearer_auth(&self.token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(raw.clone())
+            .json(&body)
             .send()
-            .await;
-        if let Err(e) = res {
-            warn!(error = %crate::redact::display(&e), "forwarding CSP report to control plane failed");
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
+/// Send everything the CSP sink has folded since the last flush: one request per distinct
+/// `(directive, blocked URI)`, at most [`crate::csp_sink::MAX_PENDING`]. Best-effort, like CSP
+/// forwarding always was: a failed request is counted and logged once per flush, not retried — the
+/// counts are a triage view, and requeueing them would turn a control-plane outage into a backlog.
+/// Returns the number of requests attempted.
+pub async fn flush_csp(
+    client: &CpClient,
+    sink: &crate::csp_sink::CspSink,
+    metrics: &Metrics,
+) -> usize {
+    let batch = sink.take();
+    let mut failed = 0usize;
+    for (violation, count) in &batch {
+        let ok = client.send_csp(violation, *count).await.is_ok();
+        metrics.record_csp_forwarded(ok);
+        if !ok {
+            failed += 1;
         }
+    }
+    if failed > 0 {
+        warn!(
+            failed,
+            sent = batch.len(),
+            "forwarding folded CSP reports to the control plane failed"
+        );
+    }
+    batch.len()
+}
+
+/// Background loop: flush the folded CSP reports every [`crate::csp_sink::FLUSH_INTERVAL`].
+pub async fn csp_flush_loop(
+    client: Arc<CpClient>,
+    sink: Arc<crate::csp_sink::CspSink>,
+    metrics: Arc<Metrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        if sleep_or_shutdown(&mut shutdown, crate::csp_sink::FLUSH_INTERVAL).await {
+            break;
+        }
+        flush_csp(&client, &sink, &metrics).await;
     }
 }
 
@@ -627,6 +677,51 @@ mod tests {
         usage_count: Arc<std::sync::atomic::AtomicUsize>,
         /// Every accepted usage report, in order.
         all_usage: Arc<StdMutex<Vec<serde_json::Value>>>,
+        /// Every CSP report request received, in order.
+        csp: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+
+    async fn csp(State(s): State<Stub>, Json(v): Json<serde_json::Value>) -> StatusCode {
+        s.csp.lock().unwrap().push(v);
+        StatusCode::ACCEPTED
+    }
+
+    /// A flood of identical reports reaches the control plane as ONE request carrying the count —
+    /// and distinct reports as one request each — instead of one request per report.
+    #[tokio::test]
+    async fn folded_csp_reports_are_sent_once_per_pair_with_their_count() {
+        let (addr, stub) = spawn_stub().await;
+        let cp = client(addr);
+        let sink = crate::csp_sink::CspSink::new();
+        let metrics = Metrics::new();
+        let r = |d: &str, b: &str| {
+            crate::csp_sink::parse_report(
+                format!(r#"{{"violated-directive":"{d}","blocked-uri":"{b}"}}"#).as_bytes(),
+            )
+            .unwrap()
+        };
+        for _ in 0..500 {
+            sink.queue(r("script-src", "https://evil.example/x.js"));
+        }
+        sink.queue(r("img-src", "https://img.example/"));
+
+        assert_eq!(flush_csp(&cp, &sink, &metrics).await, 2);
+        let mut got = stub.csp.lock().unwrap().clone();
+        got.sort_by_key(|v| v["count"].as_u64());
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0]["csp-report"]["violated-directive"], "img-src");
+        assert_eq!(got[0]["count"], 1);
+        assert_eq!(got[1]["csp-report"]["violated-directive"], "script-src");
+        assert_eq!(got[1]["count"], 500);
+        let text = metrics.render();
+        assert!(
+            text.contains(r#"edgeguard_csp_forward_requests_total{result="ok"} 2"#),
+            "{text}"
+        );
+
+        // Nothing pending: a flush sends nothing.
+        assert_eq!(flush_csp(&cp, &sink, &metrics).await, 0);
+        assert_eq!(stub.csp.lock().unwrap().len(), 2);
     }
 
     async fn policy(headers: HeaderMap) -> axum::response::Response {
@@ -693,6 +788,7 @@ mod tests {
             .route("/v3/edge/t1/usage", post(usage))
             .route("/v3/edge/t1/quota", get(quota))
             .route("/v3/edge/t1/acme-lease", post(acme_lease))
+            .route("/v3/edge/t1/csp-report", post(csp))
             .with_state(stub.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

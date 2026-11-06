@@ -6,6 +6,46 @@ All notable changes to EdgeGuard are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-11-06
+
+A security release on 0.7.1. Anyone could POST to a managed edge's CSP report sink and have every
+report relayed to the control plane as its own request. The sink now rate-limits each client,
+drops what is not a CSP report, and forwards identical reports folded into one request with a
+count. Standalone edges forward nothing, but get the same per-client limit and parsing on the
+sink. The binary, the image and the config file need no change; a library user should read
+"Using `eggrd` as a library" below.
+
+### Security
+- **The CSP report sink can no longer be used to flood the control plane.** `POST
+  /__edgeguard/csp-report` is public by necessity, and in managed mode every report used to become
+  one request to the control plane, from a task spawned per report, before the body was parsed — so
+  anyone could drive an unbounded number of outbound requests through any managed edge. Now:
+  - **Each client address has a budget** (120 reports a minute, 60 at once), resolved the same way
+    the proxy resolves its client (`server.trust_forwarded_for`, `forwarded_hops`,
+    `trusted_forwarders`). Past it the sink answers `429`. Idle addresses are pruned at most once
+    every 10 s, and while 100 000 addresses are tracked new ones are answered `429` too, so a
+    flood from many addresses can neither grow the limiter without bound nor make every request
+    scan it.
+  - **The body is parsed first.** Anything that is not a `report-uri` style CSP report is counted
+    and dropped, never forwarded; the sink still answers `204`, as browsers expect.
+  - **Reports are folded.** Identical `(directive, blocked URI)` pairs are sent every 10 s as one
+    request with a `count`, at most 64 pairs and 10 000 reports per pair per interval, from one
+    background task. Reports past either limit are counted as `overflow`, not sent.
+  - **Query strings and fragments are stripped** from `blocked-uri` and `document-uri` before
+    anything is kept or forwarded: the page URL a browser reports can carry a session id.
+  - New series: `edgeguard_csp_reports_dropped_total{reason}` (`rate_limited`, `invalid`,
+    `overflow`) and `edgeguard_csp_forward_requests_total{result}`.
+
+  A control plane that predates `count` accepts the folded requests and counts each one once.
+
+### Changed
+- **Using `eggrd` as a library:** `proxy::AppState` has a public `csp` field (the sink), so a
+  struct literal of it must name it (`csp: Arc::new(csp_sink::CspSink::new())`).
+  `CpClient::forward_csp` is gone: `cp::csp_flush_loop` drains the sink and sends each folded
+  report with `CpClient::send_csp`. `proxy::csp_report` now reads the connection's address
+  (`ConnectInfo<SocketAddr>`) to find the client, as the proxy handler already did, so a router
+  that mounts it on its own must be served with connect info. The new `csp_sink` module is public.
+
 ## [0.7.1] — 2026-11-05
 
 A security release on 0.7.0. It fixes two holes: credentials in a configured URL reached the logs,
@@ -2521,7 +2561,8 @@ unchanged). Ships the v0–v2.5 feature set below.
 - Added an optional `validation.max_response_body` cap so a huge upstream response can't
   OOM the proxy.
 
-[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/lucheeseng827/eggrd/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/lucheeseng827/eggrd/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/lucheeseng827/eggrd/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/lucheeseng827/eggrd/compare/v0.5.0...v0.7.0
 [0.7.0-rc.1]: https://github.com/lucheeseng827/eggrd/compare/v0.5.0...v0.7.0-rc.1

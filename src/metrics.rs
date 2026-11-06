@@ -357,6 +357,11 @@ pub struct Metrics {
     latency_sum_micros: AtomicU64,
     latency_count: AtomicU64,
     csp_reports: AtomicU64,
+    /// CSP reports the sink did not keep, indexed like [`crate::csp_sink::CspDrop::ALL`].
+    csp_dropped: [AtomicU64; 3],
+    /// Folded CSP report requests sent to the control plane, and those that failed.
+    csp_forwarded: AtomicU64,
+    csp_forward_failed: AtomicU64,
     /// Drainable usage accumulators for managed-mode reporting (requests + bandwidth *since the
     /// last drain*). Kept separate from the monotonic Prometheus counters above precisely because
     /// the usage reporter resets these to zero each period — a Prometheus counter must not decrease.
@@ -469,6 +474,9 @@ impl Default for Metrics {
             latency_sum_micros: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             csp_reports: AtomicU64::new(0),
+            csp_dropped: Default::default(),
+            csp_forwarded: AtomicU64::new(0),
+            csp_forward_failed: AtomicU64::new(0),
             usage_requests: AtomicU64::new(0),
             usage_ingress_bytes: AtomicU64::new(0),
             usage_egress_bytes: AtomicU64::new(0),
@@ -928,6 +936,25 @@ impl Metrics {
         self.csp_reports.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a CSP report the sink did not keep.
+    pub fn record_csp_dropped(&self, reason: crate::csp_sink::CspDrop) {
+        let i = crate::csp_sink::CspDrop::ALL
+            .iter()
+            .position(|r| *r == reason)
+            .unwrap_or(0);
+        self.csp_dropped[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one folded CSP report request sent to the control plane, or one that failed.
+    pub fn record_csp_forwarded(&self, ok: bool) {
+        if ok {
+            &self.csp_forwarded
+        } else {
+            &self.csp_forward_failed
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Count one request toward the drainable usage accumulator (managed mode). Called once per
     /// request from the single `finish` exit, so every request — proxied or rejected — counts.
     /// `outcome` is the request's outcome label; a denial outcome (see [`outcome_is_blocked`]) also
@@ -1152,6 +1179,26 @@ impl Metrics {
         out.push_str(&format!(
             "edgeguard_csp_reports_total {}\n",
             self.csp_reports.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP edgeguard_csp_reports_dropped_total CSP reports the sink did not keep, by reason.\n",
+        );
+        out.push_str("# TYPE edgeguard_csp_reports_dropped_total counter\n");
+        for (reason, n) in crate::csp_sink::CspDrop::ALL.iter().zip(&self.csp_dropped) {
+            out.push_str(&format!(
+                "edgeguard_csp_reports_dropped_total{{reason=\"{}\"}} {}\n",
+                reason.label(),
+                n.load(Ordering::Relaxed)
+            ));
+        }
+        out.push_str(
+            "# HELP edgeguard_csp_forward_requests_total Folded CSP report requests sent to the control plane, by result.\n",
+        );
+        out.push_str("# TYPE edgeguard_csp_forward_requests_total counter\n");
+        out.push_str(&format!(
+            "edgeguard_csp_forward_requests_total{{result=\"ok\"}} {}\nedgeguard_csp_forward_requests_total{{result=\"error\"}} {}\n",
+            self.csp_forwarded.load(Ordering::Relaxed),
+            self.csp_forward_failed.load(Ordering::Relaxed)
         ));
 
         // Connections per listener. `rejected` climbing means `server.max_connections` is turning

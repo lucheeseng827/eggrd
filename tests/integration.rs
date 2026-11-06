@@ -585,6 +585,70 @@ async fn csp_report_sink_accepts_and_counts_reports() {
     );
 }
 
+/// The sink is public, so one client cannot flood it: past its budget it answers 429. A body that
+/// is not a CSP report is accepted (browsers ignore the status) but counted as dropped.
+#[tokio::test]
+async fn csp_report_sink_limits_a_flooding_client_and_drops_non_reports() {
+    let up = spawn_upstream().await;
+    let proxy = spawn_proxy(base_cfg(format!("http://{up}"))).await;
+    let report = r#"{"csp-report":{"violated-directive":"script-src","blocked-uri":"https://evil.example"}}"#;
+
+    let junk = send(
+        proxy,
+        "POST",
+        "/__edgeguard/csp-report",
+        None,
+        Bytes::from_static(b"not a report"),
+    )
+    .await;
+    assert_eq!(junk.status, StatusCode::NO_CONTENT);
+
+    let mut accepted = 0;
+    let mut limited = 0;
+    let started = std::time::Instant::now();
+    for _ in 0..100 {
+        let r = send(
+            proxy,
+            "POST",
+            "/__edgeguard/csp-report",
+            None,
+            Bytes::from_static(report.as_bytes()),
+        )
+        .await;
+        match r.status {
+            StatusCode::NO_CONTENT => accepted += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    // The junk body spent one of the burst; refill during the loop (PER_CLIENT_PER_MINUTE / 60 a
+    // second) admits a few more, as many as the time the loop took allows — a slow runner must not
+    // turn a correct limiter into a failure.
+    let burst = edgeguard::csp_sink::PER_CLIENT_BURST as usize;
+    let per_sec = f64::from(edgeguard::csp_sink::PER_CLIENT_PER_MINUTE) / 60.0;
+    let refilled = (started.elapsed().as_secs_f64() * per_sec).ceil() as usize + 1;
+    assert!(
+        (burst - 1..=burst - 1 + refilled).contains(&accepted),
+        "accepted {accepted}, refill allowance {refilled}"
+    );
+    assert_eq!(accepted + limited, 100);
+
+    let m = send(proxy, "GET", "/__edgeguard/metrics", None, Bytes::new()).await;
+    assert!(
+        m.body.contains(&format!(
+            "edgeguard_csp_reports_dropped_total{{reason=\"rate_limited\"}} {limited}"
+        )),
+        "{}",
+        m.body
+    );
+    assert!(
+        m.body
+            .contains("edgeguard_csp_reports_dropped_total{reason=\"invalid\"} 1"),
+        "{}",
+        m.body
+    );
+}
+
 #[tokio::test]
 async fn metrics_endpoint_exposes_request_counters() {
     let up = spawn_upstream().await;

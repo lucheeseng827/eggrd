@@ -35,7 +35,7 @@ hardening) in a single static binary.
 ```bash
 cargo install eggrd && edgeguard init && edgeguard doctor
 # or
-docker run -p 8080:8080 mancube/eggrd:0.7.1
+docker run -p 8080:8080 mancube/eggrd:0.7.2
 ```
 
 ## Status
@@ -1552,7 +1552,9 @@ report to — a central **control plane**:
   keeps the last verdict (fail-static). This is what turns the meter into a cap; leave it off to
   meter without blocking.
 - **CSP forwarding.** Received CSP violation reports are forwarded to the control plane for
-  aggregate analytics, in addition to the local count.
+  aggregate analytics, in addition to the local count. Identical reports are folded and sent every
+  10 s as one request with a count, and each client address has a budget at the sink, so the sink
+  cannot be used to flood the control plane.
 
 ```toml
 [control_plane]

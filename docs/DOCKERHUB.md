@@ -61,8 +61,9 @@ identity provider.
 
 | Tag | Notes |
 |---|---|
-| `latest` | newest release (= `0.7.1`) |
-| `0.7` | newest `0.7.x` release (= `0.7.1`) |
+| `latest` | newest release (= `0.7.2`) |
+| `0.7` | newest `0.7.x` release (= `0.7.2`) |
+| `0.7.2` | Security release: the CSP report sink limits each client (120 a minute, `429` past it), drops bodies that are not CSP reports, strips query strings from reported URLs, and in managed mode forwards identical reports folded into one request every 10 s instead of one request each; two new metrics for what it dropped and sent |
 | `0.7.1` | Security release: credentials in a configured upstream, pool, Redis or collector URL no longer reach the logs, `doctor` or the status pages; the WAF Host allow-list rule now sees the host of every request (cleartext HTTP/2, absolute-form, no `Host`), and a request with no host or two that disagree gets `400`; WebSocket handshakes go through the WAF; `server.trusted_forwarders`; unknown config keys reported (**see the upgrade note**) |
 | `0.7.0` | Mutual TLS on every hop (client certificates with CRLs, TLS and mTLS to upstreams, a control plane on a private CA); upstream pools with failover, weighted round robin, least connections, hashing, sticky sessions and active health checks; PROXY protocol; connection hardening (header-read timeout, connection cap, graceful drain); API-usage monitoring by route, consumer and upstream; `[outbound]` defaults for an egress proxy and private CA; security fixes for repeated credential headers and `X-Forwarded-For` (**see the upgrade note**) |
 | `0.7.0-rc.1` | prerelease of 0.7.0, superseded by it |
@@ -76,7 +77,9 @@ identity provider.
 
 There is no `0.6.0` image (its hardening shipped in 0.7.0) and no `0.7.0-rc.2` image.
 
-Pin a version in production: `mancube/eggrd:0.7.1`.
+Pin a version in production: `mancube/eggrd:0.7.2`.
+
+> **Upgrading from 0.7.1 to 0.7.2.** No config change. A client that floods `/__edgeguard/csp-report` now gets `429`; browsers stay far below the limit. Crate users: the library API changed (see the changelog); the image is not affected.
 
 > **Upgrading from 0.7.0 to 0.7.1: check these before rolling out.**
 >
@@ -151,7 +154,7 @@ Pin a version in production: `mancube/eggrd:0.7.1`.
 ```bash
 docker run -p 8080:8080 \
   -e UPSTREAM=http://app.internal:3000 \
-  mancube/eggrd:0.7.1 --config /etc/edgeguard/edgeguard.toml
+  mancube/eggrd:0.7.2 --config /etc/edgeguard/edgeguard.toml
 ```
 
 Bring your own config (overrides the baked-in default):
@@ -160,7 +163,7 @@ Bring your own config (overrides the baked-in default):
 docker run -p 8080:8080 \
   -e UPSTREAM=http://app.internal:3000 \
   -v "$PWD/edgeguard.toml:/etc/edgeguard/edgeguard.toml:ro" \
-  mancube/eggrd:0.7.1 --config /etc/edgeguard/edgeguard.toml
+  mancube/eggrd:0.7.2 --config /etc/edgeguard/edgeguard.toml
 ```
 
 > ⚠️ The shipped config's `users` value is a **non-working placeholder** — set a real credential before exposing anything (see [Auth](#auth--secrets)).
@@ -168,7 +171,7 @@ docker run -p 8080:8080 \
 **Co-process mode** (EdgeGuard supervises your app as PID 1) needs your app in the same image. Copy the binary into your app's image instead of running this one directly:
 
 ```dockerfile
-COPY --from=mancube/eggrd:0.7.1 /usr/local/bin/edgeguard /usr/local/bin/edgeguard
+COPY --from=mancube/eggrd:0.7.2 /usr/local/bin/edgeguard /usr/local/bin/edgeguard
 ENTRYPOINT ["/usr/local/bin/edgeguard", "--config", "/etc/edgeguard/edgeguard.toml", "--wrap", "node server.js"]
 ```
 
@@ -231,7 +234,7 @@ Use `ADMIN_PORT` to move these onto a private listener and keep them off the pub
 Hash a password with the built-in helper (distroless has no shell — pass `--hash` as an arg, feed the password on stdin):
 
 ```bash
-echo -n 'your-password' | docker run -i --rm mancube/eggrd:0.7.1 --hash
+echo -n 'your-password' | docker run -i --rm mancube/eggrd:0.7.2 --hash
 # paste the $argon2id$... string as the user's value in edgeguard.toml
 ```
 

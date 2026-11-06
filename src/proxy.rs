@@ -61,6 +61,9 @@ pub struct AppState {
     /// Managed-mode control-plane client (`Some` only when `[control_plane]` is enabled). Used to
     /// forward CSP reports; policy pull + usage reporting run as background tasks in `main`.
     pub cp: Option<Arc<crate::cp::CpClient>>,
+    /// The CSP report sink's per-client limit and the reports waiting to be forwarded
+    /// ([`crate::csp_sink`]). Drained by `cp::csp_flush_loop` in managed mode.
+    pub csp: Arc<crate::csp_sink::CspSink>,
     /// Shared quota verdict, updated by the managed-mode quota poller and read by the
     /// hard-stop gate below. Lives here (not on the hot-swappable [`Runtime`]) so a policy reload
     /// never resets enforcement. Inert unless `control_plane.enforce_quota` is set.
@@ -2339,38 +2342,43 @@ fn trust_json(auth: &Arc<crate::client_auth::ClientAuth>) -> serde_json::Value {
 }
 
 /// CSP violation report sink (`POST /__edgeguard/csp-report`). Browsers POST a JSON report
-/// here when `headers.csp_report_uri` points at it; we count and log it, then `204`.
-pub async fn csp_report(State(state): State<AppState>, body: Bytes) -> StatusCode {
+/// here when `headers.csp_report_uri` points at it; we count it, and in managed mode fold it for
+/// forwarding, then `204`. See [`crate::csp_sink`] for the limits.
+pub async fn csp_report(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    tcp_peer: Option<axum::Extension<crate::serve::TcpPeer>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    use crate::csp_sink::{CspDrop, Fold};
     state.metrics.record_csp_report();
-    // Managed mode: forward the raw report to the control plane (fire-and-forget, so the browser's
-    // 204 is never delayed by an outbound call). Only when a control plane is configured and
-    // `forward_csp` is on.
-    if let Some(cp) = &state.cp {
-        if state.runtime.load().cfg.control_plane.forward_csp {
-            let cp = cp.clone();
-            let raw = body.clone();
-            tokio::spawn(async move { cp.forward_csp(&raw).await });
-        }
+    let rt = state.runtime.load();
+    // The same client the proxy would serve this request as, so `server.trust_forwarded_for`
+    // behind a load balancer charges the browser, not the balancer.
+    let hop = tcp_peer.map_or(peer, |p| (p.0).0).ip();
+    let (client, _) = rt.forwarders.resolve(&headers, peer, hop);
+    if !state.csp.admit(client) {
+        state.metrics.record_csp_dropped(CspDrop::RateLimited);
+        return StatusCode::TOO_MANY_REQUESTS;
     }
-    // This endpoint is unauthenticated and a report can carry the full document URL,
-    // referrer, and query strings — logging the whole blob at `info` is both a privacy leak
-    // and a log-flood vector. Record only the directive that fired, at `debug`.
-    match serde_json::from_slice::<serde_json::Value>(&body) {
-        Ok(report) => {
-            let directive = report
-                .get("csp-report")
-                .and_then(|r| {
-                    r.get("violated-directive")
-                        .or_else(|| r.get("effective-directive"))
-                })
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            debug!(target: "edgeguard::csp", directive, "CSP violation report");
-        }
-        Err(_) => warn!(
-            bytes = body.len(),
-            "CSP violation report with an unparseable body"
-        ),
+    // Parsed before anything else happens to it: a body that is not a CSP report is counted and
+    // dropped, never forwarded. This endpoint is unauthenticated and a report can carry the full
+    // document URL — logging the blob is both a privacy leak and a log-flood vector, so only the
+    // directive is logged, at `debug`.
+    let Some(violation) = crate::csp_sink::parse_report(&body) else {
+        state.metrics.record_csp_dropped(CspDrop::Invalid);
+        debug!(target: "edgeguard::csp", bytes = body.len(), "body is not a CSP report; dropped");
+        return StatusCode::NO_CONTENT;
+    };
+    debug!(target: "edgeguard::csp", directive = %violation.directive, "CSP violation report");
+    // Managed mode: fold it for the next flush (`cp::csp_flush_loop`). Nothing outbound happens
+    // here, so the browser's 204 never waits on the control plane.
+    if state.cp.is_some()
+        && rt.cfg.control_plane.forward_csp
+        && state.csp.queue(violation) == Fold::Overflow
+    {
+        state.metrics.record_csp_dropped(CspDrop::Overflow);
     }
     StatusCode::NO_CONTENT
 }

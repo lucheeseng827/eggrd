@@ -19,6 +19,7 @@ pub mod client_cert_header;
 pub mod config;
 pub mod cors;
 pub mod cp;
+pub mod csp_sink;
 pub mod dlp;
 pub mod doctor;
 pub mod generate;
@@ -302,6 +303,7 @@ pub fn build_state(cfg: Arc<Config>) -> Result<AppState> {
         metrics: Arc::new(metrics),
         runtime,
         cp,
+        csp: Arc::new(crate::csp_sink::CspSink::new()),
         quota: Arc::new(crate::cp::QuotaState::default()),
         draining: Arc::default(),
         policy_pending: Arc::default(),

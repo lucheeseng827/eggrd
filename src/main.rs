@@ -599,6 +599,7 @@ async fn run() -> Result<()> {
     // series render with the rest and `/__edgeguard/tls` can reach it.
     let tls_metrics = state.metrics.clone();
     let cp_quota = state.quota.clone();
+    let csp_sink = state.csp.clone();
     // Flipped by the signal handler below, so `/ready` fails from the first moment of shutdown.
     let draining = state.draining.clone();
     let listener_metrics = state.metrics.clone();
@@ -738,6 +739,12 @@ async fn run() -> Result<()> {
                 cp::quota_loop(quota_client, cp_quota, quota_interval, quota_rx).await
             });
         }
+        // Folded CSP reports (crate::csp_sink): one request per distinct pair per interval.
+        let csp_rx = shutdown_rx.clone();
+        let (csp_client, csp_metrics) = (cp_client.clone(), cp_metrics.clone());
+        tokio::spawn(
+            async move { cp::csp_flush_loop(csp_client, csp_sink, csp_metrics, csp_rx).await },
+        );
         let report_rx = shutdown_rx.clone();
         tokio::spawn(
             async move { cp::report_loop(cp_client, cp_metrics, report, report_rx).await },
